@@ -35,18 +35,29 @@ impl DiagonalSpec {
 }
 
 // Public API
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChunkDiff {
+    pub cx: i32,
+    pub cy: i32,
+    pub diff_bits: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct GameOfLife {
     grid: BitGrid,
-    generation: usize,
+    generation: u64,
     memo: Memo,
 }
 
 impl GameOfLife {
     pub fn new(grid: BitGrid) -> Self {
+        Self::new_with_generation(grid, 0)
+    }
+
+    pub fn new_with_generation(grid: BitGrid, generation: u64) -> Self {
         Self {
             grid,
-            generation: 0,
+            generation,
             memo: Memo::default(),
         }
     }
@@ -55,12 +66,19 @@ impl GameOfLife {
         &self.grid
     }
 
-    pub fn generation(&self) -> usize {
+    pub fn generation(&self) -> u64 {
         self.generation
     }
 
     pub fn step_with_changes(&mut self) -> Vec<(i32, i32)> {
-        let (next, changed) = step_grid_with_changes_and_memo(&self.grid, &mut self.memo);
+        let (next, chunk_changes) = step_grid_with_chunk_changes_and_memo(&self.grid, &mut self.memo);
+        self.grid = next;
+        self.generation += 1;
+        expand_chunk_diffs_to_cells(&chunk_changes)
+    }
+
+    pub fn step_with_chunk_changes(&mut self) -> Vec<ChunkDiff> {
+        let (next, changed) = step_grid_with_chunk_changes_and_memo(&self.grid, &mut self.memo);
         self.grid = next;
         self.generation += 1;
         changed
@@ -70,7 +88,7 @@ impl GameOfLife {
 #[cfg(test)]
 pub fn step_grid(grid: &BitGrid) -> BitGrid {
     let mut memo = Memo::default();
-    step_grid_with_changes_and_memo(grid, &mut memo).0
+    step_grid_with_chunk_changes_and_memo(grid, &mut memo).0
 }
 
 // Stepping pipeline
@@ -78,6 +96,14 @@ pub fn step_grid_with_changes_and_memo(
     grid: &BitGrid,
     memo: &mut Memo,
 ) -> (BitGrid, Vec<(i32, i32)>) {
+    let (next, chunk_changes) = step_grid_with_chunk_changes_and_memo(grid, memo);
+    (next, expand_chunk_diffs_to_cells(&chunk_changes))
+}
+
+pub fn step_grid_with_chunk_changes_and_memo(
+    grid: &BitGrid,
+    memo: &mut Memo,
+) -> (BitGrid, Vec<ChunkDiff>) {
     if grid.is_empty() {
         return (BitGrid::new(), Vec::new());
     }
@@ -108,7 +134,7 @@ fn flush_pending_chunks(
     pending: &mut Vec<(i32, i32, u64, ChunkNeighborhood)>,
     memo: &mut Memo,
     next: &mut BitGrid,
-    changed: &mut Vec<(i32, i32)>,
+    changed: &mut Vec<ChunkDiff>,
 ) {
     if pending.is_empty() {
         return;
@@ -126,7 +152,7 @@ fn flush_pending_chunks(
 
 fn apply_chunk_step(
     next: &mut BitGrid,
-    changed: &mut Vec<(i32, i32)>,
+    changed: &mut Vec<ChunkDiff>,
     cx: i32,
     cy: i32,
     current_bits: u64,
@@ -135,7 +161,10 @@ fn apply_chunk_step(
     if next_bits != 0 {
         next.set_chunk_bits(cx, cy, next_bits);
     }
-    append_changed_cells(changed, cx, cy, current_bits ^ next_bits);
+    let diff_bits = current_bits ^ next_bits;
+    if diff_bits != 0 {
+        changed.push(ChunkDiff { cx, cy, diff_bits });
+    }
 }
 
 // Neighborhood collection
@@ -195,19 +224,6 @@ fn evolve_center_chunk_bitwise(neighborhood: &ChunkNeighborhood) -> u64 {
     let exactly_three = bit0 & bit1 & !bit2 & !bit3;
     let exactly_two = !bit0 & bit1 & !bit2 & !bit3;
     exactly_three | (center & exactly_two)
-}
-
-#[cfg(test)]
-fn evolve_center_chunks_bitwise_batch(neighborhoods: &[ChunkNeighborhood]) -> Vec<u64> {
-    debug_assert!(!neighborhoods.is_empty());
-    debug_assert!(neighborhoods.len() <= 8);
-    if neighborhoods.len() == 1 {
-        return vec![evolve_center_chunk_bitwise(&neighborhoods[0])];
-    }
-
-    let chunks = build_chunk_row_batches(neighborhoods);
-    let next = evolve_packed_chunk_rows(&chunks);
-    next[..neighborhoods.len()].to_vec()
 }
 
 fn evolve_center_chunks_bitwise_batch_from_pending(
@@ -290,31 +306,6 @@ fn accumulate_neighbor_bitplanes(neighbors: &[u64x8; 8]) -> (u64x8, u64x8, u64x8
 }
 
 // Batched row layout
-#[cfg(test)]
-fn build_chunk_row_batches(neighborhoods: &[ChunkNeighborhood]) -> [ChunkRowBatch; 9] {
-    let mut chunks = [[[0_u16; 8]; 8]; 9];
-
-    for (lane, neighborhood) in neighborhoods.iter().enumerate() {
-        let first_batch = chunk_rows_batch_4([
-            neighborhood.0[0],
-            neighborhood.0[1],
-            neighborhood.0[2],
-            neighborhood.0[3],
-        ]);
-        let second_batch = chunk_rows_batch_4([
-            neighborhood.0[4],
-            neighborhood.0[5],
-            neighborhood.0[6],
-            neighborhood.0[7],
-        ]);
-        store_rows_batch_4(&mut chunks[0..4], lane, first_batch);
-        store_rows_batch_4(&mut chunks[4..8], lane, second_batch);
-        store_rows_for_lane(&mut chunks[8], lane, chunk_rows(neighborhood.0[8]));
-    }
-
-    chunks.map(must_cast)
-}
-
 fn build_chunk_row_batches_from_pending(
     pending: &[(i32, i32, u64, ChunkNeighborhood)],
 ) -> [ChunkRowBatch; 9] {
@@ -575,54 +566,12 @@ fn append_changed_cells(changed: &mut Vec<(i32, i32)>, cx: i32, cy: i32, diff_bi
     }
 }
 
-// Test-only reference kernels
-#[cfg(test)]
-fn evolve_center_chunk_naive(neighborhood: &ChunkNeighborhood) -> u64 {
-    let mut next_bits = 0_u64;
-    for ly in 0..CHUNK_SIZE {
-        for lx in 0..CHUNK_SIZE {
-            let mut neighbors = 0_u8;
-            for dy in -1..=1 {
-                for dx in -1..=1 {
-                    if dx == 0 && dy == 0 {
-                        continue;
-                    }
-                    if naive_neighborhood_cell(neighborhood, lx + dx, ly + dy) {
-                        neighbors += 1;
-                    }
-                }
-            }
-
-            let alive = naive_neighborhood_cell(neighborhood, lx, ly);
-            if neighbors == 3 || (neighbors == 2 && alive) {
-                let bit = (ly * CHUNK_SIZE + lx) as u32;
-                next_bits |= 1_u64 << bit;
-            }
-        }
+fn expand_chunk_diffs_to_cells(chunk_diffs: &[ChunkDiff]) -> Vec<(i32, i32)> {
+    let mut changed = Vec::new();
+    for diff in chunk_diffs {
+        append_changed_cells(&mut changed, diff.cx, diff.cy, diff.diff_bits);
     }
-    next_bits
-}
-
-#[cfg(test)]
-fn naive_neighborhood_cell(neighborhood: &ChunkNeighborhood, x: i32, y: i32) -> bool {
-    let chunk_x = if x < 0 {
-        0
-    } else if x >= CHUNK_SIZE {
-        2
-    } else {
-        1
-    };
-    let chunk_y = if y < 0 {
-        0
-    } else if y >= CHUNK_SIZE {
-        2
-    } else {
-        1
-    };
-    let local_x = x.rem_euclid(CHUNK_SIZE) as u32;
-    let local_y = y.rem_euclid(CHUNK_SIZE) as u32;
-    let bit = local_y * CHUNK_SIZE as u32 + local_x;
-    (neighborhood.0[(chunk_y * 3 + chunk_x) as usize] & (1_u64 << bit)) != 0
+    changed
 }
 
 #[cfg(test)]

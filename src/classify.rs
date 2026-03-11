@@ -3,6 +3,7 @@ use std::fmt;
 
 use crate::bitgrid::BitGrid;
 use crate::benchmark::effective_generation_limit;
+use crate::engine::{SimulationEngine, advance_grid, select_engine};
 use crate::life::step_grid_with_changes_and_memo;
 use crate::memo::Memo;
 use crate::normalize::{NormalizedGridSignature, normalize};
@@ -215,8 +216,10 @@ fn run_classification_from_state(
         }
 
         seen.insert(signature.clone(), (generation, origin));
-        grid = next_grid_with_memo(&signature, &grid, memo);
-        generation += 1;
+        let step_span =
+            continuation_step_span(&grid, generation, generation_limit, limits.max_generations);
+        grid = next_grid_with_memo(&signature, &grid, memo, step_span);
+        generation += step_span as usize;
 
         if generation > generation_limit {
             let mut next_limit =
@@ -650,6 +653,33 @@ fn next_grid_with_memo(
     _signature: &NormalizedGridSignature,
     current: &BitGrid,
     memo: &mut Memo,
+    step_span: u64,
 ) -> BitGrid {
-    step_grid_with_changes_and_memo(current, memo).0
+    if step_span <= 1 {
+        step_grid_with_changes_and_memo(current, memo).0
+    } else {
+        advance_grid(current, step_span).grid
+    }
+}
+
+fn continuation_step_span(
+    current: &BitGrid,
+    generation: usize,
+    generation_limit: usize,
+    nominal_generation_limit: usize,
+) -> u64 {
+    if generation < nominal_generation_limit {
+        return 1;
+    }
+
+    let remaining = generation_limit.saturating_sub(generation) as u64;
+    if remaining <= 1 {
+        return 1;
+    }
+
+    match select_engine(current, remaining) {
+        SimulationEngine::SimdChunk => 1,
+        SimulationEngine::HybridSegmented => remaining.min(8),
+        SimulationEngine::HashLife => remaining.min(16),
+    }
 }

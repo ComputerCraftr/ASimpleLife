@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::bitgrid::BitGrid;
 use crate::classify::{Classification, ClassificationLimits, classify_seed};
 use crate::generators::{mix_seed, pattern_by_name, random_soup};
-use crate::life::{GameOfLife, step_grid, step_grid_with_changes_and_memo};
+use crate::life::{ChunkDiff, GameOfLife, step_grid, step_grid_with_changes_and_memo};
 use crate::memo::Memo;
 use crate::normalize::normalize;
 use crate::render::{TerminalBackbuffer, compute_origin_for_cells};
@@ -279,6 +279,32 @@ fn render_diff_only_emits_changed_cells() {
     assert!(full.contains("\x1b[2;1H"));
 
     let diff = render_output(&mut buffer, &updated, Some(&[(1, 0), (1, 1)]));
+    assert!(diff.contains("\x1b[2;2H▀"));
+    assert!(!diff.contains("\x1b[2;1H"));
+}
+
+#[test]
+fn render_chunk_diff_only_emits_changed_region() {
+    let mut buffer = TerminalBackbuffer::new(4, 2);
+    let initial = BitGrid::from_cells(&[(0, 0), (3, 3), (1, 1)]);
+    let updated = BitGrid::from_cells(&[(0, 0), (3, 3), (1, 0)]);
+
+    let mut out = Vec::new();
+    buffer.render_chunk_into(&initial, None, &mut out).unwrap();
+
+    let mut diff_out = Vec::new();
+    buffer
+        .render_chunk_into(
+            &updated,
+            Some(&[ChunkDiff {
+                cx: 0,
+                cy: 0,
+                diff_bits: (1_u64 << 1) | (1_u64 << 9),
+            }]),
+            &mut diff_out,
+        )
+        .unwrap();
+    let diff = String::from_utf8(diff_out).unwrap();
     assert!(diff.contains("\x1b[2;2H▀"));
     assert!(!diff.contains("\x1b[2;1H"));
 }

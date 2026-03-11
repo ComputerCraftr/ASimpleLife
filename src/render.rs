@@ -1,4 +1,5 @@
 use crate::bitgrid::BitGrid;
+use crate::life::ChunkDiff;
 use std::io::{self, Write};
 
 #[derive(Clone, Debug)]
@@ -35,6 +36,26 @@ impl TerminalBackbuffer {
         } else if let Some(changed_cells) = changed_cells {
             for &(x, y) in changed_cells {
                 self.update_terminal_cell_for_world(grid, x, y);
+            }
+        }
+
+        self.flush_dirty(out)
+    }
+
+    pub fn render_chunk_into<W: Write>(
+        &mut self,
+        grid: &BitGrid,
+        changed_chunks: Option<&[ChunkDiff]>,
+        out: &mut W,
+    ) -> io::Result<()> {
+        let next_origin = compute_origin(self.width, self.height, grid);
+
+        if self.origin != Some(next_origin) || changed_chunks.is_none() {
+            self.origin = Some(next_origin);
+            self.rebuild_all(grid);
+        } else if let Some(changed_chunks) = changed_chunks {
+            for &diff in changed_chunks {
+                self.update_terminal_cells_for_chunk(grid, diff);
             }
         }
 
@@ -79,6 +100,53 @@ impl TerminalBackbuffer {
         }
 
         self.write_cell(grid, row as usize, col as usize);
+    }
+
+    fn update_terminal_cells_for_chunk(&mut self, grid: &BitGrid, diff: ChunkDiff) {
+        let Some((origin_x, origin_y)) = self.origin else {
+            return;
+        };
+        if diff.diff_bits == 0 {
+            return;
+        }
+
+        let mut remaining = diff.diff_bits;
+        let mut min_local_x = i32::MAX;
+        let mut max_local_x = i32::MIN;
+        let mut min_local_y = i32::MAX;
+        let mut max_local_y = i32::MIN;
+
+        while remaining != 0 {
+            let bit = remaining.trailing_zeros() as i32;
+            min_local_x = min_local_x.min(bit % 8);
+            max_local_x = max_local_x.max(bit % 8);
+            min_local_y = min_local_y.min(bit / 8);
+            max_local_y = max_local_y.max(bit / 8);
+            remaining &= remaining - 1;
+        }
+
+        let min_world_x = diff.cx * 8 + min_local_x;
+        let max_world_x = diff.cx * 8 + max_local_x;
+        let min_world_y = diff.cy * 8 + min_local_y;
+        let max_world_y = diff.cy * 8 + max_local_y;
+
+        let min_col = (min_world_x - origin_x).max(0);
+        let max_col = (max_world_x - origin_x).min(self.width as i32 - 1);
+        if min_col > max_col {
+            return;
+        }
+
+        let min_row = (min_world_y - origin_y).div_euclid(2).max(0);
+        let max_row = (max_world_y - origin_y).div_euclid(2).min(self.height as i32 - 1);
+        if min_row > max_row {
+            return;
+        }
+
+        for row in min_row as usize..=max_row as usize {
+            for col in min_col as usize..=max_col as usize {
+                self.write_cell(grid, row, col);
+            }
+        }
     }
 
     fn write_cell(&mut self, grid: &BitGrid, row: usize, col: usize) {

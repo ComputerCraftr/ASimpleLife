@@ -7,6 +7,7 @@ use crate::bitgrid::BitGrid;
 use crate::classify::{
     Classification, ClassificationCheckpoint, ClassificationLimits, classify_seed_with_checkpoint,
 };
+use crate::engine::{SimulationEngine, advance_grid, select_engine};
 use crate::generators::{mix_seed, pattern_by_name, random_soup};
 use crate::memo::Memo;
 use crate::normalize::{NormalizedGridSignature, normalize};
@@ -58,7 +59,13 @@ pub fn run_benchmark_report(format: BenchmarkFormat, options: &BenchmarkOptions)
             &prediction_limits,
             &oracle_limits,
         );
-        report.record(&case, &expected, &actual, started.elapsed());
+        report.record(
+            &case,
+            &expected,
+            &actual,
+            started.elapsed(),
+            prediction_limits.max_generations as u64,
+        );
     }
 
     if options.exhaustive_5x5 {
@@ -228,8 +235,10 @@ fn reference_classify_continuation(
         }
 
         seen.insert(signature, (generation, origin));
-        grid = reference_step_grid(&grid);
-        generation += 1;
+        let step_span =
+            continuation_step_span(&grid, generation, generation_limit, limits.max_generations);
+        grid = reference_next_grid(&grid, step_span);
+        generation += step_span as usize;
 
         if generation > generation_limit {
             generation_limit = effective_generation_limit(limits, grid.population(), grid.bounds());
@@ -238,6 +247,36 @@ fn reference_classify_continuation(
 
     Classification::Unknown {
         simulated: generation_limit,
+    }
+}
+
+fn reference_next_grid(current: &BitGrid, step_span: u64) -> BitGrid {
+    if step_span <= 1 {
+        reference_step_grid(current)
+    } else {
+        advance_grid(current, step_span).grid
+    }
+}
+
+fn continuation_step_span(
+    current: &BitGrid,
+    generation: usize,
+    generation_limit: usize,
+    nominal_generation_limit: usize,
+) -> u64 {
+    if generation < nominal_generation_limit {
+        return 1;
+    }
+
+    let remaining = generation_limit.saturating_sub(generation) as u64;
+    if remaining <= 1 {
+        return 1;
+    }
+
+    match select_engine(current, remaining) {
+        SimulationEngine::SimdChunk => 1,
+        SimulationEngine::HybridSegmented => remaining.min(8),
+        SimulationEngine::HashLife => remaining.min(16),
     }
 }
 
@@ -338,9 +377,11 @@ struct BenchmarkReport {
     by_size: BTreeMap<i32, SliceStats>,
     by_outcome: BTreeMap<OutcomeBucket, SliceStats>,
     by_error: BTreeMap<ErrorBucket, usize>,
+    by_engine: BTreeMap<SimulationEngine, SliceStats>,
     runtimes: Vec<Duration>,
     runtime_by_family: BTreeMap<BenchmarkFamily, Vec<Duration>>,
     runtime_by_size: BTreeMap<i32, Vec<Duration>>,
+    runtime_by_engine: BTreeMap<SimulationEngine, Vec<Duration>>,
     unknown_count: usize,
 }
 
@@ -361,8 +402,10 @@ struct JsonReport {
     by_density: BTreeMap<String, JsonSliceStats>,
     by_size: BTreeMap<String, JsonSliceStats>,
     by_outcome: BTreeMap<String, JsonSliceStats>,
+    by_engine: BTreeMap<String, JsonSliceStats>,
     runtime_by_family: BTreeMap<String, JsonRuntimeSummary>,
     runtime_by_size: BTreeMap<String, JsonRuntimeSummary>,
+    runtime_by_engine: BTreeMap<String, JsonRuntimeSummary>,
     by_error: BTreeMap<String, usize>,
 }
 
@@ -389,10 +432,12 @@ impl BenchmarkReport {
         expected: &Classification,
         actual: &Classification,
         runtime: Duration,
+        planned_generations: u64,
     ) {
         let outcome = outcome_bucket(expected);
         let error = error_bucket(expected, actual);
         let compatible = error == ErrorBucket::ExactOrCompatible;
+        let engine = select_engine(&case.grid, planned_generations);
 
         self.total += 1;
         if compatible {
@@ -408,6 +453,7 @@ impl BenchmarkReport {
         record_slice(&mut self.by_density, case.density_percent, compatible);
         record_slice(&mut self.by_size, case.size, compatible);
         record_slice(&mut self.by_outcome, outcome, compatible);
+        record_slice(&mut self.by_engine, engine, compatible);
         *self.by_error.entry(error).or_insert(0) += 1;
         self.runtimes.push(runtime);
         self.runtime_by_family
@@ -418,6 +464,7 @@ impl BenchmarkReport {
             .entry(case.size)
             .or_default()
             .push(runtime);
+        self.runtime_by_engine.entry(engine).or_default().push(runtime);
         if matches!(actual, Classification::Unknown { .. }) {
             self.unknown_count += 1;
         }
@@ -449,8 +496,10 @@ impl BenchmarkReport {
         print_slice_map("density", &self.by_density);
         print_slice_map("size", &self.by_size);
         print_slice_map("outcome", &self.by_outcome);
+        print_slice_map("engine", &self.by_engine);
         print_runtime_map("runtime_by_family", &self.runtime_by_family);
         print_runtime_map("runtime_by_size", &self.runtime_by_size);
+        print_runtime_map("runtime_by_engine", &self.runtime_by_engine);
         println!("error_buckets:");
         for (bucket, count) in &self.by_error {
             println!("  {:?}: {}", bucket, count);
@@ -468,8 +517,10 @@ impl BenchmarkReport {
             by_density: slice_map_json(&self.by_density),
             by_size: slice_map_json(&self.by_size),
             by_outcome: slice_map_json(&self.by_outcome),
+            by_engine: slice_map_json(&self.by_engine),
             runtime_by_family: runtime_map_json(&self.runtime_by_family),
             runtime_by_size: runtime_map_json(&self.runtime_by_size),
+            runtime_by_engine: runtime_map_json(&self.runtime_by_engine),
             by_error: self
                 .by_error
                 .iter()
@@ -732,7 +783,13 @@ fn run_exhaustive_5x5(report: &mut BenchmarkReport) {
             density_percent: estimate_density_percent(&grid),
             grid,
         };
-        report.record(&case, &expected, &actual, started.elapsed());
+        report.record(
+            &case,
+            &expected,
+            &actual,
+            started.elapsed(),
+            prediction_limits.max_generations as u64,
+        );
     }
 }
 

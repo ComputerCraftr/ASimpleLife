@@ -6,6 +6,7 @@ use crate::generators::pattern_by_name;
 pub struct Config {
     pub pattern: String,
     pub steps: usize,
+    pub fast_forward: u64,
     pub delay_ms: u64,
     pub width: usize,
     pub height: usize,
@@ -18,6 +19,7 @@ impl Default for Config {
         Self {
             pattern: "glider".to_string(),
             steps: 200,
+            fast_forward: 0,
             delay_ms: 80,
             width: 80,
             height: 24,
@@ -48,6 +50,7 @@ where
         match arg.as_str() {
             "--pattern" => config.pattern = next_string(&mut args, "--pattern")?,
             "--steps" => config.steps = next_parsed(&mut args, "--steps")?,
+            "--fast-forward" => config.fast_forward = next_parsed(&mut args, "--fast-forward")?,
             "--delay-ms" => config.delay_ms = next_parsed(&mut args, "--delay-ms")?,
             "--width" => config.width = next_parsed(&mut args, "--width")?,
             "--height" => config.height = next_parsed(&mut args, "--height")?,
@@ -115,6 +118,7 @@ pub fn print_help() {
         "  --pattern <name>   glider | blinker | block | diehard | acorn | r_pentomino | gosper_glider_gun | glider_producing_switch_engine | blinker_puffer_1 | random"
     );
     println!("  --steps <n>        number of generations to run");
+    println!("  --fast-forward <n> jump ahead n generations before rendering");
     println!("  --delay-ms <n>     frame delay in milliseconds");
     println!("  --width <n>        terminal character width");
     println!("  --height <n>       terminal character height");
@@ -133,6 +137,8 @@ mod tests {
             "gosper_glider_gun".to_string(),
             "--steps".to_string(),
             "10".to_string(),
+            "--fast-forward".to_string(),
+            "64".to_string(),
             "--width".to_string(),
             "100".to_string(),
             "--height".to_string(),
@@ -143,6 +149,7 @@ mod tests {
 
         assert_eq!(config.pattern, "gosper_glider_gun");
         assert_eq!(config.steps, 10);
+        assert_eq!(config.fast_forward, 64);
         assert_eq!(config.width, 100);
         assert_eq!(config.height, 20);
         assert!(config.classify_only);

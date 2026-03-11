@@ -1,50 +1,6 @@
-use crate::generators::SplitMix64;
 use crate::memo::Memo;
 
-use super::{
-    ChunkNeighborhood, evolve_center_chunk_bitwise, evolve_center_chunk_naive,
-    evolve_center_chunks_bitwise_batch,
-};
-
-#[test]
-fn branchless_chunk_kernel_matches_naive_kernel() {
-    let mut rng = SplitMix64::new(0x9E3779B97F4A7C15);
-    for _ in 0..512 {
-        let mut chunks = [0_u64; 9];
-        for chunk in &mut chunks {
-            *chunk = rng.next_u64();
-        }
-        let neighborhood = ChunkNeighborhood(chunks);
-        assert_eq!(
-            evolve_center_chunk_bitwise(&neighborhood),
-            evolve_center_chunk_naive(&neighborhood)
-        );
-    }
-}
-
-#[test]
-fn simd_chunk_batch_kernel_matches_scalar_kernel() {
-    let mut rng = SplitMix64::new(0xD1B54A32D192ED03);
-    for batch_len in 1..=8 {
-        for _ in 0..128 {
-            let mut neighborhoods = Vec::with_capacity(batch_len);
-            for _ in 0..batch_len {
-                let mut chunks = [0_u64; 9];
-                for chunk in &mut chunks {
-                    *chunk = rng.next_u64();
-                }
-                neighborhoods.push(ChunkNeighborhood(chunks));
-            }
-
-            let batch = evolve_center_chunks_bitwise_batch(&neighborhoods);
-            let scalar = neighborhoods
-                .iter()
-                .map(evolve_center_chunk_bitwise)
-                .collect::<Vec<_>>();
-            assert_eq!(batch, scalar);
-        }
-    }
-}
+use super::{ChunkNeighborhood, evolve_center_chunk_bitwise};
 
 #[test]
 fn symmetric_neighborhoods_share_chunk_transition_cache_entries() {

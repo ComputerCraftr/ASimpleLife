@@ -5,6 +5,7 @@ use std::{io::Write, io::stdout};
 use a_simple_life::app::initial_grid;
 use a_simple_life::classify::{ClassificationLimits, classify_seed};
 use a_simple_life::cli;
+use a_simple_life::engine::advance_grid;
 use a_simple_life::life::GameOfLife;
 use a_simple_life::memo::Memo;
 use a_simple_life::render::TerminalBackbuffer;
@@ -24,7 +25,12 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let grid = initial_grid(&config);
+    let initial = initial_grid(&config);
+    let grid = if config.fast_forward == 0 {
+        initial
+    } else {
+        advance_grid(&initial, config.fast_forward).grid
+    };
     let mut memo = Memo::default();
     let limits = ClassificationLimits::default();
     let classification = classify_seed(&grid, &limits, &mut memo);
@@ -34,15 +40,15 @@ fn main() {
         return;
     }
 
-    let mut game = GameOfLife::new(grid);
+    let mut game = GameOfLife::new_with_generation(grid, config.fast_forward);
     let (mut view_width, mut view_height) = terminal_view_size(config.width, config.height);
     let mut backbuffer = TerminalBackbuffer::new(view_width, view_height);
-    let mut previous_generation = usize::MAX;
+    let mut previous_generation = u64::MAX;
     let mut previous_population = usize::MAX;
     let mut stdout = stdout();
     let mut status_buffer = Vec::with_capacity(256);
     let mut frame_buffer = Vec::with_capacity((view_width * view_height) + 64);
-    let mut changed_cells: Option<Vec<(i32, i32)>> = None;
+    let mut changed_chunks = None;
 
     print!("\x1b[2J\x1b[?25l");
 
@@ -54,7 +60,7 @@ fn main() {
             backbuffer.resize(view_width, view_height);
             frame_buffer = Vec::with_capacity((view_width * view_height) + 64);
             stdout.write_all(b"\x1b[2J").unwrap();
-            changed_cells = None;
+            changed_chunks = None;
         }
 
         let generation = game.generation();
@@ -69,14 +75,14 @@ fn main() {
 
         frame_buffer.clear();
         backbuffer
-            .render_into(game.grid(), changed_cells.as_deref(), &mut frame_buffer)
+            .render_chunk_into(game.grid(), changed_chunks.as_deref(), &mut frame_buffer)
             .unwrap();
         write!(&mut frame_buffer, "\x1b[{};1H", view_height + 2).unwrap();
         stdout.write_all(&frame_buffer).unwrap();
         stdout.flush().unwrap();
 
         thread::sleep(Duration::from_millis(config.delay_ms));
-        changed_cells = Some(game.step_with_changes());
+        changed_chunks = Some(game.step_with_chunk_changes());
     }
 
     println!("\x1b[?25h");
@@ -84,7 +90,7 @@ fn main() {
 
 fn write_status_line(
     out: &mut Vec<u8>,
-    generation: usize,
+    generation: u64,
     population: usize,
     classification: &impl std::fmt::Display,
 ) {
