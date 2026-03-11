@@ -6,6 +6,7 @@ use std::io::{self, Write};
 pub struct TerminalBackbuffer {
     width: usize,
     height: usize,
+    row_offset: usize,
     origin: Option<Cell>,
     cells: Vec<u8>,
     dirty_rows: Vec<Option<(usize, usize)>>,
@@ -16,6 +17,7 @@ impl TerminalBackbuffer {
         Self {
             width,
             height,
+            row_offset: 1,
             origin: None,
             cells: vec![0; width * height],
             dirty_rows: vec![None; height],
@@ -72,6 +74,10 @@ impl TerminalBackbuffer {
         self.origin = None;
         self.cells = vec![0; width * height];
         self.dirty_rows = vec![None; height];
+    }
+
+    pub fn set_row_offset(&mut self, row_offset: usize) {
+        self.row_offset = row_offset;
     }
 
     fn rebuild_all(&mut self, grid: &BitGrid) {
@@ -186,7 +192,7 @@ impl TerminalBackbuffer {
                 continue;
             };
 
-            write_cursor_move(out, row + 2, start + 1)?;
+            write_cursor_move(out, row + self.row_offset + 1, start + 1)?;
             for col in start..=end {
                 let mut encoded = [0_u8; 4];
                 let ch = decode_cell(self.cells[row * self.width + col]);

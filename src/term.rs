@@ -1,5 +1,5 @@
 #[cfg(unix)]
-pub fn terminal_view_size(default_width: usize, default_height: usize) -> (usize, usize) {
+pub fn terminal_size(default_width: usize, default_height: usize) -> (usize, usize) {
     use std::mem::MaybeUninit;
     use std::os::fd::AsRawFd;
 
@@ -12,8 +12,8 @@ pub fn terminal_view_size(default_width: usize, default_height: usize) -> (usize
         let winsize = unsafe { winsize.assume_init() };
         let cols = usize::from(winsize.ws_col);
         let rows = usize::from(winsize.ws_row);
-        if cols > 0 && rows > 1 {
-            return (cols, rows - 1);
+        if cols > 0 && rows > 0 {
+            return (cols, rows);
         }
     }
 
@@ -21,6 +21,6 @@ pub fn terminal_view_size(default_width: usize, default_height: usize) -> (usize
 }
 
 #[cfg(not(unix))]
-pub fn terminal_view_size(default_width: usize, default_height: usize) -> (usize, usize) {
+pub fn terminal_size(default_width: usize, default_height: usize) -> (usize, usize) {
     (default_width, default_height)
 }
