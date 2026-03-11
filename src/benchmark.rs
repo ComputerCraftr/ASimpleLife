@@ -4,12 +4,14 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::bitgrid::BitGrid;
-use crate::classify::{Classification, ClassificationLimits, classify_seed};
+use crate::classify::{
+    Classification, ClassificationCheckpoint, ClassificationLimits, classify_seed_with_checkpoint,
+};
 use crate::generators::{mix_seed, pattern_by_name, random_soup};
 use crate::memo::Memo;
-use crate::normalize::normalize;
+use crate::normalize::{NormalizedGridSignature, normalize};
 
-type SeenStates = HashMap<Vec<(i32, i32)>, (usize, (i32, i32))>;
+type SeenStates = HashMap<NormalizedGridSignature, (usize, (i32, i32))>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BenchmarkFormat {
@@ -24,10 +26,15 @@ pub struct BenchmarkOptions {
 }
 
 pub fn run_benchmark_report(format: BenchmarkFormat, options: &BenchmarkOptions) {
-    let limits = ClassificationLimits {
+    let prediction_limits = ClassificationLimits {
         max_generations: 256,
         max_population: 20_000,
-        max_bounding_box: 512,
+        max_bounding_box: i32::MAX,
+    };
+    let oracle_limits = ClassificationLimits {
+        max_generations: 512,
+        max_population: 50_000,
+        max_bounding_box: i32::MAX,
     };
     let filters = benchmark_family_filter(options);
     let suite = weighted_benchmark_suite()
@@ -42,9 +49,15 @@ pub fn run_benchmark_report(format: BenchmarkFormat, options: &BenchmarkOptions)
     let mut report = BenchmarkReport::default();
 
     for case in suite {
-        let expected = reference_classify(&case.grid, &limits);
         let started = Instant::now();
-        let actual = classify_seed(&case.grid, &limits, &mut Memo::default());
+        let (actual, checkpoint) =
+            classify_seed_with_checkpoint(&case.grid, &prediction_limits, &mut Memo::default());
+        let expected = reference_classify_from_checkpoint(
+            checkpoint,
+            &actual,
+            &prediction_limits,
+            &oracle_limits,
+        );
         report.record(&case, &expected, &actual, started.elapsed());
     }
 
@@ -76,11 +89,15 @@ pub(crate) fn bitmask_pattern(mask: u32, width: i32, height: i32) -> BitGrid {
     BitGrid::from_cells(&cells)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn reference_classify(seed: &BitGrid, limits: &ClassificationLimits) -> Classification {
     let mut seen: SeenStates = HashMap::new();
     let mut grid = seed.clone();
+    let mut generation = 0;
+    let mut generation_limit =
+        effective_generation_limit(limits, grid.population(), grid.bounds());
 
-    for generation in 0..=limits.max_generations {
+    while generation <= generation_limit {
         let (signature, origin) = normalize(&grid);
         if grid.is_empty() {
             return Classification::DiesOut {
@@ -88,7 +105,7 @@ pub(crate) fn reference_classify(seed: &BitGrid, limits: &ClassificationLimits) 
             };
         }
 
-        if let Some(&(first_seen, first_origin)) = seen.get(&signature.cells) {
+        if let Some(&(first_seen, first_origin)) = seen.get(&signature) {
             let period = generation - first_seen;
             let dx = origin.0 - first_origin.0;
             let dy = origin.1 - first_origin.1;
@@ -122,12 +139,105 @@ pub(crate) fn reference_classify(seed: &BitGrid, limits: &ClassificationLimits) 
             }
         }
 
-        seen.insert(signature.cells, (generation, origin));
+        seen.insert(signature, (generation, origin));
         grid = reference_step_grid(&grid);
+        generation += 1;
+
+        if generation > generation_limit {
+            generation_limit = effective_generation_limit(limits, grid.population(), grid.bounds());
+        }
     }
 
     Classification::Unknown {
-        simulated: limits.max_generations,
+        simulated: generation_limit,
+    }
+}
+
+fn reference_classify_from_checkpoint(
+    checkpoint: ClassificationCheckpoint,
+    prediction: &Classification,
+    prediction_limits: &ClassificationLimits,
+    oracle_limits: &ClassificationLimits,
+) -> Classification {
+    let oracle_limit = effective_generation_limit(
+        oracle_limits,
+        checkpoint.grid.population(),
+        checkpoint.grid.bounds(),
+    );
+
+    if checkpoint.generation > oracle_limit {
+        return prediction.clone();
+    }
+
+    reference_classify_continuation(
+        checkpoint.grid,
+        checkpoint.seen,
+        checkpoint.generation,
+        oracle_limit.max(prediction_limits.max_generations),
+        oracle_limits,
+    )
+}
+
+fn reference_classify_continuation(
+    mut grid: BitGrid,
+    mut seen: SeenStates,
+    mut generation: usize,
+    mut generation_limit: usize,
+    limits: &ClassificationLimits,
+) -> Classification {
+    while generation <= generation_limit {
+        let (signature, origin) = normalize(&grid);
+        if grid.is_empty() {
+            return Classification::DiesOut {
+                at_generation: generation,
+            };
+        }
+
+        if let Some(&(first_seen, first_origin)) = seen.get(&signature) {
+            let period = generation - first_seen;
+            let dx = origin.0 - first_origin.0;
+            let dy = origin.1 - first_origin.1;
+            return if dx == 0 && dy == 0 {
+                Classification::Repeats { period, first_seen }
+            } else {
+                Classification::Spaceship {
+                    period,
+                    first_seen,
+                    delta: (dx, dy),
+                    detected_at: generation,
+                }
+            };
+        }
+
+        if grid.population() > limits.max_population {
+            return Classification::LikelyInfinite {
+                reason: "population_growth",
+                detected_at: generation,
+            };
+        }
+
+        if let Some((min_x, min_y, max_x, max_y)) = grid.bounds() {
+            let width = max_x - min_x + 1;
+            let height = max_y - min_y + 1;
+            if width > limits.max_bounding_box || height > limits.max_bounding_box {
+                return Classification::LikelyInfinite {
+                    reason: "expanding_bounds",
+                    detected_at: generation,
+                };
+            }
+        }
+
+        seen.insert(signature, (generation, origin));
+        grid = reference_step_grid(&grid);
+        generation += 1;
+
+        if generation > generation_limit {
+            generation_limit = effective_generation_limit(limits, grid.population(), grid.bounds());
+        }
+    }
+
+    Classification::Unknown {
+        simulated: generation_limit,
     }
 }
 
@@ -223,6 +333,7 @@ struct BenchmarkReport {
     total: usize,
     compatible: usize,
     by_family: BTreeMap<BenchmarkFamily, SliceStats>,
+    by_error_by_family: BTreeMap<BenchmarkFamily, BTreeMap<ErrorBucket, usize>>,
     by_density: BTreeMap<u32, SliceStats>,
     by_size: BTreeMap<i32, SliceStats>,
     by_outcome: BTreeMap<OutcomeBucket, SliceStats>,
@@ -246,6 +357,7 @@ struct JsonReport {
     unknown_rate: f64,
     runtime_overall: JsonRuntimeSummary,
     by_family: BTreeMap<String, JsonSliceStats>,
+    by_error_by_family: BTreeMap<String, BTreeMap<String, usize>>,
     by_density: BTreeMap<String, JsonSliceStats>,
     by_size: BTreeMap<String, JsonSliceStats>,
     by_outcome: BTreeMap<String, JsonSliceStats>,
@@ -287,6 +399,12 @@ impl BenchmarkReport {
             self.compatible += 1;
         }
         record_slice(&mut self.by_family, case.family, compatible);
+        *self
+            .by_error_by_family
+            .entry(case.family)
+            .or_default()
+            .entry(error)
+            .or_insert(0) += 1;
         record_slice(&mut self.by_density, case.density_percent, compatible);
         record_slice(&mut self.by_size, case.size, compatible);
         record_slice(&mut self.by_outcome, outcome, compatible);
@@ -327,6 +445,7 @@ impl BenchmarkReport {
         );
         print_runtime_summary("runtime_overall", &self.runtimes);
         print_slice_map("family", &self.by_family);
+        print_nested_error_map("error_by_family", &self.by_error_by_family);
         print_slice_map("density", &self.by_density);
         print_slice_map("size", &self.by_size);
         print_slice_map("outcome", &self.by_outcome);
@@ -345,6 +464,7 @@ impl BenchmarkReport {
             unknown_rate: self.unknown_count as f64 / self.total.max(1) as f64,
             runtime_overall: runtime_summary_json(&self.runtimes),
             by_family: slice_map_json(&self.by_family),
+            by_error_by_family: nested_error_map_json(&self.by_error_by_family),
             by_density: slice_map_json(&self.by_density),
             by_size: slice_map_json(&self.by_size),
             by_outcome: slice_map_json(&self.by_outcome),
@@ -385,6 +505,19 @@ fn print_runtime_map<K: std::fmt::Debug + Ord>(label: &str, map: &BTreeMap<K, Ve
     for (key, samples) in map {
         print!("  {:?}: ", key);
         print_runtime_summary_inline(samples);
+    }
+}
+
+fn print_nested_error_map<K: std::fmt::Debug + Ord>(
+    label: &str,
+    map: &BTreeMap<K, BTreeMap<ErrorBucket, usize>>,
+) {
+    println!("{label}:");
+    for (key, buckets) in map {
+        println!("  {:?}:", key);
+        for (bucket, count) in buckets {
+            println!("    {:?}: {}", bucket, count);
+        }
     }
 }
 
@@ -449,6 +582,22 @@ fn runtime_map_json<K: std::fmt::Debug + Ord>(
 ) -> BTreeMap<String, JsonRuntimeSummary> {
     map.iter()
         .map(|(key, samples)| (format!("{key:?}"), runtime_summary_json(samples)))
+        .collect()
+}
+
+fn nested_error_map_json<K: std::fmt::Debug + Ord>(
+    map: &BTreeMap<K, BTreeMap<ErrorBucket, usize>>,
+) -> BTreeMap<String, BTreeMap<String, usize>> {
+    map.iter()
+        .map(|(key, buckets)| {
+            (
+                format!("{key:?}"),
+                buckets
+                    .iter()
+                    .map(|(bucket, count)| (format!("{bucket:?}"), *count))
+                    .collect(),
+            )
+        })
         .collect()
 }
 
@@ -548,10 +697,15 @@ fn weighted_benchmark_suite() -> Vec<BenchmarkCase> {
 }
 
 fn run_exhaustive_5x5(report: &mut BenchmarkReport) {
-    let limits = ClassificationLimits {
+    let prediction_limits = ClassificationLimits {
         max_generations: 128,
         max_population: 10_000,
-        max_bounding_box: 256,
+        max_bounding_box: i32::MAX,
+    };
+    let oracle_limits = ClassificationLimits {
+        max_generations: 256,
+        max_population: 20_000,
+        max_bounding_box: i32::MAX,
     };
 
     for mask in 0_u32..(1_u32 << 25) {
@@ -559,12 +713,18 @@ fn run_exhaustive_5x5(report: &mut BenchmarkReport) {
             continue;
         }
         let grid = bitmask_pattern(mask, 5, 5);
-        let expected = reference_classify(&grid, &limits);
+        let started = Instant::now();
+        let (actual, checkpoint) =
+            classify_seed_with_checkpoint(&grid, &prediction_limits, &mut Memo::default());
+        let expected = reference_classify_from_checkpoint(
+            checkpoint,
+            &actual,
+            &prediction_limits,
+            &oracle_limits,
+        );
         if !reference_is_decisive_runtime(&expected) {
             continue;
         }
-        let started = Instant::now();
-        let actual = classify_seed(&grid, &limits, &mut Memo::default());
         let case = BenchmarkCase {
             name: format!("5x5_{mask}"),
             family: BenchmarkFamily::ExhaustiveFiveByFive,
@@ -702,37 +862,39 @@ fn gun_puffer_breeder_cases() -> Vec<BenchmarkCase> {
 }
 
 fn delayed_interaction_cases() -> Vec<BenchmarkCase> {
-    let bases = vec![
-        (
-            "double_glider",
-            BitGrid::from_cells(&[
-                (1, 0),
-                (2, 1),
-                (0, 2),
-                (1, 2),
-                (2, 2),
-                (11, 10),
-                (12, 11),
-                (10, 12),
-                (11, 12),
-                (12, 12),
-            ]),
-        ),
-        (
-            "late_collision",
-            BitGrid::from_cells(&[
-                (1, 0),
-                (2, 1),
-                (0, 2),
-                (1, 2),
-                (2, 2),
-                (40, 30),
-                (41, 30),
-                (42, 30),
-            ]),
-        ),
-    ];
-    benchmark_cases_from_bases(BenchmarkFamily::DelayedInteraction, bases)
+    let mut cases = Vec::new();
+    for distance in [24, 48, 96, 192] {
+        let bases = vec![
+            (
+                format!("head_on_gliders_d{distance}"),
+                head_on_glider_collision(distance),
+            ),
+            (
+                format!("block_trigger_d{distance}"),
+                distant_glider_trigger(distance, pattern_by_name("block").unwrap(), (0, 0)),
+            ),
+            (
+                format!("blinker_trigger_d{distance}"),
+                distant_glider_trigger(distance, pattern_by_name("blinker").unwrap(), (0, 0)),
+            ),
+        ];
+
+        for (name, base) in bases {
+            for (idx, grid) in translated_variants(&base).into_iter().enumerate() {
+                cases.push(BenchmarkCase {
+                    name: format!("{name}_{idx}"),
+                    family: BenchmarkFamily::DelayedInteraction,
+                    size: grid
+                        .bounds()
+                        .map(|(min_x, _, max_x, _)| max_x - min_x + 1)
+                        .unwrap_or(0),
+                    density_percent: estimate_density_percent(&grid),
+                    grid,
+                });
+            }
+        }
+    }
+    cases
 }
 
 fn deceptive_ash_cases() -> Vec<BenchmarkCase> {
@@ -796,6 +958,33 @@ fn benchmark_cases_from_bases(
         }
     }
     cases
+}
+
+fn head_on_glider_collision(distance: i32) -> BitGrid {
+    let southeast_glider = [(1, 0), (2, 1), (0, 2), (1, 2), (2, 2)];
+    let northwest_glider = [(0, 0), (1, 0), (2, 0), (0, 1), (1, 2)];
+    let mut cells = offset_cells(&southeast_glider, 0, 0);
+    cells.extend(offset_cells(&northwest_glider, distance, distance));
+    BitGrid::from_cells(&cells)
+}
+
+fn distant_glider_trigger(distance: i32, target: BitGrid, target_origin: (i32, i32)) -> BitGrid {
+    let glider = [(1, 0), (2, 1), (0, 2), (1, 2), (2, 2)];
+    let mut cells = target
+        .live_cells()
+        .into_iter()
+        .map(|(x, y)| (x + target_origin.0, y + target_origin.1))
+        .collect::<Vec<_>>();
+    cells.extend(offset_cells(
+        &glider,
+        target_origin.0 - distance,
+        target_origin.1 - distance,
+    ));
+    BitGrid::from_cells(&cells)
+}
+
+fn offset_cells(cells: &[(i32, i32)], dx: i32, dy: i32) -> Vec<(i32, i32)> {
+    cells.iter().map(|&(x, y)| (x + dx, y + dy)).collect()
 }
 
 fn translated_variants(grid: &BitGrid) -> Vec<BitGrid> {
@@ -876,6 +1065,34 @@ fn reference_step_grid(grid: &BitGrid) -> BitGrid {
 
 fn reference_is_decisive_runtime(classification: &Classification) -> bool {
     !matches!(classification, Classification::Unknown { .. })
+}
+
+pub(crate) fn effective_generation_limit(
+    limits: &ClassificationLimits,
+    population: usize,
+    bounds: Option<(i32, i32, i32, i32)>,
+) -> usize {
+    const SMALL_PATTERN_POPULATION: usize = 64;
+    const SMALL_PATTERN_SPAN: i32 = 24;
+    const MIN_EXTENDED_LIMIT: usize = 1024;
+    const MAX_EXTENDED_LIMIT: usize = 2048;
+
+    let Some((min_x, min_y, max_x, max_y)) = bounds else {
+        return limits.max_generations;
+    };
+    let width = max_x - min_x + 1;
+    let height = max_y - min_y + 1;
+
+    if population <= SMALL_PATTERN_POPULATION
+        && width <= SMALL_PATTERN_SPAN
+        && height <= SMALL_PATTERN_SPAN
+    {
+        return limits
+            .max_generations
+            .clamp(MIN_EXTENDED_LIMIT, MAX_EXTENDED_LIMIT);
+    }
+
+    limits.max_generations
 }
 
 pub(crate) fn canonical_small_box_mask(mask: u32, width: usize, height: usize) -> u32 {

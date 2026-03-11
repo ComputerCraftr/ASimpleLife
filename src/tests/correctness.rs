@@ -173,6 +173,17 @@ fn diehard_eventually_dies() {
 }
 
 #[test]
+fn diehard_stops_at_extinction_before_large_generation_limit() {
+    let grid = pattern_by_name("diehard").unwrap();
+    let limits = ClassificationLimits {
+        max_generations: 10_000,
+        ..ClassificationLimits::default()
+    };
+    let result = classify_seed(&grid, &limits, &mut Memo::default());
+    assert_eq!(result, Classification::DiesOut { at_generation: 130 });
+}
+
+#[test]
 fn rpentomino_survives_short_horizon() {
     let grid = pattern_by_name("r_pentomino").unwrap();
     let limits = ClassificationLimits {
@@ -181,6 +192,46 @@ fn rpentomino_survives_short_horizon() {
     };
     let result = classify_seed(&grid, &limits, &mut Memo::default());
     assert_eq!(result, Classification::Unknown { simulated: 100 });
+}
+
+#[test]
+fn bounded_iid_soup_reaches_repeat_before_extended_limit() {
+    let seed = mix_seed(
+        ((16_u64) ^ ((30_u64) << 16) ^ (2_u64 << 32)).wrapping_add(0x9E3779B97F4A7C15),
+    );
+    let grid = random_soup(16, 16, 30, seed);
+    let limits = ClassificationLimits {
+        max_generations: 256,
+        max_population: 20_000,
+        max_bounding_box: i32::MAX,
+    };
+
+    let result = classify_seed(&grid, &limits, &mut Memo::default());
+
+    assert_eq!(
+        result,
+        Classification::Repeats {
+            period: 1,
+            first_seen: 354,
+        }
+    );
+}
+
+#[test]
+fn block_stops_at_repeat_before_large_generation_limit() {
+    let grid = pattern_by_name("block").unwrap();
+    let limits = ClassificationLimits {
+        max_generations: 10_000,
+        ..ClassificationLimits::default()
+    };
+    let result = classify_seed(&grid, &limits, &mut Memo::default());
+    assert_eq!(
+        result,
+        Classification::Repeats {
+            period: 1,
+            first_seen: 0,
+        }
+    );
 }
 
 #[test]

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 pub const CHUNK_SIZE: i32 = 8;
+const DEFAULT_CHUNK_CAPACITY: usize = 64;
 
 #[repr(align(64))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -8,7 +9,7 @@ struct Chunk {
     bits: u64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BitGrid {
     chunks: HashMap<(i32, i32), Chunk>,
     population: usize,
@@ -16,11 +17,19 @@ pub struct BitGrid {
 
 impl BitGrid {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_chunk_capacity(DEFAULT_CHUNK_CAPACITY)
+    }
+
+    pub fn with_chunk_capacity(chunk_capacity: usize) -> Self {
+        Self {
+            chunks: HashMap::with_capacity(chunk_capacity),
+            population: 0,
+        }
     }
 
     pub fn from_cells(cells: &[(i32, i32)]) -> Self {
-        let mut grid = Self::new();
+        let estimated_chunks = cells.len().div_ceil(64).max(DEFAULT_CHUNK_CAPACITY);
+        let mut grid = Self::with_chunk_capacity(estimated_chunks);
         for &(x, y) in cells {
             grid.set(x, y, true);
         }
@@ -125,6 +134,12 @@ impl BitGrid {
 
         self.population += bits.count_ones() as usize;
         self.chunks.insert((cx, cy), Chunk { bits });
+    }
+}
+
+impl Default for BitGrid {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

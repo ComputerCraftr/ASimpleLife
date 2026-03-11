@@ -83,7 +83,7 @@ pub fn step_grid_with_changes_and_memo(
     }
 
     let target_chunks = collect_target_chunks(grid);
-    let mut next = BitGrid::new();
+    let mut next = BitGrid::with_chunk_capacity(target_chunks.len());
     let mut changed = Vec::new();
     let mut pending = Vec::with_capacity(8);
 

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use crate::bitgrid::BitGrid;
+use crate::benchmark::effective_generation_limit;
 use crate::life::step_grid_with_changes_and_memo;
 use crate::memo::Memo;
 use crate::normalize::{NormalizedGridSignature, normalize};
@@ -68,9 +69,16 @@ impl Default for ClassificationLimits {
         Self {
             max_generations: 512,
             max_population: 20_000,
-            max_bounding_box: 512,
+            max_bounding_box: i32::MAX,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ClassificationCheckpoint {
+    pub generation: usize,
+    pub grid: BitGrid,
+    pub seen: HashMap<NormalizedGridSignature, (usize, (i32, i32))>,
 }
 
 pub fn classify_seed(
@@ -83,19 +91,50 @@ pub fn classify_seed(
         return cached;
     }
 
-    let mut seen: HashMap<NormalizedGridSignature, (usize, (i32, i32))> = HashMap::new();
-    let mut grid = seed.clone();
+    let (result, _) = classify_seed_with_checkpoint(seed, limits, memo);
+    memo.insert_classification(seed_signature, result.clone());
+    result
+}
+
+pub(crate) fn classify_seed_with_checkpoint(
+    seed: &BitGrid,
+    limits: &ClassificationLimits,
+    memo: &mut Memo,
+) -> (Classification, ClassificationCheckpoint) {
+    run_classification_from_state(
+        seed.clone(),
+        HashMap::new(),
+        0,
+        effective_generation_limit(limits, seed.population(), seed.bounds()),
+        limits,
+        memo,
+    )
+}
+
+fn run_classification_from_state(
+    mut grid: BitGrid,
+    mut seen: HashMap<NormalizedGridSignature, (usize, (i32, i32))>,
+    mut generation: usize,
+    mut generation_limit: usize,
+    limits: &ClassificationLimits,
+    memo: &mut Memo,
+) -> (Classification, ClassificationCheckpoint) {
     let mut metrics_history: Vec<(usize, i32, i32, i32, i32, i32)> = Vec::new();
 
-    for generation in 0..=limits.max_generations {
+    while generation <= generation_limit {
         let (signature, origin) = normalize(&grid);
 
         if grid.is_empty() {
-            let result = Classification::DiesOut {
-                at_generation: generation,
-            };
-            memo.insert_classification(seed_signature, result.clone());
-            return result;
+            return (
+                Classification::DiesOut {
+                    at_generation: generation,
+                },
+                ClassificationCheckpoint {
+                    generation,
+                    grid,
+                    seen,
+                },
+            );
         }
 
         if let Some(&(first_seen, first_origin)) = seen.get(&signature) {
@@ -112,17 +151,28 @@ pub fn classify_seed(
                     detected_at: generation,
                 }
             };
-            memo.insert_classification(seed_signature, result.clone());
-            return result;
+            return (
+                result,
+                ClassificationCheckpoint {
+                    generation,
+                    grid,
+                    seen,
+                },
+            );
         }
 
         if grid.population() > limits.max_population {
-            let result = Classification::LikelyInfinite {
-                reason: "population_growth",
-                detected_at: generation,
-            };
-            memo.insert_classification(seed_signature, result.clone());
-            return result;
+            return (
+                Classification::LikelyInfinite {
+                    reason: "population_growth",
+                    detected_at: generation,
+                },
+                ClassificationCheckpoint {
+                    generation,
+                    grid,
+                    seen,
+                },
+            );
         }
 
         if let Some((min_x, min_y, max_x, max_y)) = grid.bounds() {
@@ -137,39 +187,111 @@ pub fn classify_seed(
                 width.max(height),
             ));
             if width > limits.max_bounding_box || height > limits.max_bounding_box {
-                let result = Classification::LikelyInfinite {
-                    reason: "expanding_bounds",
-                    detected_at: generation,
-                };
-                memo.insert_classification(seed_signature, result.clone());
-                return result;
+                return (
+                    Classification::LikelyInfinite {
+                        reason: "expanding_bounds",
+                        detected_at: generation,
+                    },
+                    ClassificationCheckpoint {
+                        generation,
+                        grid,
+                        seen,
+                    },
+                );
             }
 
-            if let Some(result) = detect_persistent_expansion(generation, &metrics_history, &grid) {
-                memo.insert_classification(seed_signature, result.clone());
-                return result;
+            if let Some(result) =
+                detect_persistent_expansion(generation, &metrics_history, &grid, limits)
+            {
+                return (
+                    result,
+                    ClassificationCheckpoint {
+                        generation,
+                        grid,
+                        seen,
+                    },
+                );
             }
         }
 
         seen.insert(signature.clone(), (generation, origin));
         grid = next_grid_with_memo(&signature, &grid, memo);
+        generation += 1;
+
+        if generation > generation_limit {
+            let mut next_limit =
+                effective_generation_limit(limits, grid.population(), grid.bounds());
+            if next_limit <= generation_limit
+                && let Some(settling_limit) =
+                    settling_extension_limit(limits, generation_limit, &metrics_history)
+            {
+                next_limit = settling_limit;
+            }
+            generation_limit = next_limit;
+        }
     }
 
-    let result = Classification::Unknown {
-        simulated: limits.max_generations,
-    };
-    memo.insert_classification(seed_signature, result.clone());
-    result
+    (
+        Classification::Unknown {
+            simulated: generation_limit,
+        },
+        ClassificationCheckpoint {
+            generation,
+            grid,
+            seen,
+        },
+    )
+}
+
+fn settling_extension_limit(
+    limits: &ClassificationLimits,
+    generation_limit: usize,
+    metrics_history: &[(usize, i32, i32, i32, i32, i32)],
+) -> Option<usize> {
+    const MAX_SETTLING_POPULATION: usize = 256;
+    const MAX_SETTLING_SPAN: i32 = 64;
+    const MAX_WIDE_SETTLING_POPULATION: usize = 16;
+    const MAX_WIDE_SETTLING_SPAN: i32 = 256;
+    const MIN_EXTENSION_LIMIT: usize = 512;
+    const MAX_EXTENSION_LIMIT: usize = 1024;
+
+    if limits.max_generations < 256 || generation_limit >= MAX_EXTENSION_LIMIT {
+        return None;
+    }
+
+    let &(current_population, _, _, _, _, max_span) = metrics_history.last()?;
+    let bounded_small_pattern =
+        current_population <= MAX_SETTLING_POPULATION && max_span <= MAX_SETTLING_SPAN;
+    let bounded_wide_tiny_pattern =
+        current_population <= MAX_WIDE_SETTLING_POPULATION && max_span <= MAX_WIDE_SETTLING_SPAN;
+
+    if !bounded_small_pattern && !bounded_wide_tiny_pattern {
+        return None;
+    }
+
+    Some(
+        limits
+            .max_generations
+            .saturating_mul(2)
+            .clamp(MIN_EXTENSION_LIMIT, MAX_EXTENSION_LIMIT),
+    )
 }
 
 fn detect_persistent_expansion(
     generation: usize,
     metrics_history: &[(usize, i32, i32, i32, i32, i32)],
     grid: &BitGrid,
+    limits: &ClassificationLimits,
 ) -> Option<Classification> {
     const BURN_IN: usize = 288;
     const WINDOW: usize = 32;
     const MIN_POPULATION_GROWTH_PER_WINDOW: usize = 1;
+    const MIN_PERSISTENT_EXPANSION_SPAN: i32 = 64;
+    const MIN_HEURISTIC_HORIZON: usize = 512;
+
+    if limits.max_generations < MIN_HEURISTIC_HORIZON {
+        return None;
+    }
 
     if generation < BURN_IN || metrics_history.len() <= WINDOW * 2 {
         return None;
@@ -179,8 +301,18 @@ fn detect_persistent_expansion(
         metrics_history[metrics_history.len() - (WINDOW * 2) - 1];
     let (mid_population, mid_min_x, mid_max_x, mid_min_y, mid_max_y, _) =
         metrics_history[metrics_history.len() - WINDOW - 1];
-    let (current_population, current_min_x, current_max_x, current_min_y, current_max_y, _) =
-        metrics_history[metrics_history.len() - 1];
+    let (
+        current_population,
+        current_min_x,
+        current_max_x,
+        current_min_y,
+        current_max_y,
+        current_span,
+    ) = metrics_history[metrics_history.len() - 1];
+
+    if current_span < MIN_PERSISTENT_EXPANSION_SPAN {
+        return None;
+    }
 
     let monotone_population = current_population >= mid_population
         && mid_population >= old_population
