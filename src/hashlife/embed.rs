@@ -25,8 +25,10 @@ impl HashLifeOracle {
         }
         let shift_x = (size as i32 - width) / 2 - min_x;
         let shift_y = (size as i32 - height) / 2 - min_y;
-        let mut translated = grid
-            .live_cells()
+        let live_cells = grid.live_cells();
+        let mut translated = Vec::with_capacity(live_cells.len());
+        translated.extend(
+            live_cells
             .into_iter()
             .map(|(x, y)| {
                 let tx = (x + shift_x) as u32;
@@ -34,8 +36,8 @@ impl HashLifeOracle {
                 EmbeddedCell {
                     key: morton_key(tx, ty),
                 }
-            })
-            .collect::<Vec<_>>();
+            }),
+        );
         translated.sort_unstable_by_key(|cell| cell.key);
         let root = self.build_node_from_cells_iterative(&translated, level);
         EmbeddedJump {
@@ -80,7 +82,9 @@ impl HashLifeOracle {
             level,
             bit_shift: level.saturating_sub(1) * 2,
         }];
-        let mut results = Vec::new();
+        let estimated_internal = (cells.len().max(1).next_power_of_two() * 2).min(1 << 16);
+        ops.reserve(estimated_internal / 2);
+        let mut results = Vec::with_capacity(estimated_internal);
 
         while let Some(op) = ops.pop() {
             match op {

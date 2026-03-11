@@ -3,36 +3,28 @@ use crate::bitgrid::BitGrid;
 
 impl HashLifeOracle {
     pub(super) fn base_transition(&mut self, node: NodeId) -> NodeId {
-        let mut mask = 0_u16;
-        let mut live = Vec::with_capacity(self.nodes[node as usize].population as usize);
-        self.collect_cells_iterative(node, 0, 0, 4, &mut live);
-        for (x, y) in live {
-            let bit = (y * 4 + x) as u16;
-            mask |= 1 << bit;
-        }
-
+        let Node { nw, ne, sw, se, .. } = self.nodes[node as usize];
+        let mask = self.level1_to_4x4_mask(nw, 0, 0)
+            | self.level1_to_4x4_mask(ne, 2, 0)
+            | self.level1_to_4x4_mask(sw, 0, 2)
+            | self.level1_to_4x4_mask(se, 2, 2);
         let centered = base_transitions()[mask as usize];
-        let nw = if centered & 0b0001 != 0 {
-            self.live_leaf
-        } else {
-            self.dead_leaf
-        };
-        let ne = if centered & 0b0010 != 0 {
-            self.live_leaf
-        } else {
-            self.dead_leaf
-        };
-        let sw = if centered & 0b0100 != 0 {
-            self.live_leaf
-        } else {
-            self.dead_leaf
-        };
-        let se = if centered & 0b1000 != 0 {
-            self.live_leaf
-        } else {
-            self.dead_leaf
-        };
+        let leaves = [self.dead_leaf, self.live_leaf];
+        let nw = leaves[(centered & 0b0001 != 0) as usize];
+        let ne = leaves[((centered >> 1) & 0b0001) as usize];
+        let sw = leaves[((centered >> 2) & 0b0001) as usize];
+        let se = leaves[((centered >> 3) & 0b0001) as usize];
         self.join(nw, ne, sw, se)
+    }
+
+    fn level1_to_4x4_mask(&self, node: NodeId, base_x: u16, base_y: u16) -> u16 {
+        let Node { level, nw, ne, sw, se, .. } = self.nodes[node as usize];
+        debug_assert_eq!(level, 1);
+        (u16::from(self.nodes[nw as usize].population != 0) << (base_y * 4 + base_x))
+            | (u16::from(self.nodes[ne as usize].population != 0) << (base_y * 4 + base_x + 1))
+            | (u16::from(self.nodes[sw as usize].population != 0) << ((base_y + 1) * 4 + base_x))
+            | (u16::from(self.nodes[se as usize].population != 0)
+                << ((base_y + 1) * 4 + base_x + 1))
     }
 
     pub(super) fn node_to_grid(&self, node: NodeId, offset_x: i32, offset_y: i32) -> BitGrid {

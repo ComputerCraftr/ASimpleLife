@@ -125,6 +125,41 @@ struct HashLifeStats {
     builder_partitions: usize,
 }
 
+#[derive(Clone, Copy)]
+enum PendingTask {
+    PhaseOne {
+        next_exp: u32,
+        a: NodeId,
+        b: NodeId,
+        c: NodeId,
+        d: NodeId,
+        e: NodeId,
+        f: NodeId,
+        g: NodeId,
+        h: NodeId,
+        i: NodeId,
+    },
+    PhaseTwo {
+        next_exp: u32,
+        nw: NodeId,
+        ne: NodeId,
+        sw: NodeId,
+        se: NodeId,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct TaskRecord {
+    remaining: u8,
+    task: PendingTask,
+}
+
+#[derive(Clone, Copy)]
+struct Step0TaskRecord {
+    remaining: u8,
+    children: [NodeId; 4],
+}
+
 #[derive(Clone, Copy, Debug)]
 struct EmbeddedCell {
     key: u64,
@@ -183,6 +218,10 @@ impl Default for HashLifeOracle {
 }
 
 impl HashLifeOracle {
+    fn cached_jump_result(&self, key: (NodeId, u32)) -> Option<NodeId> {
+        self.jump_cache.get(&key).copied()
+    }
+
     pub fn advance(&mut self, grid: &BitGrid, generations: u64) -> BitGrid {
         if generations == 0 || grid.is_empty() {
             return grid.clone();
@@ -292,34 +331,16 @@ impl HashLifeOracle {
     }
 
     fn advance_power_of_two_recursive(&mut self, node: NodeId, step_exp: u32) -> NodeId {
-        #[derive(Clone, Copy)]
-        enum PendingTask {
-            PhaseOne {
-                next_exp: u32,
-                a: NodeId,
-                b: NodeId,
-                c: NodeId,
-                d: NodeId,
-                e: NodeId,
-                f: NodeId,
-                g: NodeId,
-                h: NodeId,
-                i: NodeId,
-            },
-            PhaseTwo {
-                next_exp: u32,
-                nw: NodeId,
-                ne: NodeId,
-                sw: NodeId,
-                se: NodeId,
-            },
-        }
-
         let debug = hashlife_debug_enabled();
-        let mut discover = vec![(node, step_exp)];
-        let mut pending: HashMap<(NodeId, u32), (u8, PendingTask)> = HashMap::new();
-        let mut dependents: HashMap<(NodeId, u32), Vec<(NodeId, u32)>> = HashMap::new();
-        let mut ready = Vec::new();
+        let level = self.nodes[node as usize].level as usize;
+        let task_capacity = 1usize << level.saturating_sub(step_exp as usize + 1).min(10);
+        let mut discover = Vec::with_capacity(task_capacity.max(8));
+        discover.push((node, step_exp));
+        let mut task_index: HashMap<(NodeId, u32), usize> = HashMap::with_capacity(task_capacity);
+        let mut tasks = Vec::<Option<TaskRecord>>::with_capacity(task_capacity);
+        let mut task_keys = Vec::<Option<(NodeId, u32)>>::with_capacity(task_capacity);
+        let mut dependents: HashMap<(NodeId, u32), Vec<usize>> = HashMap::with_capacity(task_capacity);
+        let mut ready = Vec::<usize>::with_capacity(task_capacity);
         let mut iterations = 0_usize;
         let mut max_stack = discover.len();
         let mut next_iteration_log = 100_000_usize;
@@ -337,7 +358,7 @@ impl HashLifeOracle {
                         discover.len(),
                         max_stack,
                         self.jump_cache.len(),
-                        pending.len(),
+                        task_index.len(),
                         ready.len(),
                     );
                     next_iteration_log += 100_000;
@@ -348,18 +369,18 @@ impl HashLifeOracle {
                         discover.len(),
                         max_stack,
                         self.jump_cache.len(),
-                        pending.len(),
+                        task_index.len(),
                         ready.len(),
                     );
                     next_stack_log = next_stack_log.saturating_mul(2);
                 }
                 let key = (node, step_exp);
-                if self.jump_cache.contains_key(&key) {
+                if self.cached_jump_result(key).is_some() {
                     self.stats.jump_cache_hits += 1;
                     continue;
                 }
                 self.stats.jump_cache_misses += 1;
-                if pending.contains_key(&key) {
+                if task_index.contains_key(&key) {
                     continue;
                 }
 
@@ -370,29 +391,31 @@ impl HashLifeOracle {
                 if step_exp == 0 {
                     let result = self.advance_one_generation_centered(node);
                     self.jump_cache.insert(key, result);
-                    notify_dependents(&key, &mut pending, &mut dependents, &mut ready);
+                    notify_dependents(&key, &mut tasks, &mut dependents, &mut ready);
                     continue;
                 }
 
                 if self.nodes[node as usize].population == 0 {
                     let result = self.empty(level - 1);
                     self.jump_cache.insert(key, result);
-                    notify_dependents(&key, &mut pending, &mut dependents, &mut ready);
+                    notify_dependents(&key, &mut tasks, &mut dependents, &mut ready);
                     continue;
                 }
 
                 if level == 2 {
                     let result = self.base_transition(node);
                     self.jump_cache.insert(key, result);
-                    notify_dependents(&key, &mut pending, &mut dependents, &mut ready);
+                    notify_dependents(&key, &mut tasks, &mut dependents, &mut ready);
                     continue;
                 }
 
                 let [a, b, c, d, e, f, g, h, i] = self.overlapping_subnodes(node);
                 let next_exp = step_exp - 1;
-                pending.insert(
-                    key,
-                    (0, PendingTask::PhaseOne {
+                let task_id = tasks.len();
+                task_index.insert(key, task_id);
+                tasks.push(Some(TaskRecord {
+                    remaining: 0,
+                    task: PendingTask::PhaseOne {
                         next_exp,
                         a,
                         b,
@@ -403,21 +426,21 @@ impl HashLifeOracle {
                         g,
                         h,
                         i,
-                    }),
-                );
+                    },
+                }));
+                task_keys.push(Some(key));
                 for child in [i, h, g, f, e, d, c, b, a] {
                     let child_key = (child, next_exp);
-                    if !self.jump_cache.contains_key(&child_key) {
-                        dependents.entry(child_key).or_default().push(key);
-                        let entry = pending.get_mut(&key).unwrap();
-                        entry.0 += 1;
-                        if !pending.contains_key(&child_key) {
+                    if self.cached_jump_result(child_key).is_none() {
+                        dependents.entry(child_key).or_default().push(task_id);
+                        tasks[task_id].as_mut().unwrap().remaining += 1;
+                        if !task_index.contains_key(&child_key) {
                             discover.push(child_key);
                         }
                     }
                 }
-                if pending[&key].0 == 0 {
-                    ready.push(key);
+                if tasks[task_id].as_ref().unwrap().remaining == 0 {
+                    ready.push(task_id);
                 }
                 continue;
             }
@@ -426,9 +449,10 @@ impl HashLifeOracle {
                 break;
             }
 
-            let Some(task_key) = ready.pop() else {
-                let sample = pending.iter().next().map(|(&(pending_node, pending_exp), &task)| {
-                    let (recurse_exp, missing) = match task.1 {
+            let Some(task_id) = ready.pop() else {
+                let sample = task_index.iter().next().map(|(&(pending_node, pending_exp), &task_id)| {
+                    let task = tasks[task_id].unwrap();
+                    let (recurse_exp, missing) = match task.task {
                         PendingTask::PhaseOne {
                             next_exp,
                             a,
@@ -444,7 +468,7 @@ impl HashLifeOracle {
                             next_exp,
                             [a, b, c, d, e, f, g, h, i]
                                 .into_iter()
-                                .filter(|&child| !self.jump_cache.contains_key(&(child, next_exp)))
+                                .filter(|&child| self.cached_jump_result((child, next_exp)).is_none())
                                 .collect::<Vec<_>>(),
                         ),
                         PendingTask::PhaseTwo {
@@ -457,7 +481,7 @@ impl HashLifeOracle {
                             next_exp,
                             [nw, ne, sw, se]
                                 .into_iter()
-                                .filter(|&child| !self.jump_cache.contains_key(&(child, next_exp)))
+                                .filter(|&child| self.cached_jump_result((child, next_exp)).is_none())
                                 .collect::<Vec<_>>(),
                         ),
                     };
@@ -465,12 +489,16 @@ impl HashLifeOracle {
                 });
                 panic!(
                     "hashlife dependency resolution stalled for node={node} step_exp={step_exp} pending={} sample={sample:?}",
-                    pending.len()
+                    task_index.len()
                 );
             };
-            let (remaining, task) = pending.remove(&task_key).unwrap();
-            debug_assert_eq!(remaining, 0);
-            match task {
+            let Some(task_key) = task_keys[task_id].take() else {
+                continue;
+            };
+            task_index.remove(&task_key);
+            let task = tasks[task_id].take().unwrap();
+            debug_assert_eq!(task.remaining, 0);
+            match task.task {
                 PendingTask::PhaseOne { .. } => {
                     let (pending_node, pending_exp) = task_key;
                     let PendingTask::PhaseOne {
@@ -484,7 +512,7 @@ impl HashLifeOracle {
                         g,
                         h,
                         i,
-                    } = task else { unreachable!() };
+                    } = task.task else { unreachable!() };
                     let aa = self.jump_cache[&(a, next_exp)];
                     let bb = self.jump_cache[&(b, next_exp)];
                     let cc = self.jump_cache[&(c, next_exp)];
@@ -500,29 +528,31 @@ impl HashLifeOracle {
                     let sw = self.join(dd, ee, gg, hh);
                     let se = self.join(ee, ff, hh, ii);
                     let parent_key = (pending_node, pending_exp);
-                    pending.insert(
-                        parent_key,
-                        (0, PendingTask::PhaseTwo {
+                    let parent_id = task_id;
+                    task_index.insert(parent_key, parent_id);
+                    task_keys[parent_id] = Some(parent_key);
+                    tasks[parent_id] = Some(TaskRecord {
+                        remaining: 0,
+                        task: PendingTask::PhaseTwo {
                             next_exp,
                             nw,
                             ne,
                             sw,
                             se,
-                        }),
-                    );
+                        },
+                    });
                     for child in [se, sw, ne, nw] {
                         let child_key = (child, next_exp);
-                        if !self.jump_cache.contains_key(&child_key) {
-                            dependents.entry(child_key).or_default().push(parent_key);
-                            let entry = pending.get_mut(&parent_key).unwrap();
-                            entry.0 += 1;
-                            if !pending.contains_key(&child_key) {
+                        if self.cached_jump_result(child_key).is_none() {
+                            dependents.entry(child_key).or_default().push(parent_id);
+                            tasks[parent_id].as_mut().unwrap().remaining += 1;
+                            if !task_index.contains_key(&child_key) {
                                 discover.push(child_key);
                             }
                         }
                     }
-                    if pending[&parent_key].0 == 0 {
-                        ready.push(parent_key);
+                    if tasks[parent_id].as_ref().unwrap().remaining == 0 {
+                        ready.push(parent_id);
                     }
                 }
                 PendingTask::PhaseTwo { .. } => {
@@ -533,7 +563,7 @@ impl HashLifeOracle {
                         ne,
                         sw,
                         se,
-                    } = task else { unreachable!() };
+                    } = task.task else { unreachable!() };
                     let q00 = self.jump_cache[&(nw, next_exp)];
                     let q01 = self.jump_cache[&(ne, next_exp)];
                     let q10 = self.jump_cache[&(sw, next_exp)];
@@ -541,7 +571,7 @@ impl HashLifeOracle {
                     let result = self.join(q00, q01, q10, q11);
                     let key = (pending_node, pending_exp);
                     self.jump_cache.insert(key, result);
-                    notify_dependents(&key, &mut pending, &mut dependents, &mut ready);
+                    notify_dependents(&key, &mut tasks, &mut dependents, &mut ready);
                 }
             }
         }
@@ -551,7 +581,7 @@ impl HashLifeOracle {
                 "[hashlife] advance_pow2 done root={node} step_exp={step_exp} iterations={iterations} max_stack={} cache={} pending={} ready={}",
                 max_stack,
                 self.jump_cache.len(),
-                pending.len(),
+                task_index.len(),
                 ready.len(),
             );
         }
@@ -567,22 +597,27 @@ impl HashLifeOracle {
         }
 
         let debug = hashlife_debug_enabled();
-        let mut discover = vec![node];
-        let mut pending: HashMap<NodeId, (u8, [NodeId; 4])> = HashMap::new();
-        let mut dependents: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
-        let mut ready = Vec::new();
+        let level = self.nodes[node as usize].level as usize;
+        let task_capacity = 1usize << level.saturating_sub(1).min(10);
+        let mut discover = Vec::with_capacity(task_capacity.max(8));
+        discover.push(node);
+        let mut task_index: HashMap<NodeId, usize> = HashMap::with_capacity(task_capacity);
+        let mut tasks = Vec::<Option<Step0TaskRecord>>::with_capacity(task_capacity);
+        let mut task_keys = Vec::<Option<NodeId>>::with_capacity(task_capacity);
+        let mut dependents: HashMap<NodeId, Vec<usize>> = HashMap::with_capacity(task_capacity);
+        let mut ready = Vec::<usize>::with_capacity(task_capacity);
         let mut iterations = 0_usize;
 
         while !self.jump_cache.contains_key(&key) {
             while let Some(node) = discover.pop() {
                 iterations += 1;
                 let key = (node, 0);
-                if self.jump_cache.contains_key(&key) {
+                if self.cached_jump_result(key).is_some() {
                     self.stats.jump_cache_hits += 1;
                     continue;
                 }
                 self.stats.jump_cache_misses += 1;
-                if pending.contains_key(&node) {
+                if task_index.contains_key(&node) {
                     continue;
                 }
 
@@ -592,14 +627,14 @@ impl HashLifeOracle {
                 if self.nodes[node as usize].population == 0 {
                     let result = self.empty(level - 1);
                     self.jump_cache.insert(key, result);
-                    notify_step0_dependents(node, &mut pending, &mut dependents, &mut ready);
+                    notify_step0_dependents(node, &mut tasks, &mut dependents, &mut ready);
                     continue;
                 }
 
                 if level == 2 {
                     let result = self.base_transition(node);
                     self.jump_cache.insert(key, result);
-                    notify_step0_dependents(node, &mut pending, &mut dependents, &mut ready);
+                    notify_step0_dependents(node, &mut tasks, &mut dependents, &mut ready);
                     continue;
                 }
 
@@ -617,20 +652,25 @@ impl HashLifeOracle {
                 let ne = self.join(b, c, e, f);
                 let sw = self.join(d, e, g, h);
                 let se = self.join(e, f, h, i);
-                pending.insert(node, (0, [nw, ne, sw, se]));
+                let task_id = tasks.len();
+                task_index.insert(node, task_id);
+                tasks.push(Some(Step0TaskRecord {
+                    remaining: 0,
+                    children: [nw, ne, sw, se],
+                }));
+                task_keys.push(Some(node));
 
                 for child in [se, sw, ne, nw] {
-                    if !self.jump_cache.contains_key(&(child, 0)) {
-                        dependents.entry(child).or_default().push(node);
-                        let entry = pending.get_mut(&node).unwrap();
-                        entry.0 += 1;
-                        if !pending.contains_key(&child) {
+                    if self.cached_jump_result((child, 0)).is_none() {
+                        dependents.entry(child).or_default().push(task_id);
+                        tasks[task_id].as_mut().unwrap().remaining += 1;
+                        if !task_index.contains_key(&child) {
                             discover.push(child);
                         }
                     }
                 }
-                if pending[&node].0 == 0 {
-                    ready.push(node);
+                if tasks[task_id].as_ref().unwrap().remaining == 0 {
+                    ready.push(task_id);
                 }
             }
 
@@ -638,33 +678,37 @@ impl HashLifeOracle {
                 break;
             }
 
-            let Some(task_node) = ready.pop() else {
-                let sample = pending.iter().next().map(|(&pending_node, &(remaining, task))| {
-                    (pending_node, remaining, task)
+            let Some(task_id) = ready.pop() else {
+                let sample = task_index.iter().next().map(|(&pending_node, &task_id)| {
+                    let task = tasks[task_id].unwrap();
+                    (pending_node, task.remaining, task.children)
                 });
                 panic!(
                     "hashlife step-0 dependency resolution stalled for node={node} pending={} sample={sample:?}",
-                    pending.len()
+                    task_index.len()
                 );
             };
-
-            let (remaining, task) = pending.remove(&task_node).unwrap();
-            debug_assert_eq!(remaining, 0);
-            let [nw, ne, sw, se] = task;
+            let Some(task_node) = task_keys[task_id].take() else {
+                continue;
+            };
+            task_index.remove(&task_node);
+            let task = tasks[task_id].take().unwrap();
+            debug_assert_eq!(task.remaining, 0);
+            let [nw, ne, sw, se] = task.children;
             let q00 = self.jump_cache[&(nw, 0)];
             let q01 = self.jump_cache[&(ne, 0)];
             let q10 = self.jump_cache[&(sw, 0)];
             let q11 = self.jump_cache[&(se, 0)];
             let result = self.join(q00, q01, q10, q11);
             self.jump_cache.insert((task_node, 0), result);
-            notify_step0_dependents(task_node, &mut pending, &mut dependents, &mut ready);
+            notify_step0_dependents(task_node, &mut tasks, &mut dependents, &mut ready);
         }
 
         if debug {
             eprintln!(
                 "[hashlife] advance_step0 done root={node} iterations={iterations} cache={} pending={} ready={}",
                 self.jump_cache.len(),
-                pending.len(),
+                task_index.len(),
                 ready.len(),
             );
         }
@@ -721,16 +765,16 @@ fn hashlife_debug_enabled() -> bool {
 
 fn notify_dependents(
     key: &(NodeId, u32),
-    pending: &mut HashMap<(NodeId, u32), (u8, impl Copy)>,
-    dependents: &mut HashMap<(NodeId, u32), Vec<(NodeId, u32)>>,
-    ready: &mut Vec<(NodeId, u32)>,
+    tasks: &mut [Option<TaskRecord>],
+    dependents: &mut HashMap<(NodeId, u32), Vec<usize>>,
+    ready: &mut Vec<usize>,
 ) {
     if let Some(waiters) = dependents.remove(key) {
-        for waiter in waiters {
-            if let Some((remaining, _)) = pending.get_mut(&waiter) {
-                *remaining -= 1;
-                if *remaining == 0 {
-                    ready.push(waiter);
+        for waiter_id in waiters {
+            if let Some(task) = tasks[waiter_id].as_mut() {
+                task.remaining -= 1;
+                if task.remaining == 0 {
+                    ready.push(waiter_id);
                 }
             }
         }
@@ -739,16 +783,16 @@ fn notify_dependents(
 
 fn notify_step0_dependents(
     node: NodeId,
-    pending: &mut HashMap<NodeId, (u8, impl Copy)>,
-    dependents: &mut HashMap<NodeId, Vec<NodeId>>,
-    ready: &mut Vec<NodeId>,
+    tasks: &mut [Option<Step0TaskRecord>],
+    dependents: &mut HashMap<NodeId, Vec<usize>>,
+    ready: &mut Vec<usize>,
 ) {
     if let Some(waiters) = dependents.remove(&node) {
-        for waiter in waiters {
-            if let Some((remaining, _)) = pending.get_mut(&waiter) {
-                *remaining -= 1;
-                if *remaining == 0 {
-                    ready.push(waiter);
+        for waiter_id in waiters {
+            if let Some(task) = tasks[waiter_id].as_mut() {
+                task.remaining -= 1;
+                if task.remaining == 0 {
+                    ready.push(waiter_id);
                 }
             }
         }
