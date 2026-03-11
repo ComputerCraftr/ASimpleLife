@@ -1,5 +1,5 @@
-use super::super::cli::Config;
-use super::super::initial_grid;
+use crate::app::initial_grid;
+use crate::cli::Config;
 use crate::normalize::normalize;
 
 #[test]

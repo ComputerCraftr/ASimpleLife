@@ -1,41 +1,14 @@
-mod bitgrid;
-mod classify;
-mod cli;
-mod generators;
-mod life;
-mod memo;
-mod normalize;
-mod render;
-mod term;
-#[cfg(test)]
-#[path = "tests/mod.rs"]
-mod tests;
-
 use std::thread;
 use std::time::Duration;
 use std::{io::Write, io::stdout};
 
-use bitgrid::BitGrid;
-use classify::{ClassificationLimits, classify_seed};
-use cli::Config;
-use generators::{pattern_by_name, random_soup};
-use life::GameOfLife;
-use memo::Memo;
-use render::TerminalBackbuffer;
-use term::terminal_view_size;
-
-fn initial_grid(config: &Config) -> BitGrid {
-    if config.pattern == "random" {
-        return random_soup(
-            (config.width as i32) * 2 / 3,
-            config.height as i32,
-            37,
-            config.seed,
-        );
-    }
-
-    pattern_by_name(&config.pattern).expect("validated pattern name")
-}
+use a_simple_life::app::initial_grid;
+use a_simple_life::classify::{ClassificationLimits, classify_seed};
+use a_simple_life::cli;
+use a_simple_life::life::GameOfLife;
+use a_simple_life::memo::Memo;
+use a_simple_life::render::TerminalBackbuffer;
+use a_simple_life::term::terminal_view_size;
 
 fn main() {
     let config = match cli::parse_args() {

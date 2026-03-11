@@ -9,6 +9,10 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 
+[profile.release-debug]
+inherits = "release"
+debug = true
+
 [dependencies]
 bytemuck = { version = "1.25.0", features = ["must_cast"] }
 libc = "0.2.183"
