@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::bitgrid::BitGrid;
 use crate::classify::{Classification, ClassificationLimits, classify_seed};
-use crate::generators::{pattern_by_name, random_soup};
+use crate::generators::{mix_seed, pattern_by_name, random_soup};
 use crate::life::{GameOfLife, step_grid, step_grid_with_changes_and_memo};
 use crate::memo::Memo;
 use crate::normalize::normalize;
@@ -349,38 +349,7 @@ fn structured_random_soups_match_reference_when_reference_is_decisive() {
     }
 }
 
-#[test]
-#[ignore = "exhaustive 5x5 sweep is expensive"]
-fn exhaustive_all_5x5_patterns_reference_check() {
-    let limits = ClassificationLimits {
-        max_generations: 128,
-        max_population: 10_000,
-        max_bounding_box: 256,
-    };
-    for mask in 0_u32..(1_u32 << 25) {
-        let grid = bitmask_pattern(mask, 5, 5);
-        let expected = reference_classify(&grid, &limits);
-        if !reference_is_decisive(&expected) {
-            continue;
-        }
-        let actual = classify_seed(&grid, &limits, &mut Memo::default());
-        assert_same_outcome(&format!("mask_{mask}"), &expected, &actual);
-    }
-}
-
-#[test]
-#[ignore = "benchmark/report harness"]
-fn classification_benchmark_report() {
-    run_benchmark_report(false);
-}
-
-#[test]
-#[ignore = "benchmark/report harness"]
-fn classification_benchmark_report_json() {
-    run_benchmark_report(true);
-}
-
-fn run_benchmark_report(as_json: bool) {
+pub(super) fn run_benchmark_report(as_json: bool) {
     let limits = ClassificationLimits {
         max_generations: 256,
         max_population: 20_000,
@@ -527,7 +496,7 @@ fn assert_matches_reference_if_decisive(name: &str, grid: &BitGrid, limits: &Cla
     assert_same_outcome(name, &expected, &actual);
 }
 
-fn assert_same_outcome(name: &str, expected: &Classification, actual: &Classification) {
+pub(super) fn assert_same_outcome(name: &str, expected: &Classification, actual: &Classification) {
     match (expected, actual) {
         (Classification::DiesOut { .. }, Classification::DiesOut { .. }) => {}
         (
@@ -566,7 +535,7 @@ fn assert_same_outcome(name: &str, expected: &Classification, actual: &Classific
     }
 }
 
-fn reference_is_decisive(classification: &Classification) -> bool {
+pub(super) fn reference_is_decisive(classification: &Classification) -> bool {
     !matches!(classification, Classification::Unknown { .. })
 }
 
@@ -632,7 +601,7 @@ fn curated_reference_suite() -> Vec<NamedCase> {
     cases
 }
 
-fn bitmask_pattern(mask: u32, width: i32, height: i32) -> BitGrid {
+pub(super) fn bitmask_pattern(mask: u32, width: i32, height: i32) -> BitGrid {
     let mut cells = Vec::new();
     for y in 0..height {
         for x in 0..width {
@@ -688,14 +657,10 @@ fn structured_random_soup(width: i32, height: i32, seed: u64) -> BitGrid {
 }
 
 fn hash_seed(a: i32, b: u32, c: u64) -> u64 {
-    let mut z = (a as u64) ^ ((b as u64) << 16) ^ (c << 32);
-    z = z.wrapping_add(0x9E3779B97F4A7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^ (z >> 31)
+    mix_seed(((a as u64) ^ ((b as u64) << 16) ^ (c << 32)).wrapping_add(0x9E3779B97F4A7C15))
 }
 
-fn reference_classify(seed: &BitGrid, limits: &ClassificationLimits) -> Classification {
+pub(super) fn reference_classify(seed: &BitGrid, limits: &ClassificationLimits) -> Classification {
     let mut seen: HashMap<Vec<(i32, i32)>, (usize, (i32, i32))> = HashMap::new();
     let mut grid = seed.clone();
 

@@ -8,6 +8,7 @@ mod normalize;
 mod render;
 mod term;
 #[cfg(test)]
+#[path = "tests/mod.rs"]
 mod tests;
 
 use std::thread;
