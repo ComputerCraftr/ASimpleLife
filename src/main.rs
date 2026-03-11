@@ -32,7 +32,10 @@ fn main() {
         advance_grid(&initial, config.fast_forward).grid
     };
     let mut memo = Memo::default();
-    let limits = ClassificationLimits::default();
+    let mut limits = ClassificationLimits::default();
+    if let Some(max_generations) = config.max_generations {
+        limits.max_generations = max_generations;
+    }
     let classification = classify_seed(&grid, &limits, &mut memo);
 
     if config.classify_only {

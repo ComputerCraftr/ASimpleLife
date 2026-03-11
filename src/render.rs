@@ -1,4 +1,4 @@
-use crate::bitgrid::BitGrid;
+use crate::bitgrid::{BitGrid, Cell, Coord};
 use crate::life::ChunkDiff;
 use std::io::{self, Write};
 
@@ -6,7 +6,7 @@ use std::io::{self, Write};
 pub struct TerminalBackbuffer {
     width: usize,
     height: usize,
-    origin: Option<(i32, i32)>,
+    origin: Option<Cell>,
     cells: Vec<u8>,
     dirty_rows: Vec<Option<(usize, usize)>>,
 }
@@ -25,7 +25,7 @@ impl TerminalBackbuffer {
     pub fn render_into<W: Write>(
         &mut self,
         grid: &BitGrid,
-        changed_cells: Option<&[(i32, i32)]>,
+        changed_cells: Option<&[Cell]>,
         out: &mut W,
     ) -> io::Result<()> {
         let next_origin = compute_origin(self.width, self.height, grid);
@@ -83,23 +83,27 @@ impl TerminalBackbuffer {
         }
     }
 
-    fn update_terminal_cell_for_world(&mut self, grid: &BitGrid, x: i32, y: i32) {
+    fn update_terminal_cell_for_world(&mut self, grid: &BitGrid, x: Coord, y: Coord) {
         let Some((origin_x, origin_y)) = self.origin else {
             return;
         };
 
         let col = x - origin_x;
-        if !(0..self.width as i32).contains(&col) {
+        if !(0..self.width as Coord).contains(&col) {
             return;
         }
 
         let relative_y = y - origin_y;
         let row = relative_y.div_euclid(2);
-        if !(0..self.height as i32).contains(&row) {
+        if !(0..self.height as Coord).contains(&row) {
             return;
         }
 
-        self.write_cell(grid, row as usize, col as usize);
+        self.write_cell(
+            grid,
+            usize::try_from(row).expect("row exceeded usize"),
+            usize::try_from(col).expect("column exceeded usize"),
+        );
     }
 
     fn update_terminal_cells_for_chunk(&mut self, grid: &BitGrid, diff: ChunkDiff) {
@@ -111,13 +115,13 @@ impl TerminalBackbuffer {
         }
 
         let mut remaining = diff.diff_bits;
-        let mut min_local_x = i32::MAX;
-        let mut max_local_x = i32::MIN;
-        let mut min_local_y = i32::MAX;
-        let mut max_local_y = i32::MIN;
+        let mut min_local_x = Coord::MAX;
+        let mut max_local_x = Coord::MIN;
+        let mut min_local_y = Coord::MAX;
+        let mut max_local_y = Coord::MIN;
 
         while remaining != 0 {
-            let bit = remaining.trailing_zeros() as i32;
+            let bit = remaining.trailing_zeros() as Coord;
             min_local_x = min_local_x.min(bit % 8);
             max_local_x = max_local_x.max(bit % 8);
             min_local_y = min_local_y.min(bit / 8);
@@ -131,19 +135,23 @@ impl TerminalBackbuffer {
         let max_world_y = diff.cy * 8 + max_local_y;
 
         let min_col = (min_world_x - origin_x).max(0);
-        let max_col = (max_world_x - origin_x).min(self.width as i32 - 1);
+        let max_col = (max_world_x - origin_x).min(self.width as Coord - 1);
         if min_col > max_col {
             return;
         }
 
         let min_row = (min_world_y - origin_y).div_euclid(2).max(0);
-        let max_row = (max_world_y - origin_y).div_euclid(2).min(self.height as i32 - 1);
+        let max_row = (max_world_y - origin_y).div_euclid(2).min(self.height as Coord - 1);
         if min_row > max_row {
             return;
         }
 
-        for row in min_row as usize..=max_row as usize {
-            for col in min_col as usize..=max_col as usize {
+        for row in usize::try_from(min_row).expect("row range start exceeded usize")
+            ..=usize::try_from(max_row).expect("row range end exceeded usize")
+        {
+            for col in usize::try_from(min_col).expect("column range start exceeded usize")
+                ..=usize::try_from(max_col).expect("column range end exceeded usize")
+            {
                 self.write_cell(grid, row, col);
             }
         }
@@ -151,8 +159,8 @@ impl TerminalBackbuffer {
 
     fn write_cell(&mut self, grid: &BitGrid, row: usize, col: usize) {
         let (origin_x, origin_y) = self.origin.unwrap_or((0, 0));
-        let x = origin_x + col as i32;
-        let y = origin_y + (row as i32 * 2);
+        let x = origin_x + col as Coord;
+        let y = origin_y + (row as Coord * 2);
         let encoded = encode_cell(grid.get(x, y), grid.get(x, y + 1));
         let idx = row * self.width + col;
 
@@ -191,15 +199,15 @@ impl TerminalBackbuffer {
     }
 }
 
-fn compute_origin(width: usize, height: usize, grid: &BitGrid) -> (i32, i32) {
+fn compute_origin(width: usize, height: usize, grid: &BitGrid) -> Cell {
     compute_origin_for_cells(width, height, &grid.live_cells())
 }
 
 pub(crate) fn compute_origin_for_cells(
     width: usize,
     height: usize,
-    cells: &[(i32, i32)],
-) -> (i32, i32) {
+    cells: &[Cell],
+) -> Cell {
     if cells.is_empty() {
         return (0, 0);
     }
@@ -216,14 +224,14 @@ pub(crate) fn compute_origin_for_cells(
         max_x = max_x.max(x);
         min_y = min_y.min(y);
         max_y = max_y.max(y);
-        sum_x += x as i64;
-        sum_y += y as i64;
+        sum_x += x;
+        sum_y += y;
     }
 
-    let viewport_width = width as i32;
-    let viewport_height = (height as i32) * 2;
-    let centroid_x = (sum_x / cells.len() as i64) as i32;
-    let centroid_y = (sum_y / cells.len() as i64) as i32;
+    let viewport_width = width as Coord;
+    let viewport_height = (height as Coord) * 2;
+    let centroid_x = sum_x / cells.len() as i64;
+    let centroid_y = sum_y / cells.len() as i64;
     let ideal_x = centroid_x - viewport_width / 2;
     let ideal_y = centroid_y - viewport_height / 2;
     let min_origin_x = max_x - viewport_width + 1;
@@ -232,12 +240,12 @@ pub(crate) fn compute_origin_for_cells(
     let max_origin_y = min_y;
 
     (
-        clamp_i32(ideal_x, min_origin_x, max_origin_x),
-        clamp_i32(ideal_y, min_origin_y, max_origin_y),
+        clamp_coord(ideal_x, min_origin_x, max_origin_x),
+        clamp_coord(ideal_y, min_origin_y, max_origin_y),
     )
 }
 
-fn clamp_i32(value: i32, low: i32, high: i32) -> i32 {
+fn clamp_coord(value: Coord, low: Coord, high: Coord) -> Coord {
     if low > high {
         return high;
     }

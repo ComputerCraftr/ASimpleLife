@@ -1,6 +1,6 @@
-use super::{GC_GROWTH_TRIGGER, GC_MIN_NODES, GC_MIN_RECLAIM, HashLifeOracle, NodeId, NodeKey};
+use super::{GC_GROWTH_TRIGGER, GC_MIN_NODES, GC_MIN_RECLAIM, HashLifeEngine, NodeId, NodeKey};
 
-impl HashLifeOracle {
+impl HashLifeEngine {
     pub(super) fn initialize_runtime_state(&mut self) {
         self.dead_leaf = self.intern_leaf(false);
         self.live_leaf = self.intern_leaf(true);
@@ -84,7 +84,7 @@ impl HashLifeOracle {
             }
             marked[idx] = true;
 
-            let node = self.nodes[idx];
+            let node = &self.nodes[idx];
             if node.level == 0 {
                 continue;
             }
@@ -113,12 +113,12 @@ impl HashLifeOracle {
     pub(super) fn compact_marked_nodes(&mut self, marked: Vec<bool>) {
         let mut remap = vec![NodeId::MAX; self.nodes.len()];
         let mut compacted = Vec::with_capacity(marked.iter().filter(|&&keep| keep).count());
-        for (old_idx, node) in self.nodes.iter().copied().enumerate() {
+        for (old_idx, node) in self.nodes.iter().enumerate() {
             if !marked[old_idx] {
                 continue;
             }
             remap[old_idx] = compacted.len() as NodeId;
-            compacted.push(node);
+            compacted.push(*node);
         }
 
         for node in &mut compacted {
@@ -133,7 +133,7 @@ impl HashLifeOracle {
 
         self.nodes = compacted;
         self.intern.clear();
-        for (node_id, node) in self.nodes.iter().copied().enumerate() {
+        for (node_id, node) in self.nodes.iter().enumerate() {
             let key = if node.level == 0 {
                 NodeKey::Leaf(node.population == 1)
             } else {
@@ -160,7 +160,7 @@ impl HashLifeOracle {
 }
 
 #[cfg(test)]
-impl HashLifeOracle {
+impl HashLifeEngine {
     pub(crate) fn runtime_stats(&self) -> super::HashLifeRuntimeStats {
         super::HashLifeRuntimeStats {
             nodes: self.nodes.len(),
@@ -183,7 +183,11 @@ impl HashLifeOracle {
             nodes_after_compact: self.stats.nodes_after_compact,
             jump_cache_before_clear: self.stats.jump_cache_before_clear,
             gc_reason: self.stats.gc_reason,
+            builder_frames: self.stats.builder_frames,
             builder_partitions: self.stats.builder_partitions,
+            builder_max_stack: self.stats.builder_max_stack,
+            scheduler_tasks: self.stats.scheduler_tasks,
+            scheduler_ready_max: self.stats.scheduler_ready_max,
         }
     }
 }

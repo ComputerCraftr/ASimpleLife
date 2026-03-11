@@ -1,34 +1,40 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
-use crate::bitgrid::BitGrid;
+use crate::bitgrid::{BitGrid, Cell, Coord};
 use crate::benchmark::effective_generation_limit;
-use crate::engine::{SimulationEngine, advance_grid, select_engine};
 use crate::life::step_grid_with_changes_and_memo;
 use crate::memo::Memo;
 use crate::normalize::{NormalizedGridSignature, normalize};
 
+fn bounds_dimensions(bounds: (Coord, Coord, Coord, Coord)) -> (Coord, Coord, Coord) {
+    let (min_x, min_y, max_x, max_y) = bounds;
+    let width = max_x - min_x + 1;
+    let height = max_y - min_y + 1;
+    (width, height, width.max(height))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Classification {
     DiesOut {
-        at_generation: usize,
+        at_generation: u64,
     },
     Repeats {
-        period: usize,
-        first_seen: usize,
+        period: u64,
+        first_seen: u64,
     },
     Spaceship {
-        period: usize,
-        first_seen: usize,
-        delta: (i32, i32),
-        detected_at: usize,
+        period: u64,
+        first_seen: u64,
+        delta: Cell,
+        detected_at: u64,
     },
     LikelyInfinite {
         reason: &'static str,
-        detected_at: usize,
+        detected_at: u64,
     },
     Unknown {
-        simulated: usize,
+        simulated: u64,
     },
 }
 
@@ -60,9 +66,9 @@ impl fmt::Display for Classification {
 
 #[derive(Clone, Debug)]
 pub struct ClassificationLimits {
-    pub max_generations: usize,
+    pub max_generations: u64,
     pub max_population: usize,
-    pub max_bounding_box: i32,
+    pub max_bounding_box: Coord,
 }
 
 impl Default for ClassificationLimits {
@@ -70,16 +76,16 @@ impl Default for ClassificationLimits {
         Self {
             max_generations: 512,
             max_population: 20_000,
-            max_bounding_box: i32::MAX,
+            max_bounding_box: Coord::MAX,
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ClassificationCheckpoint {
-    pub generation: usize,
+    pub generation: u64,
     pub grid: BitGrid,
-    pub seen: HashMap<NormalizedGridSignature, (usize, (i32, i32))>,
+    pub seen: HashMap<NormalizedGridSignature, (u64, Cell)>,
 }
 
 pub fn classify_seed(
@@ -92,12 +98,12 @@ pub fn classify_seed(
         return cached;
     }
 
-    let (result, _) = classify_seed_with_checkpoint(seed, limits, memo);
+    let (result, _) = predict_seed_with_checkpoint(seed, limits, memo);
     memo.insert_classification(seed_signature, result.clone());
     result
 }
 
-pub(crate) fn classify_seed_with_checkpoint(
+pub(crate) fn predict_seed_with_checkpoint(
     seed: &BitGrid,
     limits: &ClassificationLimits,
     memo: &mut Memo,
@@ -114,13 +120,13 @@ pub(crate) fn classify_seed_with_checkpoint(
 
 fn run_classification_from_state(
     mut grid: BitGrid,
-    mut seen: HashMap<NormalizedGridSignature, (usize, (i32, i32))>,
-    mut generation: usize,
-    mut generation_limit: usize,
+    mut seen: HashMap<NormalizedGridSignature, (u64, Cell)>,
+    mut generation: u64,
+    mut generation_limit: u64,
     limits: &ClassificationLimits,
     memo: &mut Memo,
 ) -> (Classification, ClassificationCheckpoint) {
-    let mut metrics_history: Vec<(usize, i32, i32, i32, i32, i32)> = Vec::new();
+    let mut metrics_history: Vec<(usize, Coord, Coord, Coord, Coord, Coord)> = Vec::new();
 
     while generation <= generation_limit {
         let (signature, origin) = normalize(&grid);
@@ -176,16 +182,16 @@ fn run_classification_from_state(
             );
         }
 
-        if let Some((min_x, min_y, max_x, max_y)) = grid.bounds() {
-            let width = max_x - min_x + 1;
-            let height = max_y - min_y + 1;
+        if let Some(bounds) = grid.bounds() {
+            let (min_x, min_y, max_x, max_y) = bounds;
+            let (width, height, span) = bounds_dimensions(bounds);
             metrics_history.push((
                 grid.population(),
                 min_x,
                 max_x,
                 min_y,
                 max_y,
-                width.max(height),
+                span,
             ));
             if width > limits.max_bounding_box || height > limits.max_bounding_box {
                 return (
@@ -216,10 +222,8 @@ fn run_classification_from_state(
         }
 
         seen.insert(signature.clone(), (generation, origin));
-        let step_span =
-            continuation_step_span(&grid, generation, generation_limit, limits.max_generations);
-        grid = next_grid_with_memo(&signature, &grid, memo, step_span);
-        generation += step_span as usize;
+        grid = step_grid_with_changes_and_memo(&grid, memo).0;
+        generation += 1;
 
         if generation > generation_limit {
             let mut next_limit =
@@ -248,15 +252,15 @@ fn run_classification_from_state(
 
 fn settling_extension_limit(
     limits: &ClassificationLimits,
-    generation_limit: usize,
-    metrics_history: &[(usize, i32, i32, i32, i32, i32)],
-) -> Option<usize> {
+    generation_limit: u64,
+    metrics_history: &[(usize, Coord, Coord, Coord, Coord, Coord)],
+) -> Option<u64> {
     const MAX_SETTLING_POPULATION: usize = 256;
-    const MAX_SETTLING_SPAN: i32 = 64;
+    const MAX_SETTLING_SPAN: Coord = 64;
     const MAX_WIDE_SETTLING_POPULATION: usize = 16;
-    const MAX_WIDE_SETTLING_SPAN: i32 = 256;
-    const MIN_EXTENSION_LIMIT: usize = 512;
-    const MAX_EXTENSION_LIMIT: usize = 1024;
+    const MAX_WIDE_SETTLING_SPAN: Coord = 256;
+    const MIN_EXTENSION_LIMIT: u64 = 512;
+    const MAX_EXTENSION_LIMIT: u64 = 1024;
 
     if limits.max_generations < 256 || generation_limit >= MAX_EXTENSION_LIMIT {
         return None;
@@ -281,16 +285,16 @@ fn settling_extension_limit(
 }
 
 fn detect_persistent_expansion(
-    generation: usize,
-    metrics_history: &[(usize, i32, i32, i32, i32, i32)],
+    generation: u64,
+    metrics_history: &[(usize, Coord, Coord, Coord, Coord, Coord)],
     grid: &BitGrid,
     limits: &ClassificationLimits,
 ) -> Option<Classification> {
-    const BURN_IN: usize = 288;
+    const BURN_IN: u64 = 288;
     const WINDOW: usize = 32;
     const MIN_POPULATION_GROWTH_PER_WINDOW: usize = 1;
-    const MIN_PERSISTENT_EXPANSION_SPAN: i32 = 64;
-    const MIN_HEURISTIC_HORIZON: usize = 512;
+    const MIN_PERSISTENT_EXPANSION_SPAN: Coord = 64;
+    const MIN_HEURISTIC_HORIZON: u64 = 512;
 
     if limits.max_generations < MIN_HEURISTIC_HORIZON {
         return None;
@@ -395,16 +399,16 @@ impl FrontierDirections {
 }
 
 fn edge_advances(
-    prior_front: i32,
-    recent_front: i32,
-    prior_back: i32,
-    recent_back: i32,
-    prior_orthogonal: i32,
-    recent_orthogonal: i32,
+    prior_front: Coord,
+    recent_front: Coord,
+    prior_back: Coord,
+    recent_back: Coord,
+    prior_orthogonal: Coord,
+    recent_orthogonal: Coord,
 ) -> bool {
-    const MIN_EDGE_ADVANCE_PER_WINDOW: i32 = 6;
-    const MAX_OPPOSITE_EDGE_DRIFT: i32 = 4;
-    const MAX_ORTHOGONAL_SPAN_GROWTH_PER_WINDOW: i32 = 8;
+    const MIN_EDGE_ADVANCE_PER_WINDOW: Coord = 6;
+    const MAX_OPPOSITE_EDGE_DRIFT: Coord = 4;
+    const MAX_ORTHOGONAL_SPAN_GROWTH_PER_WINDOW: Coord = 8;
 
     prior_front >= MIN_EDGE_ADVANCE_PER_WINDOW
         && recent_front >= MIN_EDGE_ADVANCE_PER_WINDOW
@@ -416,9 +420,9 @@ fn edge_advances(
 
 fn has_detached_frontier_glider(grid: &BitGrid, fronts: &FrontierDirections) -> bool {
     const GLIDER_CELLS: usize = 5;
-    const MAX_COMPONENT_SPAN: i32 = 4;
-    const FRONT_MARGIN: i32 = 3;
-    const MIN_GAP_FROM_MAIN: i32 = 8;
+    const MAX_COMPONENT_SPAN: Coord = 4;
+    const FRONT_MARGIN: Coord = 3;
+    const MIN_GAP_FROM_MAIN: Coord = 8;
     const MIN_FRONTIER_GLIDERS: usize = 1;
 
     let Some((global_min_x, global_min_y, global_max_x, global_max_y)) = grid.bounds() else {
@@ -472,9 +476,9 @@ fn has_detached_frontier_glider(grid: &BitGrid, fronts: &FrontierDirections) -> 
 
 fn has_trailing_blinker_ash(grid: &BitGrid, fronts: &FrontierDirections) -> bool {
     const BLINKER_CELLS: usize = 3;
-    const MAX_COMPONENT_SPAN: i32 = 3;
-    const TRAIL_MARGIN: i32 = 6;
-    const MIN_GAP_FROM_MAIN: i32 = 8;
+    const MAX_COMPONENT_SPAN: Coord = 3;
+    const TRAIL_MARGIN: Coord = 6;
+    const MIN_GAP_FROM_MAIN: Coord = 8;
     const MIN_TRAILING_BLINKERS: usize = 2;
 
     let Some((global_min_x, global_min_y, global_max_x, global_max_y)) = grid.bounds() else {
@@ -525,22 +529,22 @@ fn has_trailing_blinker_ash(grid: &BitGrid, fronts: &FrontierDirections) -> bool
     trailing_blinkers >= MIN_TRAILING_BLINKERS
 }
 
-fn matches_glider(component: &[(i32, i32)]) -> bool {
+fn matches_glider(component: &[Cell]) -> bool {
     let normalized = normalize(&BitGrid::from_cells(component)).0.cells;
     glider_variants()
         .iter()
         .any(|variant| variant == &normalized)
 }
 
-fn matches_blinker(component: &[(i32, i32)]) -> bool {
+fn matches_blinker(component: &[Cell]) -> bool {
     let normalized = normalize(&BitGrid::from_cells(component)).0.cells;
     blinker_variants()
         .iter()
         .any(|variant| variant == &normalized)
 }
 
-fn glider_variants() -> Vec<Vec<(i32, i32)>> {
-    type Transform = fn(i32, i32) -> (i32, i32);
+fn glider_variants() -> Vec<Vec<Cell>> {
+    type Transform = fn(Coord, Coord) -> Cell;
     let phases = [
         vec![(1, 0), (2, 1), (0, 2), (1, 2), (2, 2)],
         vec![(0, 0), (2, 0), (1, 1), (2, 1), (1, 2)],
@@ -575,8 +579,8 @@ fn glider_variants() -> Vec<Vec<(i32, i32)>> {
     variants
 }
 
-fn blinker_variants() -> Vec<Vec<(i32, i32)>> {
-    type Transform = fn(i32, i32) -> (i32, i32);
+fn blinker_variants() -> Vec<Vec<Cell>> {
+    type Transform = fn(Coord, Coord) -> Cell;
     let phases = [vec![(0, 0), (1, 0), (2, 0)], vec![(0, 0), (0, 1), (0, 2)]];
     let transforms: [Transform; 8] = [
         |x, y| (x, y),
@@ -606,7 +610,7 @@ fn blinker_variants() -> Vec<Vec<(i32, i32)>> {
     variants
 }
 
-fn connected_components(grid: &BitGrid) -> Vec<Vec<(i32, i32)>> {
+fn connected_components(grid: &BitGrid) -> Vec<Vec<Cell>> {
     let mut remaining = grid.live_cells().into_iter().collect::<HashSet<_>>();
     let mut components = Vec::new();
 
@@ -635,7 +639,7 @@ fn connected_components(grid: &BitGrid) -> Vec<Vec<(i32, i32)>> {
     components
 }
 
-fn component_bounds(component: &[(i32, i32)]) -> (i32, i32, i32, i32) {
+fn component_bounds(component: &[Cell]) -> (Coord, Coord, Coord, Coord) {
     let mut min_x = component[0].0;
     let mut max_x = component[0].0;
     let mut min_y = component[0].1;
@@ -647,39 +651,4 @@ fn component_bounds(component: &[(i32, i32)]) -> (i32, i32, i32, i32) {
         max_y = max_y.max(y);
     }
     (min_x, min_y, max_x, max_y)
-}
-
-fn next_grid_with_memo(
-    _signature: &NormalizedGridSignature,
-    current: &BitGrid,
-    memo: &mut Memo,
-    step_span: u64,
-) -> BitGrid {
-    if step_span <= 1 {
-        step_grid_with_changes_and_memo(current, memo).0
-    } else {
-        advance_grid(current, step_span).grid
-    }
-}
-
-fn continuation_step_span(
-    current: &BitGrid,
-    generation: usize,
-    generation_limit: usize,
-    nominal_generation_limit: usize,
-) -> u64 {
-    if generation < nominal_generation_limit {
-        return 1;
-    }
-
-    let remaining = generation_limit.saturating_sub(generation) as u64;
-    if remaining <= 1 {
-        return 1;
-    }
-
-    match select_engine(current, remaining) {
-        SimulationEngine::SimdChunk => 1,
-        SimulationEngine::HybridSegmented => remaining.min(8),
-        SimulationEngine::HashLife => remaining.min(16),
-    }
 }

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::bitgrid::BitGrid;
+use crate::bitgrid::{BitGrid, Cell, Coord};
 use crate::classify::{Classification, ClassificationLimits, classify_seed};
 use crate::generators::{mix_seed, pattern_by_name, random_soup};
 use crate::life::{ChunkDiff, GameOfLife, step_grid, step_grid_with_changes_and_memo};
@@ -203,7 +203,7 @@ fn bounded_iid_soup_reaches_repeat_before_extended_limit() {
     let limits = ClassificationLimits {
         max_generations: 256,
         max_population: 20_000,
-        max_bounding_box: i32::MAX,
+        max_bounding_box: Coord::MAX,
     };
 
     let result = classify_seed(&grid, &limits, &mut Memo::default());
@@ -430,7 +430,7 @@ fn run_steps(grid: BitGrid, steps: usize) -> BitGrid {
     game.grid().clone()
 }
 
-fn crop_grid(grid: &BitGrid, min_x: i32, min_y: i32, max_x: i32, max_y: i32) -> BitGrid {
+fn crop_grid(grid: &BitGrid, min_x: Coord, min_y: Coord, max_x: Coord, max_y: Coord) -> BitGrid {
     let cells = grid
         .live_cells()
         .into_iter()
@@ -439,18 +439,18 @@ fn crop_grid(grid: &BitGrid, min_x: i32, min_y: i32, max_x: i32, max_y: i32) -> 
     BitGrid::from_cells(&cells)
 }
 
-fn contains_component_variant(grid: &BitGrid, variants: &[Vec<(i32, i32)>]) -> bool {
+fn contains_component_variant(grid: &BitGrid, variants: &[Vec<Cell>]) -> bool {
     connected_components(grid)
         .into_iter()
         .map(|component| normalize(&BitGrid::from_cells(&component)).0.cells)
         .any(|normalized| variants.iter().any(|variant| variant == &normalized))
 }
 
-fn all_normalized_variants(pattern: &BitGrid) -> Vec<Vec<(i32, i32)>> {
+fn all_normalized_variants(pattern: &BitGrid) -> Vec<Vec<Cell>> {
     all_evolution_variants(pattern, 1)
 }
 
-fn all_evolution_variants(pattern: &BitGrid, period: usize) -> Vec<Vec<(i32, i32)>> {
+fn all_evolution_variants(pattern: &BitGrid, period: usize) -> Vec<Vec<Cell>> {
     let mut variants = Vec::new();
     let mut phase = pattern.clone();
 
@@ -462,8 +462,8 @@ fn all_evolution_variants(pattern: &BitGrid, period: usize) -> Vec<Vec<(i32, i32
     variants
 }
 
-fn append_symmetry_variants(variants: &mut Vec<Vec<(i32, i32)>>, cells: &[(i32, i32)]) {
-    let transforms: [fn(i32, i32) -> (i32, i32); 8] = [
+fn append_symmetry_variants(variants: &mut Vec<Vec<Cell>>, cells: &[Cell]) {
+    let transforms: [fn(Coord, Coord) -> Cell; 8] = [
         |x, y| (x, y),
         |x, y| (x, -y),
         |x, y| (-x, y),
@@ -486,7 +486,7 @@ fn append_symmetry_variants(variants: &mut Vec<Vec<(i32, i32)>>, cells: &[(i32, 
     }
 }
 
-fn connected_components(grid: &BitGrid) -> Vec<Vec<(i32, i32)>> {
+fn connected_components(grid: &BitGrid) -> Vec<Vec<Cell>> {
     let mut remaining = grid.live_cells().into_iter().collect::<HashSet<_>>();
     let mut components = Vec::new();
 
@@ -518,7 +518,7 @@ fn connected_components(grid: &BitGrid) -> Vec<Vec<(i32, i32)>> {
 fn render_output(
     buffer: &mut TerminalBackbuffer,
     grid: &BitGrid,
-    changed_cells: Option<&[(i32, i32)]>,
+    changed_cells: Option<&[Cell]>,
 ) -> String {
     let mut out = Vec::new();
     buffer.render_into(grid, changed_cells, &mut out).unwrap();
@@ -639,22 +639,22 @@ fn curated_reference_suite() -> Vec<NamedCase> {
     cases
 }
 
-fn clustered_noise_soup(width: i32, height: i32, fill_percent: u32, seed: u64) -> BitGrid {
+fn clustered_noise_soup(width: Coord, height: Coord, fill_percent: u32, seed: u64) -> BitGrid {
     let base = random_soup(width, height, fill_percent, seed);
     let mut cells = Vec::new();
     for (x, y) in base.live_cells() {
         cells.push((x, y));
-        if ((x + y).unsigned_abs() + (seed as u32)) % 3 == 0 && x + 1 < width {
+        if ((x + y).unsigned_abs() + seed) % 3 == 0 && x + 1 < width {
             cells.push((x + 1, y));
         }
-        if ((x * 3 + y * 5).unsigned_abs() + (seed as u32)) % 5 == 0 && y + 1 < height {
+        if ((x * 3 + y * 5).unsigned_abs() + seed) % 5 == 0 && y + 1 < height {
             cells.push((x, y + 1));
         }
     }
     BitGrid::from_cells(&cells)
 }
 
-fn structured_random_soup(width: i32, height: i32, seed: u64) -> BitGrid {
+fn structured_random_soup(width: Coord, height: Coord, seed: u64) -> BitGrid {
     let left = random_soup(width / 2, height, 18, seed);
     let right = random_soup(width / 2, height, 12, seed ^ 0x9E3779B97F4A7C15);
     let mut cells = left.live_cells();
@@ -681,12 +681,12 @@ fn structured_random_soup(width: i32, height: i32, seed: u64) -> BitGrid {
     BitGrid::from_cells(&cells)
 }
 
-fn hash_seed(a: i32, b: u32, c: u64) -> u64 {
+fn hash_seed(a: Coord, b: u32, c: u64) -> u64 {
     mix_seed(((a as u64) ^ ((b as u64) << 16) ^ (c << 32)).wrapping_add(0x9E3779B97F4A7C15))
 }
 
 pub(super) fn reference_classify(seed: &BitGrid, limits: &ClassificationLimits) -> Classification {
-    let mut seen: HashMap<Vec<(i32, i32)>, (usize, (i32, i32))> = HashMap::new();
+    let mut seen: HashMap<Vec<Cell>, (u64, Cell)> = HashMap::new();
     let mut grid = seed.clone();
 
     for generation in 0..=limits.max_generations {
@@ -741,7 +741,7 @@ pub(super) fn reference_classify(seed: &BitGrid, limits: &ClassificationLimits) 
 }
 
 fn reference_step_grid(grid: &BitGrid) -> BitGrid {
-    let mut counts: HashMap<(i32, i32), u8> = HashMap::new();
+    let mut counts: HashMap<Cell, u8> = HashMap::new();
     for (x, y) in grid.live_cells() {
         for dy in -1..=1 {
             for dx in -1..=1 {

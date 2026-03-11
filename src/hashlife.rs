@@ -2,13 +2,16 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::OnceLock;
 
-use crate::bitgrid::BitGrid;
+use crate::bitgrid::{BitGrid, Coord};
 
 mod embed;
 mod gc;
 mod node;
+mod session;
 
-type NodeId = u32;
+pub use session::HashLifeSession;
+
+type NodeId = u64;
 
 fn centered_2x2_from_4x4(mask: u16) -> u8 {
     let mut result = 0_u8;
@@ -80,14 +83,14 @@ enum NodeKey {
 }
 
 #[derive(Debug)]
-pub struct HashLifeOracle {
+pub struct HashLifeEngine {
     nodes: Vec<Node>,
     intern: HashMap<NodeKey, NodeId>,
     empty_by_level: Vec<NodeId>,
     jump_cache: HashMap<(NodeId, u32), NodeId>,
     root_result_cache: HashMap<(NodeId, u32), NodeId>,
     overlap_cache: HashMap<NodeId, [NodeId; 9]>,
-    embed_layout_cache: HashMap<(u32, i32, i32, i32), u32>,
+    embed_layout_cache: HashMap<(u32, Coord, Coord, Coord), Coord>,
     retained_roots: Vec<NodeId>,
     dead_leaf: NodeId,
     live_leaf: NodeId,
@@ -99,11 +102,11 @@ pub struct HashLifeOracle {
 struct EmbeddedJump {
     root: NodeId,
     root_level: u32,
-    root_size: i32,
-    world_to_root_x: i32,
-    world_to_root_y: i32,
-    result_origin_x: i32,
-    result_origin_y: i32,
+    root_size: Coord,
+    world_to_root_x: Coord,
+    world_to_root_y: Coord,
+    result_origin_x: Coord,
+    result_origin_y: Coord,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -122,7 +125,11 @@ struct HashLifeStats {
     gc_runs: usize,
     gc_skips: usize,
     gc_reason: &'static str,
+    builder_frames: usize,
     builder_partitions: usize,
+    builder_max_stack: usize,
+    scheduler_tasks: usize,
+    scheduler_ready_max: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -162,7 +169,7 @@ struct Step0TaskRecord {
 
 #[derive(Clone, Copy, Debug)]
 struct EmbeddedCell {
-    key: u64,
+    key: u128,
 }
 
 #[cfg(test)]
@@ -188,14 +195,19 @@ pub(crate) struct HashLifeRuntimeStats {
     pub nodes_after_compact: usize,
     pub jump_cache_before_clear: usize,
     pub gc_reason: &'static str,
+    pub builder_frames: usize,
     pub builder_partitions: usize,
+    pub builder_max_stack: usize,
+    pub scheduler_tasks: usize,
+    pub scheduler_ready_max: usize,
 }
 
 const GC_MIN_NODES: usize = 4_096;
 const GC_GROWTH_TRIGGER: usize = 1_024;
 const GC_MIN_RECLAIM: usize = 256;
+const DISCOVER_BATCH: usize = 4;
 
-impl Default for HashLifeOracle {
+impl Default for HashLifeEngine {
     fn default() -> Self {
         let mut oracle = Self {
             nodes: Vec::new(),
@@ -217,54 +229,78 @@ impl Default for HashLifeOracle {
     }
 }
 
-impl HashLifeOracle {
+impl HashLifeEngine {
     fn cached_jump_result(&self, key: (NodeId, u32)) -> Option<NodeId> {
         self.jump_cache.get(&key).copied()
     }
 
-    pub fn advance(&mut self, grid: &BitGrid, generations: u64) -> BitGrid {
-        if generations == 0 || grid.is_empty() {
-            return grid.clone();
+    pub(super) fn begin_persistent_run(&mut self) -> Option<NodeId> {
+        self.stats = HashLifeStats::default();
+        self.clear_transient_state();
+        self.retained_roots.last().copied()
+    }
+
+    pub(super) fn advance_segment(
+        &mut self,
+        grid: &BitGrid,
+        generations: u64,
+    ) -> (BitGrid, Option<NodeId>) {
+        if grid.is_empty() {
+            return (BitGrid::empty(), Some(self.empty(0)));
+        }
+        if generations == 0 {
+            return (grid.clone(), None);
         }
 
         let debug = hashlife_debug_enabled();
-        let mut current = grid.clone();
+        let mut current = None::<BitGrid>;
         let mut remaining = generations;
         let mut last_root = None;
-        let previous_root = self.retained_roots.last().copied();
-        self.stats = HashLifeStats::default();
-        self.clear_transient_state();
 
         if debug {
             eprintln!(
                 "[hashlife] advance start gens={generations} pop={} bounds={:?}",
-                current.population(),
-                current.bounds()
+                current.as_ref().unwrap_or(grid).population(),
+                current.as_ref().unwrap_or(grid).bounds()
             );
         }
 
         while remaining != 0 {
-            let step_exp = 63 - remaining.leading_zeros();
+            let safe_jump = max_hashlife_safe_jump(current.as_ref().unwrap_or(grid));
+            let step_limit = remaining.min(safe_jump.max(1));
+            let step_exp = 63 - step_limit.leading_zeros();
             let step = 1_u64 << step_exp;
             if debug {
                 eprintln!(
-                    "[hashlife] segment step={step} step_exp={step_exp} pop={} bounds={:?}",
-                    current.population(),
-                    current.bounds()
+                    "[hashlife] segment step={step} step_exp={step_exp} safe_jump={} pop={} bounds={:?}",
+                    safe_jump,
+                    current.as_ref().unwrap_or(grid).population(),
+                    current.as_ref().unwrap_or(grid).bounds()
                 );
             }
-            let (next, root) = self.advance_power_of_two(&current, step_exp);
-            current = next;
+            let (next, root) =
+                self.advance_power_of_two(current.as_ref().unwrap_or(grid), step_exp);
+            current = Some(next);
             last_root = Some(root);
             if debug {
                 eprintln!(
                     "[hashlife] segment done step={step} pop={} bounds={:?}",
-                    current.population(),
-                    current.bounds()
+                    current.as_ref().unwrap_or(grid).population(),
+                    current.as_ref().unwrap_or(grid).bounds()
                 );
             }
             remaining -= step;
         }
+
+        (current.unwrap_or_else(BitGrid::empty), last_root)
+    }
+
+    pub(super) fn finish_persistent_run(
+        &mut self,
+        previous_root: Option<NodeId>,
+        last_root: Option<NodeId>,
+    ) {
+        let debug = hashlife_debug_enabled();
 
         if let Some(root) = last_root {
             self.record_retained_root(root);
@@ -299,13 +335,18 @@ impl HashLifeOracle {
                 self.stats.nodes_after_compact,
             );
         }
+    }
 
-        current
+    pub fn advance(&mut self, grid: &BitGrid, generations: u64) -> BitGrid {
+        let previous_root = self.begin_persistent_run();
+        let (advanced, last_root) = self.advance_segment(grid, generations);
+        self.finish_persistent_run(previous_root, last_root);
+        advanced
     }
 
     fn advance_power_of_two(&mut self, grid: &BitGrid, step_exp: u32) -> (BitGrid, NodeId) {
         if grid.is_empty() {
-            return (BitGrid::new(), self.empty(0));
+            return (BitGrid::empty(), self.empty(0));
         }
 
         let embedded = self.embed_for_jump(grid, step_exp);
@@ -330,122 +371,165 @@ impl HashLifeOracle {
         }
     }
 
-    fn advance_power_of_two_recursive(&mut self, node: NodeId, step_exp: u32) -> NodeId {
+    fn advance_power_of_two_recursive(&mut self, root_node: NodeId, root_step_exp: u32) -> NodeId {
         let debug = hashlife_debug_enabled();
-        let level = self.nodes[node as usize].level as usize;
-        let task_capacity = 1usize << level.saturating_sub(step_exp as usize + 1).min(10);
+        let level = self.nodes[root_node as usize].level as usize;
+        let task_capacity = 1usize << level.saturating_sub(root_step_exp as usize + 1).min(10);
         let mut discover = Vec::with_capacity(task_capacity.max(8));
-        discover.push((node, step_exp));
+        discover.push((root_node, root_step_exp));
         let mut task_index: HashMap<(NodeId, u32), usize> = HashMap::with_capacity(task_capacity);
         let mut tasks = Vec::<Option<TaskRecord>>::with_capacity(task_capacity);
         let mut task_keys = Vec::<Option<(NodeId, u32)>>::with_capacity(task_capacity);
         let mut dependents: HashMap<(NodeId, u32), Vec<usize>> = HashMap::with_capacity(task_capacity);
         let mut ready = Vec::<usize>::with_capacity(task_capacity);
+        let mut batch = [(0_u64, 0_u32); DISCOVER_BATCH];
         let mut iterations = 0_usize;
         let mut max_stack = discover.len();
         let mut next_iteration_log = 100_000_usize;
         let mut next_stack_log = 10_000_usize;
 
-        while !self.jump_cache.contains_key(&(node, step_exp)) {
-            while let Some((node, step_exp)) = discover.pop() {
-                iterations += 1;
-                if discover.len() > max_stack {
-                    max_stack = discover.len();
+        while !self.jump_cache.contains_key(&(root_node, root_step_exp)) {
+            while !discover.is_empty() {
+                let mut batch_len = 0;
+                while batch_len < DISCOVER_BATCH {
+                    let Some(entry) = discover.pop() else {
+                        break;
+                    };
+                    batch[batch_len] = entry;
+                    batch_len += 1;
                 }
-                if debug && iterations >= next_iteration_log {
-                    eprintln!(
-                        "[hashlife] advance_pow2 progress node={node} step_exp={step_exp} iterations={iterations} stack={} max_stack={} cache={} pending={} ready={}",
-                        discover.len(),
-                        max_stack,
-                        self.jump_cache.len(),
-                        task_index.len(),
-                        ready.len(),
-                    );
-                    next_iteration_log += 100_000;
-                }
-                if debug && max_stack >= next_stack_log {
-                    eprintln!(
-                        "[hashlife] advance_pow2 stack node={node} step_exp={step_exp} iterations={iterations} stack={} max_stack={} cache={} pending={} ready={}",
-                        discover.len(),
-                        max_stack,
-                        self.jump_cache.len(),
-                        task_index.len(),
-                        ready.len(),
-                    );
-                    next_stack_log = next_stack_log.saturating_mul(2);
-                }
-                let key = (node, step_exp);
-                if self.cached_jump_result(key).is_some() {
-                    self.stats.jump_cache_hits += 1;
-                    continue;
-                }
-                self.stats.jump_cache_misses += 1;
-                if task_index.contains_key(&key) {
-                    continue;
-                }
+                for &(discovered_node, discovered_step_exp) in &batch[..batch_len] {
+                    iterations += 1;
+                    if discover.len() > max_stack {
+                        max_stack = discover.len();
+                    }
+                    if debug && iterations >= next_iteration_log {
+                        eprintln!(
+                            "[hashlife] advance_pow2 progress node={discovered_node} step_exp={discovered_step_exp} iterations={iterations} stack={} max_stack={} cache={} pending={} ready={}",
+                            discover.len(),
+                            max_stack,
+                            self.jump_cache.len(),
+                            task_index.len(),
+                            ready.len(),
+                        );
+                        next_iteration_log += 100_000;
+                    }
+                    if debug && max_stack >= next_stack_log {
+                        eprintln!(
+                            "[hashlife] advance_pow2 stack node={discovered_node} step_exp={discovered_step_exp} iterations={iterations} stack={} max_stack={} cache={} pending={} ready={}",
+                            discover.len(),
+                            max_stack,
+                            self.jump_cache.len(),
+                            task_index.len(),
+                            ready.len(),
+                        );
+                        next_stack_log = next_stack_log.saturating_mul(2);
+                    }
+                    let cache_key = (discovered_node, discovered_step_exp);
+                    if self.cached_jump_result(cache_key).is_some() {
+                        self.stats.jump_cache_hits += 1;
+                        continue;
+                    }
+                    self.stats.jump_cache_misses += 1;
+                    if task_index.contains_key(&cache_key) {
+                        continue;
+                    }
 
-                let level = self.nodes[node as usize].level;
-                assert!(level >= 2);
-                assert!(step_exp <= level - 2);
+                    let discovered_level = self.nodes[discovered_node as usize].level;
+                    assert!(discovered_level >= 2);
+                    assert!(discovered_step_exp <= discovered_level - 2);
 
-                if step_exp == 0 {
-                    let result = self.advance_one_generation_centered(node);
-                    self.jump_cache.insert(key, result);
-                    notify_dependents(&key, &mut tasks, &mut dependents, &mut ready);
-                    continue;
-                }
+                    if discovered_step_exp == 0 {
+                        let result = self.advance_one_generation_centered(discovered_node);
+                        self.jump_cache.insert(cache_key, result);
+                        notify_dependents(&cache_key, &mut tasks, &mut dependents, &mut ready);
+                        if ready.len() > self.stats.scheduler_ready_max {
+                            self.stats.scheduler_ready_max = ready.len();
+                        }
+                        continue;
+                    }
 
-                if self.nodes[node as usize].population == 0 {
-                    let result = self.empty(level - 1);
-                    self.jump_cache.insert(key, result);
-                    notify_dependents(&key, &mut tasks, &mut dependents, &mut ready);
-                    continue;
-                }
+                    if self.nodes[discovered_node as usize].population == 0 {
+                        let result = self.empty(discovered_level - 1);
+                        self.jump_cache.insert(cache_key, result);
+                        notify_dependents(&cache_key, &mut tasks, &mut dependents, &mut ready);
+                        if ready.len() > self.stats.scheduler_ready_max {
+                            self.stats.scheduler_ready_max = ready.len();
+                        }
+                        continue;
+                    }
 
-                if level == 2 {
-                    let result = self.base_transition(node);
-                    self.jump_cache.insert(key, result);
-                    notify_dependents(&key, &mut tasks, &mut dependents, &mut ready);
-                    continue;
-                }
+                    if discovered_level == 2 {
+                        let result = self.base_transition(discovered_node);
+                        self.jump_cache.insert(cache_key, result);
+                        notify_dependents(&cache_key, &mut tasks, &mut dependents, &mut ready);
+                        if ready.len() > self.stats.scheduler_ready_max {
+                            self.stats.scheduler_ready_max = ready.len();
+                        }
+                        continue;
+                    }
 
-                let [a, b, c, d, e, f, g, h, i] = self.overlapping_subnodes(node);
-                let next_exp = step_exp - 1;
-                let task_id = tasks.len();
-                task_index.insert(key, task_id);
-                tasks.push(Some(TaskRecord {
-                    remaining: 0,
-                    task: PendingTask::PhaseOne {
-                        next_exp,
-                        a,
-                        b,
-                        c,
-                        d,
-                        e,
-                        f,
-                        g,
-                        h,
-                        i,
-                    },
-                }));
-                task_keys.push(Some(key));
-                for child in [i, h, g, f, e, d, c, b, a] {
-                    let child_key = (child, next_exp);
-                    if self.cached_jump_result(child_key).is_none() {
-                        dependents.entry(child_key).or_default().push(task_id);
-                        tasks[task_id].as_mut().unwrap().remaining += 1;
-                        if !task_index.contains_key(&child_key) {
-                            discover.push(child_key);
+                    let [
+                        upper_left,
+                        upper_center,
+                        upper_right,
+                        middle_left,
+                        center,
+                        middle_right,
+                        lower_left,
+                        lower_center,
+                        lower_right,
+                    ] = self.overlapping_subnodes(discovered_node);
+                    let child_step_exp = discovered_step_exp - 1;
+                    let task_id = tasks.len();
+                    task_index.insert(cache_key, task_id);
+                    tasks.push(Some(TaskRecord {
+                        remaining: 0,
+                        task: PendingTask::PhaseOne {
+                            next_exp: child_step_exp,
+                            a: upper_left,
+                            b: upper_center,
+                            c: upper_right,
+                            d: middle_left,
+                            e: center,
+                            f: middle_right,
+                            g: lower_left,
+                            h: lower_center,
+                            i: lower_right,
+                        },
+                    }));
+                    task_keys.push(Some(cache_key));
+                    self.stats.scheduler_tasks += 1;
+                    for child_node in [
+                        lower_right,
+                        lower_center,
+                        lower_left,
+                        middle_right,
+                        center,
+                        middle_left,
+                        upper_right,
+                        upper_center,
+                        upper_left,
+                    ] {
+                        let child_key = (child_node, child_step_exp);
+                        if self.cached_jump_result(child_key).is_none() {
+                            dependents.entry(child_key).or_default().push(task_id);
+                            tasks[task_id].as_mut().unwrap().remaining += 1;
+                            if !task_index.contains_key(&child_key) {
+                                discover.push(child_key);
+                            }
+                        }
+                    }
+                    if tasks[task_id].as_ref().unwrap().remaining == 0 {
+                        ready.push(task_id);
+                        if ready.len() > self.stats.scheduler_ready_max {
+                            self.stats.scheduler_ready_max = ready.len();
                         }
                     }
                 }
-                if tasks[task_id].as_ref().unwrap().remaining == 0 {
-                    ready.push(task_id);
-                }
-                continue;
             }
 
-            if self.jump_cache.contains_key(&(node, step_exp)) {
+            if self.jump_cache.contains_key(&(root_node, root_step_exp)) {
                 break;
             }
 
@@ -488,8 +572,10 @@ impl HashLifeOracle {
                     (pending_node, pending_exp, recurse_exp, missing)
                 });
                 panic!(
-                    "hashlife dependency resolution stalled for node={node} step_exp={step_exp} pending={} sample={sample:?}",
-                    task_index.len()
+                    "hashlife dependency resolution stalled root_node={root_node} root_step_exp={root_step_exp} pending={} ready={} cache={} sample={sample:?}",
+                    task_index.len(),
+                    ready.len(),
+                    self.jump_cache.len(),
                 );
             };
             let Some(task_key) = task_keys[task_id].take() else {
@@ -513,20 +599,24 @@ impl HashLifeOracle {
                         h,
                         i,
                     } = task.task else { unreachable!() };
-                    let aa = self.jump_cache[&(a, next_exp)];
-                    let bb = self.jump_cache[&(b, next_exp)];
-                    let cc = self.jump_cache[&(c, next_exp)];
-                    let dd = self.jump_cache[&(d, next_exp)];
-                    let ee = self.jump_cache[&(e, next_exp)];
-                    let ff = self.jump_cache[&(f, next_exp)];
-                    let gg = self.jump_cache[&(g, next_exp)];
-                    let hh = self.jump_cache[&(h, next_exp)];
-                    let ii = self.jump_cache[&(i, next_exp)];
+                    let upper_left_result = self.jump_cache[&(a, next_exp)];
+                    let upper_center_result = self.jump_cache[&(b, next_exp)];
+                    let upper_right_result = self.jump_cache[&(c, next_exp)];
+                    let middle_left_result = self.jump_cache[&(d, next_exp)];
+                    let center_result = self.jump_cache[&(e, next_exp)];
+                    let middle_right_result = self.jump_cache[&(f, next_exp)];
+                    let lower_left_result = self.jump_cache[&(g, next_exp)];
+                    let lower_center_result = self.jump_cache[&(h, next_exp)];
+                    let lower_right_result = self.jump_cache[&(i, next_exp)];
 
-                    let nw = self.join(aa, bb, dd, ee);
-                    let ne = self.join(bb, cc, ee, ff);
-                    let sw = self.join(dd, ee, gg, hh);
-                    let se = self.join(ee, ff, hh, ii);
+                    let next_upper_left =
+                        self.join(upper_left_result, upper_center_result, middle_left_result, center_result);
+                    let next_upper_right =
+                        self.join(upper_center_result, upper_right_result, center_result, middle_right_result);
+                    let next_lower_left =
+                        self.join(middle_left_result, center_result, lower_left_result, lower_center_result);
+                    let next_lower_right =
+                        self.join(center_result, middle_right_result, lower_center_result, lower_right_result);
                     let parent_key = (pending_node, pending_exp);
                     let parent_id = task_id;
                     task_index.insert(parent_key, parent_id);
@@ -535,14 +625,19 @@ impl HashLifeOracle {
                         remaining: 0,
                         task: PendingTask::PhaseTwo {
                             next_exp,
-                            nw,
-                            ne,
-                            sw,
-                            se,
+                            nw: next_upper_left,
+                            ne: next_upper_right,
+                            sw: next_lower_left,
+                            se: next_lower_right,
                         },
                     });
-                    for child in [se, sw, ne, nw] {
-                        let child_key = (child, next_exp);
+                    for child_node in [
+                        next_lower_right,
+                        next_lower_left,
+                        next_upper_right,
+                        next_upper_left,
+                    ] {
+                        let child_key = (child_node, next_exp);
                         if self.cached_jump_result(child_key).is_none() {
                             dependents.entry(child_key).or_default().push(parent_id);
                             tasks[parent_id].as_mut().unwrap().remaining += 1;
@@ -553,6 +648,9 @@ impl HashLifeOracle {
                     }
                     if tasks[parent_id].as_ref().unwrap().remaining == 0 {
                         ready.push(parent_id);
+                        if ready.len() > self.stats.scheduler_ready_max {
+                            self.stats.scheduler_ready_max = ready.len();
+                        }
                     }
                 }
                 PendingTask::PhaseTwo { .. } => {
@@ -572,13 +670,16 @@ impl HashLifeOracle {
                     let key = (pending_node, pending_exp);
                     self.jump_cache.insert(key, result);
                     notify_dependents(&key, &mut tasks, &mut dependents, &mut ready);
+                    if ready.len() > self.stats.scheduler_ready_max {
+                        self.stats.scheduler_ready_max = ready.len();
+                    }
                 }
             }
         }
 
         if debug {
             eprintln!(
-                "[hashlife] advance_pow2 done root={node} step_exp={step_exp} iterations={iterations} max_stack={} cache={} pending={} ready={}",
+                "[hashlife] advance_pow2 done root={root_node} step_exp={root_step_exp} iterations={iterations} max_stack={} cache={} pending={} ready={}",
                 max_stack,
                 self.jump_cache.len(),
                 task_index.len(),
@@ -586,95 +687,140 @@ impl HashLifeOracle {
             );
         }
 
-        self.jump_cache[&(node, step_exp)]
+        self.jump_cache[&(root_node, root_step_exp)]
     }
 
-    fn advance_one_generation_centered(&mut self, node: NodeId) -> NodeId {
-        let key = (node, 0);
-        if self.jump_cache.contains_key(&key) {
+    fn advance_one_generation_centered(&mut self, root_node: NodeId) -> NodeId {
+        let root_key = (root_node, 0);
+        if self.jump_cache.contains_key(&root_key) {
             self.stats.jump_cache_hits += 1;
-            return self.jump_cache[&key];
+            return self.jump_cache[&root_key];
         }
 
         let debug = hashlife_debug_enabled();
-        let level = self.nodes[node as usize].level as usize;
+        let level = self.nodes[root_node as usize].level as usize;
         let task_capacity = 1usize << level.saturating_sub(1).min(10);
         let mut discover = Vec::with_capacity(task_capacity.max(8));
-        discover.push(node);
+        discover.push(root_node);
         let mut task_index: HashMap<NodeId, usize> = HashMap::with_capacity(task_capacity);
         let mut tasks = Vec::<Option<Step0TaskRecord>>::with_capacity(task_capacity);
         let mut task_keys = Vec::<Option<NodeId>>::with_capacity(task_capacity);
         let mut dependents: HashMap<NodeId, Vec<usize>> = HashMap::with_capacity(task_capacity);
         let mut ready = Vec::<usize>::with_capacity(task_capacity);
+        let mut batch = [0_u64; DISCOVER_BATCH];
         let mut iterations = 0_usize;
 
-        while !self.jump_cache.contains_key(&key) {
-            while let Some(node) = discover.pop() {
-                iterations += 1;
-                let key = (node, 0);
-                if self.cached_jump_result(key).is_some() {
-                    self.stats.jump_cache_hits += 1;
-                    continue;
+        while !self.jump_cache.contains_key(&root_key) {
+            while !discover.is_empty() {
+                let mut batch_len = 0;
+                while batch_len < DISCOVER_BATCH {
+                    let Some(entry) = discover.pop() else {
+                        break;
+                    };
+                    batch[batch_len] = entry;
+                    batch_len += 1;
                 }
-                self.stats.jump_cache_misses += 1;
-                if task_index.contains_key(&node) {
-                    continue;
-                }
+                for &discovered_node in &batch[..batch_len] {
+                    iterations += 1;
+                    let cache_key = (discovered_node, 0);
+                    if self.cached_jump_result(cache_key).is_some() {
+                        self.stats.jump_cache_hits += 1;
+                        continue;
+                    }
+                    self.stats.jump_cache_misses += 1;
+                    if task_index.contains_key(&discovered_node) {
+                        continue;
+                    }
 
-                let level = self.nodes[node as usize].level;
-                assert!(level >= 2);
+                    let discovered_level = self.nodes[discovered_node as usize].level;
+                    assert!(discovered_level >= 2);
 
-                if self.nodes[node as usize].population == 0 {
-                    let result = self.empty(level - 1);
-                    self.jump_cache.insert(key, result);
-                    notify_step0_dependents(node, &mut tasks, &mut dependents, &mut ready);
-                    continue;
-                }
+                    if self.nodes[discovered_node as usize].population == 0 {
+                        let result = self.empty(discovered_level - 1);
+                        self.jump_cache.insert(cache_key, result);
+                        notify_step0_dependents(discovered_node, &mut tasks, &mut dependents, &mut ready);
+                        if ready.len() > self.stats.scheduler_ready_max {
+                            self.stats.scheduler_ready_max = ready.len();
+                        }
+                        continue;
+                    }
 
-                if level == 2 {
-                    let result = self.base_transition(node);
-                    self.jump_cache.insert(key, result);
-                    notify_step0_dependents(node, &mut tasks, &mut dependents, &mut ready);
-                    continue;
-                }
+                    if discovered_level == 2 {
+                        let result = self.base_transition(discovered_node);
+                        self.jump_cache.insert(cache_key, result);
+                        notify_step0_dependents(discovered_node, &mut tasks, &mut dependents, &mut ready);
+                        if ready.len() > self.stats.scheduler_ready_max {
+                            self.stats.scheduler_ready_max = ready.len();
+                        }
+                        continue;
+                    }
 
-                let [a, b, c, d, e, f, g, h, i] = self.overlapping_subnodes(node);
-                let a = self.centered_subnode(a);
-                let b = self.centered_subnode(b);
-                let c = self.centered_subnode(c);
-                let d = self.centered_subnode(d);
-                let e = self.centered_subnode(e);
-                let f = self.centered_subnode(f);
-                let g = self.centered_subnode(g);
-                let h = self.centered_subnode(h);
-                let i = self.centered_subnode(i);
-                let nw = self.join(a, b, d, e);
-                let ne = self.join(b, c, e, f);
-                let sw = self.join(d, e, g, h);
-                let se = self.join(e, f, h, i);
-                let task_id = tasks.len();
-                task_index.insert(node, task_id);
-                tasks.push(Some(Step0TaskRecord {
-                    remaining: 0,
-                    children: [nw, ne, sw, se],
-                }));
-                task_keys.push(Some(node));
+                    let [
+                        upper_left,
+                        upper_center,
+                        upper_right,
+                        middle_left,
+                        center,
+                        middle_right,
+                        lower_left,
+                        lower_center,
+                        lower_right,
+                    ] = self.overlapping_subnodes(discovered_node);
+                    let next_upper_left = self.centered_subnode(upper_left);
+                    let next_upper_center = self.centered_subnode(upper_center);
+                    let next_upper_right = self.centered_subnode(upper_right);
+                    let next_middle_left = self.centered_subnode(middle_left);
+                    let next_center = self.centered_subnode(center);
+                    let next_middle_right = self.centered_subnode(middle_right);
+                    let next_lower_left = self.centered_subnode(lower_left);
+                    let next_lower_center = self.centered_subnode(lower_center);
+                    let next_lower_right = self.centered_subnode(lower_right);
+                    let combined_upper_left =
+                        self.join(next_upper_left, next_upper_center, next_middle_left, next_center);
+                    let combined_upper_right =
+                        self.join(next_upper_center, next_upper_right, next_center, next_middle_right);
+                    let combined_lower_left =
+                        self.join(next_middle_left, next_center, next_lower_left, next_lower_center);
+                    let combined_lower_right =
+                        self.join(next_center, next_middle_right, next_lower_center, next_lower_right);
+                    let task_id = tasks.len();
+                    task_index.insert(discovered_node, task_id);
+                    tasks.push(Some(Step0TaskRecord {
+                        remaining: 0,
+                        children: [
+                            combined_upper_left,
+                            combined_upper_right,
+                            combined_lower_left,
+                            combined_lower_right,
+                        ],
+                    }));
+                    task_keys.push(Some(discovered_node));
+                    self.stats.scheduler_tasks += 1;
 
-                for child in [se, sw, ne, nw] {
-                    if self.cached_jump_result((child, 0)).is_none() {
-                        dependents.entry(child).or_default().push(task_id);
-                        tasks[task_id].as_mut().unwrap().remaining += 1;
-                        if !task_index.contains_key(&child) {
-                            discover.push(child);
+                    for child_node in [
+                        combined_lower_right,
+                        combined_lower_left,
+                        combined_upper_right,
+                        combined_upper_left,
+                    ] {
+                        if self.cached_jump_result((child_node, 0)).is_none() {
+                            dependents.entry(child_node).or_default().push(task_id);
+                            tasks[task_id].as_mut().unwrap().remaining += 1;
+                            if !task_index.contains_key(&child_node) {
+                                discover.push(child_node);
+                            }
+                        }
+                    }
+                    if tasks[task_id].as_ref().unwrap().remaining == 0 {
+                        ready.push(task_id);
+                        if ready.len() > self.stats.scheduler_ready_max {
+                            self.stats.scheduler_ready_max = ready.len();
                         }
                     }
                 }
-                if tasks[task_id].as_ref().unwrap().remaining == 0 {
-                    ready.push(task_id);
-                }
             }
 
-            if self.jump_cache.contains_key(&key) {
+            if self.jump_cache.contains_key(&root_key) {
                 break;
             }
 
@@ -684,8 +830,10 @@ impl HashLifeOracle {
                     (pending_node, task.remaining, task.children)
                 });
                 panic!(
-                    "hashlife step-0 dependency resolution stalled for node={node} pending={} sample={sample:?}",
-                    task_index.len()
+                    "hashlife step-0 dependency resolution stalled root_node={root_node} pending={} ready={} cache={} sample={sample:?}",
+                    task_index.len(),
+                    ready.len(),
+                    self.jump_cache.len(),
                 );
             };
             let Some(task_node) = task_keys[task_id].take() else {
@@ -702,41 +850,60 @@ impl HashLifeOracle {
             let result = self.join(q00, q01, q10, q11);
             self.jump_cache.insert((task_node, 0), result);
             notify_step0_dependents(task_node, &mut tasks, &mut dependents, &mut ready);
+            if ready.len() > self.stats.scheduler_ready_max {
+                self.stats.scheduler_ready_max = ready.len();
+            }
         }
 
         if debug {
             eprintln!(
-                "[hashlife] advance_step0 done root={node} iterations={iterations} cache={} pending={} ready={}",
+                "[hashlife] advance_step0 done root={root_node} iterations={iterations} cache={} pending={} ready={}",
                 self.jump_cache.len(),
                 task_index.len(),
                 ready.len(),
             );
         }
 
-        self.jump_cache[&key]
+        self.jump_cache[&root_key]
     }
 
     fn overlapping_subnodes(&mut self, node: NodeId) -> [NodeId; 9] {
-        if let Some(overlaps) = self.overlap_cache.get(&node).copied() {
+        if let Some(overlaps) = self.overlap_cache.get(&node) {
             self.stats.overlap_cache_hits += 1;
-            return overlaps;
+            return *overlaps;
         }
         self.stats.overlap_cache_misses += 1;
-        let Node { nw, ne, sw, se, .. } = self.nodes[node as usize];
-        let nw_node = self.nodes[nw as usize];
-        let ne_node = self.nodes[ne as usize];
-        let sw_node = self.nodes[sw as usize];
-        let se_node = self.nodes[se as usize];
+        let node_ref = &self.nodes[node as usize];
+        let nw = node_ref.nw;
+        let ne = node_ref.ne;
+        let sw = node_ref.sw;
+        let se = node_ref.se;
+        let nw_node = &self.nodes[nw as usize];
+        let nw_ne = nw_node.ne;
+        let nw_se = nw_node.se;
+        let nw_sw = nw_node.sw;
+        let ne_node = &self.nodes[ne as usize];
+        let ne_nw = ne_node.nw;
+        let ne_sw = ne_node.sw;
+        let ne_se = ne_node.se;
+        let sw_node = &self.nodes[sw as usize];
+        let sw_nw = sw_node.nw;
+        let sw_ne = sw_node.ne;
+        let sw_se = sw_node.se;
+        let se_node = &self.nodes[se as usize];
+        let se_nw = se_node.nw;
+        let se_ne = se_node.ne;
+        let se_sw = se_node.sw;
 
         let overlaps = [
             nw,
-            self.join(nw_node.ne, ne_node.nw, nw_node.se, ne_node.sw),
+            self.join(nw_ne, ne_nw, nw_se, ne_sw),
             ne,
-            self.join(nw_node.sw, nw_node.se, sw_node.nw, sw_node.ne),
-            self.join(nw_node.se, ne_node.sw, sw_node.ne, se_node.nw),
-            self.join(ne_node.sw, ne_node.se, se_node.nw, se_node.ne),
+            self.join(nw_sw, nw_se, sw_nw, sw_ne),
+            self.join(nw_se, ne_sw, sw_ne, se_nw),
+            self.join(ne_sw, ne_se, se_nw, se_ne),
             sw,
-            self.join(sw_node.ne, se_node.nw, sw_node.se, se_node.sw),
+            self.join(sw_ne, se_nw, sw_se, se_sw),
             se,
         ];
         self.overlap_cache.insert(node, overlaps);
@@ -744,19 +911,41 @@ impl HashLifeOracle {
     }
 
     fn centered_subnode(&mut self, node: NodeId) -> NodeId {
-        let Node { level, nw, ne, sw, se, .. } = self.nodes[node as usize];
-        debug_assert!(level >= 1);
-        if level == 1 {
+        let node_ref = &self.nodes[node as usize];
+        debug_assert!(node_ref.level >= 1);
+        if node_ref.level == 1 {
             return node;
         }
 
-        let nw_node = self.nodes[nw as usize];
-        let ne_node = self.nodes[ne as usize];
-        let sw_node = self.nodes[sw as usize];
-        let se_node = self.nodes[se as usize];
-        self.join(nw_node.se, ne_node.sw, sw_node.ne, se_node.nw)
+        let nw_se = self.nodes[node_ref.nw as usize].se;
+        let ne_sw = self.nodes[node_ref.ne as usize].sw;
+        let sw_ne = self.nodes[node_ref.sw as usize].ne;
+        let se_nw = self.nodes[node_ref.se as usize].nw;
+        self.join(nw_se, ne_sw, sw_ne, se_nw)
     }
 
+}
+
+fn max_hashlife_safe_jump(current: &BitGrid) -> u64 {
+    let Some((min_x, min_y, max_x, max_y)) = current.bounds() else {
+        return 1;
+    };
+    let width = (max_x - min_x + 1).max(1);
+    let height = (max_y - min_y + 1).max(1);
+    let span = width.max(height);
+    let raw_max_jump = (((Coord::MAX as i128) - (2 * span as i128) - 8) / 4).max(1) as u64;
+    let mut jump = 1_u64 << (63 - raw_max_jump.leading_zeros());
+    while jump > 1 && required_root_size_for_jump(span as u64, jump) > Coord::MAX as u64 {
+        jump >>= 1;
+    }
+    jump
+}
+
+fn required_root_size_for_jump(span: u64, jump: u64) -> u64 {
+    (2 * span + 4 * (jump + 2))
+        .max((4 * jump) + 4)
+        .max(4)
+        .next_power_of_two()
 }
 
 fn hashlife_debug_enabled() -> bool {
@@ -799,12 +988,12 @@ fn notify_step0_dependents(
     }
 }
 
-fn morton_key(x: u32, y: u32) -> u64 {
-    let mut key = 0_u64;
+fn morton_key(x: u64, y: u64) -> u128 {
+    let mut key = 0_u128;
     let mut bit = 0_u32;
-    while bit < 32 {
-        key |= ((x as u64 >> bit) & 1) << (bit * 2);
-        key |= ((y as u64 >> bit) & 1) << (bit * 2 + 1);
+    while bit < 64 {
+        key |= ((x as u128 >> bit) & 1) << (bit * 2);
+        key |= ((y as u128 >> bit) & 1) << (bit * 2 + 1);
         bit += 1;
     }
     key
@@ -815,7 +1004,7 @@ fn quadrant_end(
     start: usize,
     end: usize,
     bit_shift: u32,
-    quadrant: u64,
+    quadrant: u128,
 ) -> usize {
     let upper = quadrant + 1;
     start

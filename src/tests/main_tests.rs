@@ -1,6 +1,6 @@
 use crate::app::initial_grid;
 use crate::cli::Config;
-use crate::engine::{SimulationEngine, advance_grid, select_engine};
+use crate::engine::{SimulationBackend, advance_grid, select_backend};
 use crate::life::GameOfLife;
 use crate::normalize::normalize;
 
@@ -10,6 +10,7 @@ fn initial_grid_uses_named_pattern() {
         width: 80,
         height: 24,
         steps: 1,
+        max_generations: None,
         fast_forward: 0,
         delay_ms: 0,
         seed: 123,
@@ -28,6 +29,7 @@ fn initial_grid_random_soup_respects_config_dimensions() {
         width: 90,
         height: 30,
         steps: 1,
+        max_generations: None,
         fast_forward: 0,
         delay_ms: 0,
         seed: 7,
@@ -38,20 +40,20 @@ fn initial_grid_random_soup_respects_config_dimensions() {
     let grid = initial_grid(&config);
     let (min_x, min_y, max_x, max_y) = grid.bounds().unwrap();
     assert_eq!((min_x, min_y), (0, 0));
-    assert!(max_x < (config.width as i32) * 2 / 3);
-    assert!(max_y < config.height as i32);
+    assert!(max_x < ((config.width as i64) * 2) / 3);
+    assert!(max_y < config.height as i64);
 }
 
 #[test]
 fn engine_policy_uses_simd_for_small_fast_forward() {
     let grid = crate::generators::pattern_by_name("glider").unwrap();
-    assert_eq!(select_engine(&grid, 32), SimulationEngine::SimdChunk);
+    assert_eq!(select_backend(&grid, 32), SimulationBackend::SimdChunk);
 }
 
 #[test]
 fn engine_policy_uses_hashlife_for_large_sparse_fast_forward() {
     let grid = crate::generators::pattern_by_name("glider_producing_switch_engine").unwrap();
-    assert_eq!(select_engine(&grid, 2048), SimulationEngine::HashLife);
+    assert_eq!(select_backend(&grid, 2048), SimulationBackend::HashLife);
 }
 
 #[test]
@@ -65,5 +67,14 @@ fn engine_advance_matches_stepper_for_hybrid_candidate() {
     }
 
     assert_eq!(normalize(&advanced.grid).0, normalize(game.grid()).0);
-    assert_eq!(advanced.stats.engine, SimulationEngine::HybridSegmented);
+    assert_eq!(advanced.stats.backend, SimulationBackend::HybridSegmented);
+}
+
+#[test]
+fn engine_advance_handles_trillion_fast_forward_for_stable_pattern() {
+    let grid = crate::generators::pattern_by_name("block").unwrap();
+    let advanced = advance_grid(&grid, 1_000_000_000_000);
+
+    assert_eq!(normalize(&advanced.grid).0, normalize(&grid).0);
+    assert_eq!(advanced.stats.simd_generations + advanced.stats.hashlife_generations, 1_000_000_000_000);
 }

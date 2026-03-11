@@ -9,6 +9,7 @@ pub mod hashlife;
 pub mod life;
 pub mod memo;
 pub mod normalize;
+pub mod oracle;
 pub mod render;
 pub mod term;
 

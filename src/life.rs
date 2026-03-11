@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use bytemuck::{must_cast, must_cast_mut, must_cast_ref};
 use wide::{i8x16, u8x16, u16x8, u16x16, u16x32, u64x8};
 
-use crate::bitgrid::{BitGrid, CHUNK_SIZE};
+use crate::bitgrid::{BitGrid, Cell, Coord, CHUNK_SIZE};
 use crate::memo::{ChunkNeighborhood, Memo};
 
 const ROW_LOW_BYTE_MASK: u16x8 = u16x8::splat(0x00FF);
@@ -37,8 +37,8 @@ impl DiagonalSpec {
 // Public API
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkDiff {
-    pub cx: i32,
-    pub cy: i32,
+    pub cx: Coord,
+    pub cy: Coord,
     pub diff_bits: u64,
 }
 
@@ -70,7 +70,7 @@ impl GameOfLife {
         self.generation
     }
 
-    pub fn step_with_changes(&mut self) -> Vec<(i32, i32)> {
+    pub fn step_with_changes(&mut self) -> Vec<Cell> {
         let (next, chunk_changes) = step_grid_with_chunk_changes_and_memo(&self.grid, &mut self.memo);
         self.grid = next;
         self.generation += 1;
@@ -95,7 +95,7 @@ pub fn step_grid(grid: &BitGrid) -> BitGrid {
 pub fn step_grid_with_changes_and_memo(
     grid: &BitGrid,
     memo: &mut Memo,
-) -> (BitGrid, Vec<(i32, i32)>) {
+) -> (BitGrid, Vec<Cell>) {
     let (next, chunk_changes) = step_grid_with_chunk_changes_and_memo(grid, memo);
     (next, expand_chunk_diffs_to_cells(&chunk_changes))
 }
@@ -131,7 +131,7 @@ pub fn step_grid_with_chunk_changes_and_memo(
 }
 
 fn flush_pending_chunks(
-    pending: &mut Vec<(i32, i32, u64, ChunkNeighborhood)>,
+    pending: &mut Vec<(Coord, Coord, u64, ChunkNeighborhood)>,
     memo: &mut Memo,
     next: &mut BitGrid,
     changed: &mut Vec<ChunkDiff>,
@@ -153,8 +153,8 @@ fn flush_pending_chunks(
 fn apply_chunk_step(
     next: &mut BitGrid,
     changed: &mut Vec<ChunkDiff>,
-    cx: i32,
-    cy: i32,
+    cx: Coord,
+    cy: Coord,
     current_bits: u64,
     next_bits: u64,
 ) {
@@ -168,7 +168,7 @@ fn apply_chunk_step(
 }
 
 // Neighborhood collection
-fn collect_target_chunks(grid: &BitGrid) -> HashSet<(i32, i32)> {
+fn collect_target_chunks(grid: &BitGrid) -> HashSet<Cell> {
     let mut targets = HashSet::new();
     for (cx, cy) in grid.chunk_coords() {
         for dy in -1..=1 {
@@ -180,7 +180,7 @@ fn collect_target_chunks(grid: &BitGrid) -> HashSet<(i32, i32)> {
     targets
 }
 
-fn build_neighborhood(grid: &BitGrid, cx: i32, cy: i32) -> ChunkNeighborhood {
+fn build_neighborhood(grid: &BitGrid, cx: Coord, cy: Coord) -> ChunkNeighborhood {
     let mut chunks = [0_u64; 9];
     let mut index = 0;
     for dy in -1..=1 {
@@ -227,7 +227,7 @@ fn evolve_center_chunk_bitwise(neighborhood: &ChunkNeighborhood) -> u64 {
 }
 
 fn evolve_center_chunks_bitwise_batch_from_pending(
-    pending: &[(i32, i32, u64, ChunkNeighborhood)],
+    pending: &[(Coord, Coord, u64, ChunkNeighborhood)],
 ) -> Vec<u64> {
     debug_assert!(!pending.is_empty());
     debug_assert!(pending.len() <= 8);
@@ -307,7 +307,7 @@ fn accumulate_neighbor_bitplanes(neighbors: &[u64x8; 8]) -> (u64x8, u64x8, u64x8
 
 // Batched row layout
 fn build_chunk_row_batches_from_pending(
-    pending: &[(i32, i32, u64, ChunkNeighborhood)],
+    pending: &[(Coord, Coord, u64, ChunkNeighborhood)],
 ) -> [ChunkRowBatch; 9] {
     let mut chunks = [[[0_u16; 8]; 8]; 9];
 
@@ -551,22 +551,22 @@ fn edge_column_mask_batch(
 }
 
 // Changed-cell extraction
-fn append_changed_cells(changed: &mut Vec<(i32, i32)>, cx: i32, cy: i32, diff_bits: u64) {
+fn append_changed_cells(changed: &mut Vec<Cell>, cx: Coord, cy: Coord, diff_bits: u64) {
     if diff_bits == 0 {
         return;
     }
 
     let mut remaining = diff_bits;
     while remaining != 0 {
-        let bit = remaining.trailing_zeros();
-        let local_x = (bit % 8) as i32;
-        let local_y = (bit / 8) as i32;
+        let bit = remaining.trailing_zeros() as Coord;
+        let local_x = bit % 8;
+        let local_y = bit / 8;
         changed.push((cx * CHUNK_SIZE + local_x, cy * CHUNK_SIZE + local_y));
         remaining &= remaining - 1;
     }
 }
 
-fn expand_chunk_diffs_to_cells(chunk_diffs: &[ChunkDiff]) -> Vec<(i32, i32)> {
+fn expand_chunk_diffs_to_cells(chunk_diffs: &[ChunkDiff]) -> Vec<Cell> {
     let mut changed = Vec::new();
     for diff in chunk_diffs {
         append_changed_cells(&mut changed, diff.cx, diff.cy, diff.diff_bits);

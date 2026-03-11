@@ -3,16 +3,28 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::bitgrid::BitGrid;
+use crate::bitgrid::{BitGrid, Cell, Coord};
 use crate::classify::{
-    Classification, ClassificationCheckpoint, ClassificationLimits, classify_seed_with_checkpoint,
+    Classification, ClassificationCheckpoint, ClassificationLimits, predict_seed_with_checkpoint,
 };
-use crate::engine::{SimulationEngine, advance_grid, select_engine};
+use crate::engine::{SimulationBackend, select_backend};
 use crate::generators::{mix_seed, pattern_by_name, random_soup};
 use crate::memo::Memo;
 use crate::normalize::{NormalizedGridSignature, normalize};
+use crate::oracle::{OracleSession, OracleStateMetrics, OracleStepPlan};
 
-type SeenStates = HashMap<NormalizedGridSignature, (usize, (i32, i32))>;
+type SeenStates = HashMap<NormalizedGridSignature, (u64, Cell)>;
+
+fn bounds_dimensions(bounds: (Coord, Coord, Coord, Coord)) -> (Coord, Coord, Coord) {
+    let (min_x, min_y, max_x, max_y) = bounds;
+    let width = max_x - min_x + 1;
+    let height = max_y - min_y + 1;
+    (width, height, width.max(height))
+}
+
+fn grid_bounds_span(grid: &BitGrid) -> Coord {
+    grid.bounds().map(|bounds| bounds_dimensions(bounds).2).unwrap_or(0)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BenchmarkFormat {
@@ -23,54 +35,22 @@ pub enum BenchmarkFormat {
 #[derive(Clone, Debug, Default)]
 pub struct BenchmarkOptions {
     pub families: Option<Vec<String>>,
+    pub prediction_max_generations: Option<u64>,
+    pub oracle_max_generations: Option<u64>,
     pub exhaustive_5x5: bool,
+    pub oracle_runtime_case: bool,
+    pub oracle_runtime_target_generation: Option<u64>,
+    pub progress: bool,
 }
 
+const BENCHMARK_PREDICTION_MAX_GENERATIONS: u64 = 256;
+const DEFAULT_BENCHMARK_ORACLE_MAX_GENERATIONS: u64 = 1_000_000;
+const DEFAULT_ORACLE_MAX_JUMP_TARGET: u64 = 10_000_000;
+#[cfg(test)]
+const TEST_ORACLE_MAX_GENERATIONS: u64 = 4_096;
+
 pub fn run_benchmark_report(format: BenchmarkFormat, options: &BenchmarkOptions) {
-    let prediction_limits = ClassificationLimits {
-        max_generations: 256,
-        max_population: 20_000,
-        max_bounding_box: i32::MAX,
-    };
-    let oracle_limits = ClassificationLimits {
-        max_generations: 512,
-        max_population: 50_000,
-        max_bounding_box: i32::MAX,
-    };
-    let filters = benchmark_family_filter(options);
-    let suite = weighted_benchmark_suite()
-        .into_iter()
-        .filter(|case| {
-            filters
-                .as_ref()
-                .map(|set| set.contains(&case.family))
-                .unwrap_or(true)
-        })
-        .collect::<Vec<_>>();
-    let mut report = BenchmarkReport::default();
-
-    for case in suite {
-        let started = Instant::now();
-        let (actual, checkpoint) =
-            classify_seed_with_checkpoint(&case.grid, &prediction_limits, &mut Memo::default());
-        let expected = reference_classify_from_checkpoint(
-            checkpoint,
-            &actual,
-            &prediction_limits,
-            &oracle_limits,
-        );
-        report.record(
-            &case,
-            &expected,
-            &actual,
-            started.elapsed(),
-            prediction_limits.max_generations as u64,
-        );
-    }
-
-    if options.exhaustive_5x5 {
-        run_exhaustive_5x5(&mut report);
-    }
+    let report = build_benchmark_report(options);
 
     match format {
         BenchmarkFormat::Text => report.print(),
@@ -83,7 +63,141 @@ pub fn run_benchmark_report(format: BenchmarkFormat, options: &BenchmarkOptions)
     }
 }
 
-pub(crate) fn bitmask_pattern(mask: u32, width: i32, height: i32) -> BitGrid {
+fn build_benchmark_report(options: &BenchmarkOptions) -> BenchmarkReport {
+    let prediction_max_generations = options
+        .prediction_max_generations
+        .unwrap_or(BENCHMARK_PREDICTION_MAX_GENERATIONS);
+    let oracle_max_generations = options
+        .oracle_max_generations
+        .unwrap_or(DEFAULT_BENCHMARK_ORACLE_MAX_GENERATIONS);
+    let prediction_limits = ClassificationLimits {
+        max_generations: prediction_max_generations,
+        max_population: 20_000,
+        max_bounding_box: Coord::MAX,
+    };
+    let oracle_limits = ClassificationLimits {
+        max_generations: oracle_max_generations,
+        max_population: 5_000_000,
+        max_bounding_box: Coord::MAX,
+    };
+    let filters = benchmark_family_filter(options);
+    let suite = weighted_benchmark_suite()
+        .into_iter()
+        .filter(|case| {
+            filters
+                .as_ref()
+                .map(|set| set.contains(&case.family))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    let mut report = BenchmarkReport::default();
+    let mut oracle_simulation = crate::engine::SimulationSession::new();
+
+    if options.oracle_runtime_case {
+        let diagnostic_oracle_limit = options
+            .oracle_max_generations
+            .or(options.oracle_runtime_target_generation)
+            .unwrap_or(DEFAULT_ORACLE_MAX_JUMP_TARGET);
+        let diagnostic_limits = ClassificationLimits {
+            max_generations: diagnostic_oracle_limit,
+            max_population: oracle_limits.max_population,
+            max_bounding_box: oracle_limits.max_bounding_box,
+        };
+        report.oracle_runtime_case = Some(run_oracle_runtime_case(
+            &diagnostic_limits,
+            options
+                .oracle_runtime_target_generation
+                .unwrap_or(DEFAULT_ORACLE_MAX_JUMP_TARGET),
+            options.progress,
+            &mut oracle_simulation,
+        ));
+        oracle_simulation.finish();
+        return report;
+    }
+
+    if options.exhaustive_5x5 {
+        run_exhaustive_5x5(&mut report, &mut oracle_simulation);
+        oracle_simulation.finish();
+        return report;
+    }
+
+    for case in suite {
+        let started = Instant::now();
+        let (actual, checkpoint) =
+            predict_seed_with_checkpoint(&case.grid, &prediction_limits, &mut Memo::default());
+        let expected = reference_classify_from_checkpoint(
+            checkpoint,
+            &actual,
+            &prediction_limits,
+            &oracle_limits,
+            &mut oracle_simulation,
+        );
+        report.record(
+            &case,
+            &expected,
+            &actual,
+            started.elapsed(),
+            prediction_limits.max_generations,
+        );
+    }
+
+    oracle_simulation.finish();
+
+    report
+}
+
+#[cfg(test)]
+pub(crate) fn benchmark_report_json_value(options: &BenchmarkOptions) -> serde_json::Value {
+    let mut report = BenchmarkReport::default();
+    if options.oracle_runtime_case {
+        let diagnostic_oracle_limit = options
+            .oracle_max_generations
+            .or(options.oracle_runtime_target_generation)
+            .unwrap_or(TEST_ORACLE_MAX_GENERATIONS);
+        let limits = ClassificationLimits {
+            max_generations: diagnostic_oracle_limit,
+            max_population: 5_000_000,
+            max_bounding_box: Coord::MAX,
+        };
+        let mut oracle_simulation = crate::engine::SimulationSession::new();
+        report.oracle_runtime_case = Some(run_oracle_runtime_case(
+            &limits,
+            options
+                .oracle_runtime_target_generation
+                .unwrap_or(TEST_ORACLE_MAX_GENERATIONS),
+            false,
+            &mut oracle_simulation,
+        ));
+        oracle_simulation.finish();
+    }
+    serde_json::to_value(report.to_json()).unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn oracle_runtime_case_for_tests() -> (String, u64, bool, usize, Coord) {
+    let limits = ClassificationLimits {
+        max_generations: TEST_ORACLE_MAX_GENERATIONS,
+        max_population: 5_000_000,
+        max_bounding_box: Coord::MAX,
+    };
+    let mut oracle_simulation = crate::engine::SimulationSession::new();
+    let case = run_oracle_runtime_case(
+        &limits,
+        TEST_ORACLE_MAX_GENERATIONS,
+        false,
+        &mut oracle_simulation,
+    );
+    oracle_simulation.finish();
+    (
+        case.pattern.to_string(),
+        case.target_generation,
+        case.reached_target,
+        case.population,
+        case.bounds_span,
+    )
+}
+
+pub(crate) fn bitmask_pattern(mask: u32, width: Coord, height: Coord) -> BitGrid {
     let mut cells = Vec::new();
     for y in 0..height {
         for x in 0..width {
@@ -96,13 +210,12 @@ pub(crate) fn bitmask_pattern(mask: u32, width: i32, height: i32) -> BitGrid {
     BitGrid::from_cells(&cells)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 pub(crate) fn reference_classify(seed: &BitGrid, limits: &ClassificationLimits) -> Classification {
     let mut seen: SeenStates = HashMap::new();
     let mut grid = seed.clone();
     let mut generation = 0;
-    let mut generation_limit =
-        effective_generation_limit(limits, grid.population(), grid.bounds());
+    let mut generation_limit = effective_generation_limit(limits, grid.population(), grid.bounds());
 
     while generation <= generation_limit {
         let (signature, origin) = normalize(&grid);
@@ -135,9 +248,8 @@ pub(crate) fn reference_classify(seed: &BitGrid, limits: &ClassificationLimits) 
             };
         }
 
-        if let Some((min_x, min_y, max_x, max_y)) = grid.bounds() {
-            let width = max_x - min_x + 1;
-            let height = max_y - min_y + 1;
+        if let Some(bounds) = grid.bounds() {
+            let (width, height, _) = bounds_dimensions(bounds);
             if width > limits.max_bounding_box || height > limits.max_bounding_box {
                 return Classification::LikelyInfinite {
                     reason: "expanding_bounds",
@@ -160,11 +272,12 @@ pub(crate) fn reference_classify(seed: &BitGrid, limits: &ClassificationLimits) 
     }
 }
 
-fn reference_classify_from_checkpoint(
+pub(crate) fn reference_classify_from_checkpoint(
     checkpoint: ClassificationCheckpoint,
     prediction: &Classification,
     prediction_limits: &ClassificationLimits,
     oracle_limits: &ClassificationLimits,
+    oracle_simulation: &mut crate::engine::SimulationSession,
 ) -> Classification {
     let oracle_limit = effective_generation_limit(
         oracle_limits,
@@ -176,108 +289,17 @@ fn reference_classify_from_checkpoint(
         return prediction.clone();
     }
 
-    reference_classify_continuation(
+    OracleSession::new(
         checkpoint.grid,
-        checkpoint.seen,
         checkpoint.generation,
-        oracle_limit.max(prediction_limits.max_generations),
-        oracle_limits,
+        checkpoint.seen,
+        oracle_simulation,
     )
-}
-
-fn reference_classify_continuation(
-    mut grid: BitGrid,
-    mut seen: SeenStates,
-    mut generation: usize,
-    mut generation_limit: usize,
-    limits: &ClassificationLimits,
-) -> Classification {
-    while generation <= generation_limit {
-        let (signature, origin) = normalize(&grid);
-        if grid.is_empty() {
-            return Classification::DiesOut {
-                at_generation: generation,
-            };
-        }
-
-        if let Some(&(first_seen, first_origin)) = seen.get(&signature) {
-            let period = generation - first_seen;
-            let dx = origin.0 - first_origin.0;
-            let dy = origin.1 - first_origin.1;
-            return if dx == 0 && dy == 0 {
-                Classification::Repeats { period, first_seen }
-            } else {
-                Classification::Spaceship {
-                    period,
-                    first_seen,
-                    delta: (dx, dy),
-                    detected_at: generation,
-                }
-            };
-        }
-
-        if grid.population() > limits.max_population {
-            return Classification::LikelyInfinite {
-                reason: "population_growth",
-                detected_at: generation,
-            };
-        }
-
-        if let Some((min_x, min_y, max_x, max_y)) = grid.bounds() {
-            let width = max_x - min_x + 1;
-            let height = max_y - min_y + 1;
-            if width > limits.max_bounding_box || height > limits.max_bounding_box {
-                return Classification::LikelyInfinite {
-                    reason: "expanding_bounds",
-                    detected_at: generation,
-                };
-            }
-        }
-
-        seen.insert(signature, (generation, origin));
-        let step_span =
-            continuation_step_span(&grid, generation, generation_limit, limits.max_generations);
-        grid = reference_next_grid(&grid, step_span);
-        generation += step_span as usize;
-
-        if generation > generation_limit {
-            generation_limit = effective_generation_limit(limits, grid.population(), grid.bounds());
-        }
-    }
-
-    Classification::Unknown {
-        simulated: generation_limit,
-    }
-}
-
-fn reference_next_grid(current: &BitGrid, step_span: u64) -> BitGrid {
-    if step_span <= 1 {
-        reference_step_grid(current)
-    } else {
-        advance_grid(current, step_span).grid
-    }
-}
-
-fn continuation_step_span(
-    current: &BitGrid,
-    generation: usize,
-    generation_limit: usize,
-    nominal_generation_limit: usize,
-) -> u64 {
-    if generation < nominal_generation_limit {
-        return 1;
-    }
-
-    let remaining = generation_limit.saturating_sub(generation) as u64;
-    if remaining <= 1 {
-        return 1;
-    }
-
-    match select_engine(current, remaining) {
-        SimulationEngine::SimdChunk => 1,
-        SimulationEngine::HybridSegmented => remaining.min(8),
-        SimulationEngine::HashLife => remaining.min(16),
-    }
+        .classify_continuation(
+            oracle_limit.max(prediction_limits.max_generations),
+            prediction_limits.max_generations,
+            oracle_limits,
+        )
 }
 
 #[cfg(test)]
@@ -377,12 +399,13 @@ struct BenchmarkReport {
     by_size: BTreeMap<i32, SliceStats>,
     by_outcome: BTreeMap<OutcomeBucket, SliceStats>,
     by_error: BTreeMap<ErrorBucket, usize>,
-    by_engine: BTreeMap<SimulationEngine, SliceStats>,
+    by_backend: BTreeMap<SimulationBackend, SliceStats>,
     runtimes: Vec<Duration>,
     runtime_by_family: BTreeMap<BenchmarkFamily, Vec<Duration>>,
     runtime_by_size: BTreeMap<i32, Vec<Duration>>,
-    runtime_by_engine: BTreeMap<SimulationEngine, Vec<Duration>>,
+    runtime_by_backend: BTreeMap<SimulationBackend, Vec<Duration>>,
     unknown_count: usize,
+    oracle_runtime_case: Option<OracleRuntimeCaseReport>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -402,11 +425,12 @@ struct JsonReport {
     by_density: BTreeMap<String, JsonSliceStats>,
     by_size: BTreeMap<String, JsonSliceStats>,
     by_outcome: BTreeMap<String, JsonSliceStats>,
-    by_engine: BTreeMap<String, JsonSliceStats>,
+    by_backend: BTreeMap<String, JsonSliceStats>,
     runtime_by_family: BTreeMap<String, JsonRuntimeSummary>,
     runtime_by_size: BTreeMap<String, JsonRuntimeSummary>,
-    runtime_by_engine: BTreeMap<String, JsonRuntimeSummary>,
+    runtime_by_backend: BTreeMap<String, JsonRuntimeSummary>,
     by_error: BTreeMap<String, usize>,
+    oracle_runtime_case: Option<JsonOracleRuntimeCaseReport>,
 }
 
 #[derive(Serialize)]
@@ -425,6 +449,32 @@ struct JsonRuntimeSummary {
     worst_us: u128,
 }
 
+#[derive(Clone, Debug)]
+struct OracleRuntimeCaseReport {
+    pattern: &'static str,
+    target_generation: u64,
+    final_generation: u64,
+    reached_target: bool,
+    runtime: Duration,
+    classification: Classification,
+    backend: SimulationBackend,
+    population: usize,
+    bounds_span: Coord,
+}
+
+#[derive(Serialize)]
+struct JsonOracleRuntimeCaseReport {
+    pattern: String,
+    target_generation: u64,
+    final_generation: u64,
+    reached_target: bool,
+    runtime_us: u128,
+    classification: String,
+    backend: String,
+    population: usize,
+    bounds_span: Coord,
+}
+
 impl BenchmarkReport {
     fn record(
         &mut self,
@@ -437,7 +487,7 @@ impl BenchmarkReport {
         let outcome = outcome_bucket(expected);
         let error = error_bucket(expected, actual);
         let compatible = error == ErrorBucket::ExactOrCompatible;
-        let engine = select_engine(&case.grid, planned_generations);
+        let backend = select_backend(&case.grid, planned_generations);
 
         self.total += 1;
         if compatible {
@@ -453,7 +503,7 @@ impl BenchmarkReport {
         record_slice(&mut self.by_density, case.density_percent, compatible);
         record_slice(&mut self.by_size, case.size, compatible);
         record_slice(&mut self.by_outcome, outcome, compatible);
-        record_slice(&mut self.by_engine, engine, compatible);
+        record_slice(&mut self.by_backend, backend, compatible);
         *self.by_error.entry(error).or_insert(0) += 1;
         self.runtimes.push(runtime);
         self.runtime_by_family
@@ -464,7 +514,10 @@ impl BenchmarkReport {
             .entry(case.size)
             .or_default()
             .push(runtime);
-        self.runtime_by_engine.entry(engine).or_default().push(runtime);
+        self.runtime_by_backend
+            .entry(backend)
+            .or_default()
+            .push(runtime);
         if matches!(actual, Classification::Unknown { .. }) {
             self.unknown_count += 1;
         }
@@ -496,13 +549,28 @@ impl BenchmarkReport {
         print_slice_map("density", &self.by_density);
         print_slice_map("size", &self.by_size);
         print_slice_map("outcome", &self.by_outcome);
-        print_slice_map("engine", &self.by_engine);
+        print_slice_map("backend", &self.by_backend);
         print_runtime_map("runtime_by_family", &self.runtime_by_family);
         print_runtime_map("runtime_by_size", &self.runtime_by_size);
-        print_runtime_map("runtime_by_engine", &self.runtime_by_engine);
+        print_runtime_map("runtime_by_backend", &self.runtime_by_backend);
         println!("error_buckets:");
         for (bucket, count) in &self.by_error {
             println!("  {:?}: {}", bucket, count);
+        }
+        if let Some(case) = &self.oracle_runtime_case {
+            println!("oracle_runtime_case:");
+            println!(
+                "  pattern={} target_gen={} final_gen={} reached_target={} runtime={:?} classification={} backend={:?} population={} bounds_span={}",
+                case.pattern,
+                case.target_generation,
+                case.final_generation,
+                case.reached_target,
+                case.runtime,
+                case.classification,
+                case.backend,
+                case.population,
+                case.bounds_span
+            );
         }
     }
 
@@ -517,15 +585,28 @@ impl BenchmarkReport {
             by_density: slice_map_json(&self.by_density),
             by_size: slice_map_json(&self.by_size),
             by_outcome: slice_map_json(&self.by_outcome),
-            by_engine: slice_map_json(&self.by_engine),
+            by_backend: slice_map_json(&self.by_backend),
             runtime_by_family: runtime_map_json(&self.runtime_by_family),
             runtime_by_size: runtime_map_json(&self.runtime_by_size),
-            runtime_by_engine: runtime_map_json(&self.runtime_by_engine),
+            runtime_by_backend: runtime_map_json(&self.runtime_by_backend),
             by_error: self
                 .by_error
                 .iter()
                 .map(|(k, v)| (format!("{k:?}"), *v))
                 .collect(),
+            oracle_runtime_case: self.oracle_runtime_case.as_ref().map(|case| {
+                JsonOracleRuntimeCaseReport {
+                    pattern: case.pattern.to_string(),
+                    target_generation: case.target_generation,
+                    final_generation: case.final_generation,
+                    reached_target: case.reached_target,
+                    runtime_us: case.runtime.as_micros(),
+                    classification: case.classification.to_string(),
+                    backend: format!("{:?}", case.backend),
+                    population: case.population,
+                    bounds_span: case.bounds_span,
+                }
+            }),
         }
     }
 }
@@ -600,6 +681,15 @@ fn percentile(samples: &[Duration], fraction: f64) -> Duration {
 }
 
 fn runtime_summary_json(samples: &[Duration]) -> JsonRuntimeSummary {
+    if samples.is_empty() {
+        return JsonRuntimeSummary {
+            median_us: 0,
+            p90_us: 0,
+            p95_us: 0,
+            p99_us: 0,
+            worst_us: 0,
+        };
+    }
     let mut sorted = samples.to_vec();
     sorted.sort_unstable();
     JsonRuntimeSummary {
@@ -747,16 +837,19 @@ fn weighted_benchmark_suite() -> Vec<BenchmarkCase> {
     suite
 }
 
-fn run_exhaustive_5x5(report: &mut BenchmarkReport) {
+fn run_exhaustive_5x5(
+    report: &mut BenchmarkReport,
+    oracle_simulation: &mut crate::engine::SimulationSession,
+) {
     let prediction_limits = ClassificationLimits {
         max_generations: 128,
         max_population: 10_000,
-        max_bounding_box: i32::MAX,
+        max_bounding_box: Coord::MAX,
     };
     let oracle_limits = ClassificationLimits {
-        max_generations: 256,
-        max_population: 20_000,
-        max_bounding_box: i32::MAX,
+        max_generations: DEFAULT_BENCHMARK_ORACLE_MAX_GENERATIONS,
+        max_population: 5_000_000,
+        max_bounding_box: Coord::MAX,
     };
 
     for mask in 0_u32..(1_u32 << 25) {
@@ -766,12 +859,13 @@ fn run_exhaustive_5x5(report: &mut BenchmarkReport) {
         let grid = bitmask_pattern(mask, 5, 5);
         let started = Instant::now();
         let (actual, checkpoint) =
-            classify_seed_with_checkpoint(&grid, &prediction_limits, &mut Memo::default());
+            predict_seed_with_checkpoint(&grid, &prediction_limits, &mut Memo::default());
         let expected = reference_classify_from_checkpoint(
             checkpoint,
             &actual,
             &prediction_limits,
             &oracle_limits,
+            oracle_simulation,
         );
         if !reference_is_decisive_runtime(&expected) {
             continue;
@@ -788,8 +882,214 @@ fn run_exhaustive_5x5(report: &mut BenchmarkReport) {
             &expected,
             &actual,
             started.elapsed(),
-            prediction_limits.max_generations as u64,
+            prediction_limits.max_generations,
         );
+    }
+}
+
+fn run_oracle_runtime_case(
+    oracle_limits: &ClassificationLimits,
+    target_generation: u64,
+    progress: bool,
+    oracle_simulation: &mut crate::engine::SimulationSession,
+) -> OracleRuntimeCaseReport {
+    let pattern = "gosper_glider_gun";
+    let backend = select_backend(
+        &pattern_by_name(pattern).expect("known pattern must exist"),
+        target_generation,
+    );
+    let grid = pattern_by_name(pattern).expect("known pattern must exist");
+    let started = Instant::now();
+    let mut progress_logger = OracleProgressLogger::new(progress, pattern, target_generation);
+    let (classification, final_generation, final_grid) =
+        reference_classify_to_generation_target(
+            grid,
+            target_generation,
+            oracle_limits,
+            Some(&mut progress_logger),
+            oracle_simulation,
+        );
+    let runtime = started.elapsed();
+    progress_logger.finish(final_generation, runtime, &classification);
+    let bounds_span = grid_bounds_span(&final_grid);
+
+    OracleRuntimeCaseReport {
+        pattern,
+        target_generation,
+        final_generation,
+        reached_target: final_generation == target_generation,
+        runtime,
+        classification,
+        backend,
+        population: final_grid.population(),
+        bounds_span,
+    }
+}
+
+fn reference_classify_to_generation_target(
+    seed: BitGrid,
+    target_generation: u64,
+    _limits: &ClassificationLimits,
+    mut progress: Option<&mut OracleProgressLogger>,
+    oracle_simulation: &mut crate::engine::SimulationSession,
+) -> (Classification, u64, BitGrid) {
+    let mut session = OracleSession::new(seed, 0, HashMap::new(), oracle_simulation);
+    if let Some(progress_logger) = progress.as_mut() {
+        let generation = session.generation();
+        let initial_grid = session.sampled_grid();
+        progress_logger.log(
+            generation,
+            OracleStateMetrics {
+                population: initial_grid.population(),
+                bounds_span: grid_bounds_span(initial_grid),
+            },
+            None,
+        );
+    }
+    let outcome = if let Some(progress_logger) = progress {
+        let mut step_logger = |plan: OracleStepPlan, metrics: OracleStateMetrics| {
+            if plan.step_span == 0 {
+                progress_logger.log(plan.generation, metrics, Some(plan.backend));
+            } else {
+                progress_logger.log_planned_step(
+                    plan.generation,
+                    plan.step_span,
+                    plan.backend,
+                    metrics,
+                );
+            }
+        };
+        session.advance_to_target(target_generation, Some(&mut step_logger))
+    } else {
+        session.advance_to_target(target_generation, None)
+    };
+    (
+        outcome.classification,
+        outcome.final_generation,
+        outcome.grid,
+    )
+}
+
+struct OracleProgressLogger {
+    enabled: bool,
+    pattern: &'static str,
+    target_generation: u64,
+    started: Instant,
+    next_log_at: Instant,
+}
+
+impl OracleProgressLogger {
+    fn new(enabled: bool, pattern: &'static str, target_generation: u64) -> Self {
+        let started = Instant::now();
+        Self {
+            enabled,
+            pattern,
+            target_generation,
+            started,
+            next_log_at: started,
+        }
+    }
+
+    fn log(
+        &mut self,
+        generation: u64,
+        metrics: OracleStateMetrics,
+        backend: Option<SimulationBackend>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        if now < self.next_log_at && generation < self.target_generation {
+            return;
+        }
+        self.next_log_at = now + Duration::from_secs(2);
+        let elapsed = now.duration_since(self.started);
+        let progress = if self.target_generation == 0 {
+            1.0
+        } else {
+            generation as f64 / self.target_generation as f64
+        };
+        let progress_percent = (progress * 100.0).min(100.0);
+        let generations_per_second = if elapsed.is_zero() {
+            0.0
+        } else {
+            generation as f64 / elapsed.as_secs_f64()
+        };
+        let remaining_generations = self.target_generation.saturating_sub(generation);
+        let eta_seconds = if generations_per_second > 0.0 {
+            remaining_generations as f64 / generations_per_second
+        } else {
+            f64::INFINITY
+        };
+        let backend_text = backend
+            .map(|current_backend| format!(" backend={current_backend:?}"))
+            .unwrap_or_default();
+
+        eprintln!(
+            "[oracle-max-jump] pattern={} gen={}/{} ({:.2}%) elapsed={:?} eta={} population={} bounds_span={}{}",
+            self.pattern,
+            generation,
+            self.target_generation,
+            progress_percent,
+            elapsed,
+            format_eta_seconds(eta_seconds),
+            metrics.population,
+            metrics.bounds_span,
+            backend_text
+        );
+    }
+
+    fn finish(&mut self, generation: u64, runtime: Duration, classification: &Classification) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "[oracle-max-jump] finished pattern={} gen={}/{} runtime={:?} classification={}",
+            self.pattern,
+            generation,
+            self.target_generation,
+            runtime,
+            classification
+        );
+    }
+
+    fn log_planned_step(
+        &mut self,
+        generation: u64,
+        step_span: u64,
+        backend: SimulationBackend,
+        metrics: OracleStateMetrics,
+    ) {
+        if !self.enabled || step_span <= 1 {
+            return;
+        }
+        eprintln!(
+            "[oracle-max-jump] planning pattern={} gen={} next_step={} backend={:?} population={} bounds_span={}",
+            self.pattern,
+            generation,
+            step_span,
+            backend,
+            metrics.population,
+            metrics.bounds_span
+        );
+    }
+}
+
+fn format_eta_seconds(eta_seconds: f64) -> String {
+    if !eta_seconds.is_finite() {
+        return "unknown".to_string();
+    }
+    let total_seconds = eta_seconds.max(0.0).round() as u64;
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -802,7 +1102,7 @@ fn iid_random_cases() -> Vec<BenchmarkCase> {
                 cases.push(BenchmarkCase {
                     name: format!("iid_{size}_{density}_{seed}"),
                     family: BenchmarkFamily::IidRandom,
-                    size,
+                    size: i32::try_from(size).expect("benchmark size exceeded i32"),
                     density_percent: density,
                     grid,
                 });
@@ -820,7 +1120,7 @@ fn structured_random_cases() -> Vec<BenchmarkCase> {
             cases.push(BenchmarkCase {
                 name: format!("structured_{size}_{seed}"),
                 family: BenchmarkFamily::StructuredRandom,
-                size,
+                size: i32::try_from(size).expect("benchmark size exceeded i32"),
                 density_percent: estimate_density_percent(&grid),
                 grid,
             });
@@ -852,10 +1152,12 @@ fn long_lived_methuselah_cases() -> Vec<BenchmarkCase> {
             cases.push(BenchmarkCase {
                 name: format!("{name}_{idx}"),
                 family: BenchmarkFamily::LongLivedMethuselah,
-                size: grid
-                    .bounds()
-                    .map(|(min_x, _, max_x, _)| max_x - min_x + 1)
-                    .unwrap_or(0),
+                size: i32::try_from(
+                    grid.bounds()
+                        .map(|(min_x, _, max_x, _)| max_x - min_x + 1)
+                        .unwrap_or(0),
+                )
+                .expect("benchmark size exceeded i32"),
                 density_percent: estimate_density_percent(&grid),
                 grid,
             });
@@ -874,10 +1176,12 @@ fn translated_periodic_mover_cases() -> Vec<BenchmarkCase> {
             cases.push(BenchmarkCase {
                 name: format!("{name}_{idx}"),
                 family: BenchmarkFamily::TranslatedPeriodicMover,
-                size: grid
-                    .bounds()
-                    .map(|(min_x, _, max_x, _)| max_x - min_x + 1)
-                    .unwrap_or(0),
+                size: i32::try_from(
+                    grid.bounds()
+                        .map(|(min_x, _, max_x, _)| max_x - min_x + 1)
+                        .unwrap_or(0),
+                )
+                .expect("benchmark size exceeded i32"),
                 density_percent: estimate_density_percent(&grid),
                 grid,
             });
@@ -906,10 +1210,12 @@ fn gun_puffer_breeder_cases() -> Vec<BenchmarkCase> {
             cases.push(BenchmarkCase {
                 name: format!("{name}_{idx}"),
                 family: BenchmarkFamily::GunPufferBreeder,
-                size: grid
-                    .bounds()
-                    .map(|(min_x, _, max_x, _)| max_x - min_x + 1)
-                    .unwrap_or(0),
+                size: i32::try_from(
+                    grid.bounds()
+                        .map(|(min_x, _, max_x, _)| max_x - min_x + 1)
+                        .unwrap_or(0),
+                )
+                .expect("benchmark size exceeded i32"),
                 density_percent: estimate_density_percent(&grid),
                 grid,
             });
@@ -941,10 +1247,12 @@ fn delayed_interaction_cases() -> Vec<BenchmarkCase> {
                 cases.push(BenchmarkCase {
                     name: format!("{name}_{idx}"),
                     family: BenchmarkFamily::DelayedInteraction,
-                    size: grid
-                        .bounds()
-                        .map(|(min_x, _, max_x, _)| max_x - min_x + 1)
-                        .unwrap_or(0),
+                    size: i32::try_from(
+                        grid.bounds()
+                            .map(|(min_x, _, max_x, _)| max_x - min_x + 1)
+                            .unwrap_or(0),
+                    )
+                    .expect("benchmark size exceeded i32"),
                     density_percent: estimate_density_percent(&grid),
                     grid,
                 });
@@ -1005,10 +1313,12 @@ fn benchmark_cases_from_bases(
             cases.push(BenchmarkCase {
                 name: format!("{name}_{idx}"),
                 family,
-                size: grid
-                    .bounds()
-                    .map(|(min_x, _, max_x, _)| max_x - min_x + 1)
-                    .unwrap_or(0),
+                size: i32::try_from(
+                    grid.bounds()
+                        .map(|(min_x, _, max_x, _)| max_x - min_x + 1)
+                        .unwrap_or(0),
+                )
+                .expect("benchmark size exceeded i32"),
                 density_percent: estimate_density_percent(&grid),
                 grid,
             });
@@ -1017,7 +1327,7 @@ fn benchmark_cases_from_bases(
     cases
 }
 
-fn head_on_glider_collision(distance: i32) -> BitGrid {
+fn head_on_glider_collision(distance: Coord) -> BitGrid {
     let southeast_glider = [(1, 0), (2, 1), (0, 2), (1, 2), (2, 2)];
     let northwest_glider = [(0, 0), (1, 0), (2, 0), (0, 1), (1, 2)];
     let mut cells = offset_cells(&southeast_glider, 0, 0);
@@ -1025,7 +1335,7 @@ fn head_on_glider_collision(distance: i32) -> BitGrid {
     BitGrid::from_cells(&cells)
 }
 
-fn distant_glider_trigger(distance: i32, target: BitGrid, target_origin: (i32, i32)) -> BitGrid {
+fn distant_glider_trigger(distance: Coord, target: BitGrid, target_origin: Cell) -> BitGrid {
     let glider = [(1, 0), (2, 1), (0, 2), (1, 2), (2, 2)];
     let mut cells = target
         .live_cells()
@@ -1040,7 +1350,7 @@ fn distant_glider_trigger(distance: i32, target: BitGrid, target_origin: (i32, i
     BitGrid::from_cells(&cells)
 }
 
-fn offset_cells(cells: &[(i32, i32)], dx: i32, dy: i32) -> Vec<(i32, i32)> {
+fn offset_cells(cells: &[Cell], dx: Coord, dy: Coord) -> Vec<Cell> {
     cells.iter().map(|&(x, y)| (x + dx, y + dy)).collect()
 }
 
@@ -1067,7 +1377,7 @@ fn estimate_density_percent(grid: &BitGrid) -> u32 {
     ((grid.population() * 100) / area) as u32
 }
 
-fn structured_random_soup(width: i32, height: i32, seed: u64) -> BitGrid {
+fn structured_random_soup(width: Coord, height: Coord, seed: u64) -> BitGrid {
     let left = random_soup(width / 2, height, 18, seed);
     let right = random_soup(width / 2, height, 12, seed ^ 0x9E3779B97F4A7C15);
     let mut cells = left.live_cells();
@@ -1094,12 +1404,12 @@ fn structured_random_soup(width: i32, height: i32, seed: u64) -> BitGrid {
     BitGrid::from_cells(&cells)
 }
 
-fn hash_seed(a: i32, b: u32, c: u64) -> u64 {
+fn hash_seed(a: Coord, b: u32, c: u64) -> u64 {
     mix_seed(((a as u64) ^ ((b as u64) << 16) ^ (c << 32)).wrapping_add(0x9E3779B97F4A7C15))
 }
 
 fn reference_step_grid(grid: &BitGrid) -> BitGrid {
-    let mut counts: HashMap<(i32, i32), u8> = HashMap::new();
+    let mut counts: HashMap<Cell, u8> = HashMap::new();
     for (x, y) in grid.live_cells() {
         for dy in -1..=1 {
             for dx in -1..=1 {
@@ -1127,12 +1437,12 @@ fn reference_is_decisive_runtime(classification: &Classification) -> bool {
 pub(crate) fn effective_generation_limit(
     limits: &ClassificationLimits,
     population: usize,
-    bounds: Option<(i32, i32, i32, i32)>,
-) -> usize {
+    bounds: Option<(Coord, Coord, Coord, Coord)>,
+) -> u64 {
     const SMALL_PATTERN_POPULATION: usize = 64;
-    const SMALL_PATTERN_SPAN: i32 = 24;
-    const MIN_EXTENDED_LIMIT: usize = 1024;
-    const MAX_EXTENDED_LIMIT: usize = 2048;
+    const SMALL_PATTERN_SPAN: Coord = 24;
+    const MIN_EXTENDED_LIMIT: u64 = 1024;
+    const MAX_EXTENDED_LIMIT: u64 = 2048;
 
     let Some((min_x, min_y, max_x, max_y)) = bounds else {
         return limits.max_generations;

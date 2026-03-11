@@ -1,4 +1,4 @@
-use crate::bitgrid::BitGrid;
+use crate::bitgrid::{BitGrid, Cell, Coord};
 
 pub fn pattern_by_name(name: &str) -> Option<BitGrid> {
     let cells = match name {
@@ -100,16 +100,16 @@ pub fn pattern_by_name(name: &str) -> Option<BitGrid> {
     Some(BitGrid::from_cells(&cells))
 }
 
-fn parse_rle_cells(rle: &str) -> Vec<(i32, i32)> {
+fn parse_rle_cells(rle: &str) -> Vec<Cell> {
     let mut cells = Vec::new();
-    let mut x = 0_i32;
-    let mut y = 0_i32;
-    let mut run = 0_i32;
+    let mut x = 0_i64;
+    let mut y = 0_i64;
+    let mut run = 0_i64;
 
     for ch in rle.chars() {
         match ch {
             '0'..='9' => {
-                run = run * 10 + (ch as i32 - '0' as i32);
+                run = run * 10 + (ch as i64 - '0' as i64);
             }
             'b' => {
                 x += run_length(run);
@@ -136,11 +136,11 @@ fn parse_rle_cells(rle: &str) -> Vec<(i32, i32)> {
     cells
 }
 
-fn run_length(run: i32) -> i32 {
+fn run_length(run: Coord) -> Coord {
     if run == 0 { 1 } else { run }
 }
 
-pub fn random_soup(width: i32, height: i32, fill_percent: u32, seed: u64) -> BitGrid {
+pub fn random_soup(width: Coord, height: Coord, fill_percent: u32, seed: u64) -> BitGrid {
     let mut rng = SplitMix64::new(seed);
     let mut cells = Vec::new();
 

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::classify::Classification;
 use crate::normalize::NormalizedGridSignature;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ChunkNeighborhood(pub [u64; 9]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -86,12 +86,12 @@ impl Memo {
         neighborhood: &ChunkNeighborhood,
     ) -> (ChunkNeighborhood, Symmetry) {
         if let Some(cached) = self.chunk_canonicalization_cache.get(neighborhood) {
-            return cached.clone();
+            return *cached;
         }
 
         let canonical = canonicalize_neighborhood(neighborhood);
         self.chunk_canonicalization_cache
-            .insert(neighborhood.clone(), canonical.clone());
+            .insert(*neighborhood, canonical);
         canonical
     }
 

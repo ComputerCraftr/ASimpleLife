@@ -1,12 +1,12 @@
 use std::fmt;
 
-use crate::bitgrid::BitGrid;
+use crate::bitgrid::{BitGrid, Cell, Coord};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NormalizedGridSignature {
-    pub width: i32,
-    pub height: i32,
-    pub cells: Vec<(i32, i32)>,
+    pub width: Coord,
+    pub height: Coord,
+    pub cells: Vec<Cell>,
 }
 
 impl fmt::Display for NormalizedGridSignature {
@@ -15,7 +15,7 @@ impl fmt::Display for NormalizedGridSignature {
     }
 }
 
-pub fn normalize(grid: &BitGrid) -> (NormalizedGridSignature, (i32, i32)) {
+pub fn normalize(grid: &BitGrid) -> (NormalizedGridSignature, Cell) {
     let Some((min_x, min_y, max_x, max_y)) = grid.bounds() else {
         return (
             NormalizedGridSignature {

@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 
-pub const CHUNK_SIZE: i32 = 8;
+pub type Coord = i64;
+pub type Cell = (Coord, Coord);
+pub type Bounds = (Coord, Coord, Coord, Coord);
+
+pub const CHUNK_SIZE: Coord = 8;
 const DEFAULT_CHUNK_CAPACITY: usize = 64;
 
 #[repr(align(64))]
@@ -11,11 +15,18 @@ struct Chunk {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BitGrid {
-    chunks: HashMap<(i32, i32), Chunk>,
+    chunks: HashMap<Cell, Chunk>,
     population: usize,
 }
 
 impl BitGrid {
+    pub fn empty() -> Self {
+        Self {
+            chunks: HashMap::new(),
+            population: 0,
+        }
+    }
+
     pub fn new() -> Self {
         Self::with_chunk_capacity(DEFAULT_CHUNK_CAPACITY)
     }
@@ -27,7 +38,7 @@ impl BitGrid {
         }
     }
 
-    pub fn from_cells(cells: &[(i32, i32)]) -> Self {
+    pub fn from_cells(cells: &[Cell]) -> Self {
         let estimated_chunks = cells.len().div_ceil(64).max(DEFAULT_CHUNK_CAPACITY);
         let mut grid = Self::with_chunk_capacity(estimated_chunks);
         for &(x, y) in cells {
@@ -44,7 +55,7 @@ impl BitGrid {
         self.population == 0
     }
 
-    pub fn get(&self, x: i32, y: i32) -> bool {
+    pub fn get(&self, x: Coord, y: Coord) -> bool {
         let (chunk, bit) = chunk_and_bit(x, y);
         self.chunks
             .get(&chunk)
@@ -52,7 +63,7 @@ impl BitGrid {
             .unwrap_or(false)
     }
 
-    pub fn set(&mut self, x: i32, y: i32, alive: bool) {
+    pub fn set(&mut self, x: Coord, y: Coord, alive: bool) {
         let (chunk, bit) = chunk_and_bit(x, y);
         let mask = 1_u64 << bit;
         let current = self
@@ -78,22 +89,22 @@ impl BitGrid {
         }
     }
 
-    pub fn live_cells(&self) -> Vec<(i32, i32)> {
+    pub fn live_cells(&self) -> Vec<Cell> {
         let mut cells = Vec::with_capacity(self.population);
         for (&(cx, cy), chunk) in &self.chunks {
             for bit in 0..64_u32 {
                 if (chunk.bits & (1_u64 << bit)) == 0 {
                     continue;
                 }
-                let local_x = (bit % 8) as i32;
-                let local_y = (bit / 8) as i32;
+                let local_x = (bit % 8) as Coord;
+                let local_y = (bit / 8) as Coord;
                 cells.push((cx * CHUNK_SIZE + local_x, cy * CHUNK_SIZE + local_y));
             }
         }
         cells
     }
 
-    pub fn bounds(&self) -> Option<(i32, i32, i32, i32)> {
+    pub fn bounds(&self) -> Option<Bounds> {
         let mut iter = self.live_cells().into_iter();
         let (mut min_x, mut min_y) = iter.next()?;
         let mut max_x = min_x;
@@ -109,18 +120,18 @@ impl BitGrid {
         Some((min_x, min_y, max_x, max_y))
     }
 
-    pub(crate) fn chunk_bits(&self, cx: i32, cy: i32) -> u64 {
+    pub(crate) fn chunk_bits(&self, cx: Coord, cy: Coord) -> u64 {
         self.chunks
             .get(&(cx, cy))
             .map(|chunk| chunk.bits)
             .unwrap_or(0)
     }
 
-    pub(crate) fn chunk_coords(&self) -> Vec<(i32, i32)> {
+    pub(crate) fn chunk_coords(&self) -> Vec<Cell> {
         self.chunks.keys().copied().collect()
     }
 
-    pub(crate) fn set_chunk_bits(&mut self, cx: i32, cy: i32, bits: u64) {
+    pub(crate) fn set_chunk_bits(&mut self, cx: Coord, cy: Coord, bits: u64) {
         let previous = self.chunk_bits(cx, cy);
         if previous == bits {
             return;
@@ -143,10 +154,13 @@ impl Default for BitGrid {
     }
 }
 
-fn chunk_and_bit(x: i32, y: i32) -> ((i32, i32), u32) {
+fn chunk_and_bit(x: Coord, y: Coord) -> (Cell, u32) {
     let cx = x.div_euclid(CHUNK_SIZE);
     let cy = y.div_euclid(CHUNK_SIZE);
     let lx = x.rem_euclid(CHUNK_SIZE);
     let ly = y.rem_euclid(CHUNK_SIZE);
-    ((cx, cy), (ly * CHUNK_SIZE + lx) as u32)
+    (
+        (cx, cy),
+        u32::try_from(ly * CHUNK_SIZE + lx).expect("chunk bit index exceeded u32"),
+    )
 }
