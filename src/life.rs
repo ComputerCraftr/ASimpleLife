@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use bytemuck::{must_cast, must_cast_mut, must_cast_ref};
 use wide::{i8x16, u8x16, u16x8, u16x16, u16x32, u64x8};
 
-use crate::bitgrid::{BitGrid, Cell, Coord, CHUNK_SIZE};
+use crate::bitgrid::{BitGrid, CHUNK_SIZE, Cell, Coord};
 use crate::memo::{ChunkNeighborhood, Memo};
 
 const ROW_LOW_BYTE_MASK: u16x8 = u16x8::splat(0x00FF);
@@ -71,7 +71,9 @@ impl GameOfLife {
     }
 
     pub fn step_with_changes(&mut self) -> Vec<Cell> {
-        let (next, chunk_changes) = step_grid_with_chunk_changes_and_memo(&self.grid, &mut self.memo);
+        let (next, chunk_changes) =
+            step_grid_with_chunk_changes_and_memo(&self.grid, &mut self.memo);
+        self.memo.maybe_collect_transition_caches();
         self.grid = next;
         self.generation += 1;
         expand_chunk_diffs_to_cells(&chunk_changes)
@@ -79,6 +81,7 @@ impl GameOfLife {
 
     pub fn step_with_chunk_changes(&mut self) -> Vec<ChunkDiff> {
         let (next, changed) = step_grid_with_chunk_changes_and_memo(&self.grid, &mut self.memo);
+        self.memo.maybe_collect_transition_caches();
         self.grid = next;
         self.generation += 1;
         changed
@@ -92,10 +95,7 @@ pub fn step_grid(grid: &BitGrid) -> BitGrid {
 }
 
 // Stepping pipeline
-pub fn step_grid_with_changes_and_memo(
-    grid: &BitGrid,
-    memo: &mut Memo,
-) -> (BitGrid, Vec<Cell>) {
+pub fn step_grid_with_changes_and_memo(grid: &BitGrid, memo: &mut Memo) -> (BitGrid, Vec<Cell>) {
     let (next, chunk_changes) = step_grid_with_chunk_changes_and_memo(grid, memo);
     (next, expand_chunk_diffs_to_cells(&chunk_changes))
 }
@@ -366,7 +366,16 @@ fn pack_row_block(block: u16x32, base_shift: u64) -> u64x8 {
 
 fn pack_row_lanes(lanes: u16x8, shift: u64) -> u64x8 {
     let narrowed: [u16; 8] = must_cast(lanes);
-    let as_u64: u64x8 = must_cast(narrowed.map(u64::from));
+    let as_u64: u64x8 = must_cast([
+        narrowed[0] as u64,
+        narrowed[1] as u64,
+        narrowed[2] as u64,
+        narrowed[3] as u64,
+        narrowed[4] as u64,
+        narrowed[5] as u64,
+        narrowed[6] as u64,
+        narrowed[7] as u64,
+    ]);
     as_u64 << shift
 }
 
@@ -399,7 +408,7 @@ fn align_horizontal_rows(
     edge_col: usize,
     shift_cols: i32,
 ) -> ChunkRowBatch {
-    let edge_mask = edge_column_mask_batch(edge, edge_col, if shift_cols > 0 { 0 } else { 7 });
+    let edge_mask = edge_column_mask_batch(edge, edge_col, edge_target_col(shift_cols));
     if shift_cols > 0 {
         [
             (center[0] << (shift_cols as u16)) | edge_mask[0],
@@ -437,11 +446,8 @@ fn align_horizontal_neighbor(
     } else {
         center_row_lanes >> ((-shift_cols) as u16)
     };
-    let edge_mask = edge_column_mask_rows(
-        must_cast(edge_rows),
-        edge_col,
-        if shift_cols > 0 { 0 } else { 7 },
-    );
+    let edge_mask =
+        edge_column_mask_rows(must_cast(edge_rows), edge_col, edge_target_col(shift_cols));
     pack_rows(shifted | edge_mask)
 }
 
@@ -463,7 +469,7 @@ fn align_diagonal_neighbor(
     } else {
         source_row_lanes >> ((-spec.shift_cols) as u16)
     };
-    let edge_target = if spec.shift_cols > 0 { 0 } else { 7 };
+    let edge_target = edge_target_col(spec.shift_cols);
     let edge_row_lanes = ((edge_source_rows >> (spec.edge_col as u16)) & u16x8::ONE) << edge_target;
     pack_rows(shifted_source_rows | edge_row_lanes)
 }
@@ -478,7 +484,7 @@ fn align_diagonal_rows(
 ) -> ChunkRowBatch {
     let source_rows = align_vertical_rows(center, vertical, spec.edge_row, spec.shift_rows);
     let edge_source_rows = align_vertical_rows(horizontal, corner, spec.edge_row, spec.shift_rows);
-    let edge_target = if spec.shift_cols > 0 { 0 } else { 7 };
+    let edge_target = edge_target_col(spec.shift_cols);
     let edge_rows = edge_column_mask_batch(&edge_source_rows, spec.edge_col, edge_target);
 
     if spec.shift_cols > 0 {
@@ -531,8 +537,21 @@ fn chunk_rows_batch_4(chunks: [u64; 4]) -> [[u16; 8]; 4] {
 
 fn pack_rows(rows: u16x8) -> u64 {
     let narrowed: [u16; 8] = must_cast(rows & ROW_LOW_BYTE_MASK);
-    let packed_bytes = narrowed.map(|row| row as u8);
+    let packed_bytes = [
+        narrowed[0] as u8,
+        narrowed[1] as u8,
+        narrowed[2] as u8,
+        narrowed[3] as u8,
+        narrowed[4] as u8,
+        narrowed[5] as u8,
+        narrowed[6] as u8,
+        narrowed[7] as u8,
+    ];
     must_cast(packed_bytes)
+}
+
+fn edge_target_col(shift_cols: i32) -> u16 {
+    if shift_cols > 0 { 0 } else { 7 }
 }
 
 fn edge_column_mask_rows(rows: u16x8, edge_col: usize, target_col: u16) -> u16x8 {

@@ -27,11 +27,11 @@ pub fn normalize(grid: &BitGrid) -> (NormalizedGridSignature, Cell) {
         );
     };
 
-    let mut cells = grid
-        .live_cells()
-        .into_iter()
-        .map(|(x, y)| (x - min_x, y - min_y))
-        .collect::<Vec<_>>();
+    let mut cells = grid.live_cells();
+    for (x, y) in &mut cells {
+        *x -= min_x;
+        *y -= min_y;
+    }
     cells.sort_unstable();
 
     (

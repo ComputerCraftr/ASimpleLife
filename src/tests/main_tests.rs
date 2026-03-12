@@ -1,7 +1,10 @@
 use crate::app::initial_grid;
 use crate::cli::Config;
-use crate::engine::{SimulationBackend, advance_grid, select_backend};
-use crate::life::GameOfLife;
+use crate::engine::{
+    SimulationBackend, SimulationSession, select_backend, should_use_exact_simd_repeat_skip,
+};
+use crate::hashlife::GridExtractionPolicy;
+use crate::life::step_grid;
 use crate::normalize::normalize;
 
 #[test]
@@ -11,7 +14,8 @@ fn initial_grid_uses_named_pattern() {
         height: 24,
         steps: 1,
         max_generations: None,
-        fast_forward: 0,
+        target_generation: None,
+        step_generations: 1,
         delay_ms: 0,
         seed: 123,
         pattern: "glider".to_string(),
@@ -30,7 +34,8 @@ fn initial_grid_random_soup_respects_config_dimensions() {
         height: 30,
         steps: 1,
         max_generations: None,
-        fast_forward: 0,
+        target_generation: None,
+        step_generations: 1,
         delay_ms: 0,
         seed: 7,
         pattern: "random".to_string(),
@@ -38,6 +43,10 @@ fn initial_grid_random_soup_respects_config_dimensions() {
     };
 
     let grid = initial_grid(&config);
+    assert!(
+        grid.population() > 0,
+        "random soup should not be empty for the test seed"
+    );
     let (min_x, min_y, max_x, max_y) = grid.bounds().unwrap();
     assert_eq!((min_x, min_y), (0, 0));
     assert!(max_x < ((config.width as i64) * 2) / 3);
@@ -57,24 +66,144 @@ fn engine_policy_uses_hashlife_for_large_sparse_fast_forward() {
 }
 
 #[test]
-fn engine_advance_matches_stepper_for_hybrid_candidate() {
-    let grid = crate::generators::random_soup(80, 80, 20, 0x0123_4567_89AB_CDEF);
-    let advanced = advance_grid(&grid, 128);
+fn engine_advance_handles_trillion_fast_forward_for_stable_pattern() {
+    let grid = crate::generators::pattern_by_name("block").unwrap();
+    let mut session = SimulationSession::new();
+    let stats = {
+        session.load_hashlife_state(&grid);
+        session.advance_hashlife_root(1_000_000_000_000)
+    };
+    let advanced = session
+        .sample_hashlife_state_grid(GridExtractionPolicy::FullGridIfUnder {
+            max_population: u64::MAX,
+            max_chunks: usize::MAX,
+            max_bounds_span: i64::MAX,
+        })
+        .expect("hashlife state should be sampleable after deep run");
 
-    let mut game = GameOfLife::new(grid);
-    for _ in 0..128 {
-        game.step_with_changes();
-    }
-
-    assert_eq!(normalize(&advanced.grid).0, normalize(game.grid()).0);
-    assert_eq!(advanced.stats.backend, SimulationBackend::HybridSegmented);
+    assert_eq!(normalize(&advanced).0, normalize(&grid).0);
+    assert_eq!(
+        stats.simd_generations + stats.hashlife_generations,
+        1_000_000_000_000
+    );
 }
 
 #[test]
-fn engine_advance_handles_trillion_fast_forward_for_stable_pattern() {
-    let grid = crate::generators::pattern_by_name("block").unwrap();
-    let advanced = advance_grid(&grid, 1_000_000_000_000);
+fn deep_run_uses_hashlife_for_large_fast_forward() {
+    let grid = crate::generators::pattern_by_name("gosper_glider_gun").unwrap();
+    let mut session = SimulationSession::new();
+    session.load_hashlife_state(&grid);
+    let stats = session.advance_hashlife_root(100_000);
 
-    assert_eq!(normalize(&advanced.grid).0, normalize(&grid).0);
-    assert_eq!(advanced.stats.simd_generations + advanced.stats.hashlife_generations, 1_000_000_000_000);
+    assert_eq!(stats.backend, SimulationBackend::HashLife);
+    assert_eq!(stats.simd_generations, 0);
+    assert_eq!(stats.hashlife_generations, 100_000);
+}
+
+#[test]
+fn reloaded_hashlife_step_generations_matches_one_shot_target() {
+    let grid = crate::generators::pattern_by_name("glider").unwrap();
+    let mut repeated = grid;
+    let mut session = SimulationSession::new();
+    for _ in 0..5 {
+        session.load_hashlife_state(&repeated);
+        session.advance_hashlife_root(5);
+        repeated = session
+            .sample_hashlife_state_grid(GridExtractionPolicy::FullGridIfUnder {
+                max_population: u64::MAX,
+                max_chunks: usize::MAX,
+                max_bounds_span: i64::MAX,
+            })
+            .expect("hashlife state should be sampleable after repeated stepped reload");
+    }
+
+    let mut one_shot = SimulationSession::new();
+    one_shot.load_hashlife_state(&crate::generators::pattern_by_name("glider").unwrap());
+    one_shot.advance_hashlife_root(25);
+    let one_shot_grid = one_shot
+        .sample_hashlife_state_grid(GridExtractionPolicy::FullGridIfUnder {
+            max_population: u64::MAX,
+            max_chunks: usize::MAX,
+            max_bounds_span: i64::MAX,
+        })
+        .expect("hashlife state should be sampleable after one-shot stepping");
+
+    assert_eq!(normalize(&repeated).0, normalize(&one_shot_grid).0);
+}
+
+#[test]
+fn session_planner_prefers_hashlife_when_checkpointable_state_is_loaded() {
+    let grid = crate::generators::pattern_by_name("gosper_glider_gun").unwrap();
+    let mut session = SimulationSession::new();
+    session.load_hashlife_state(&grid);
+    session.advance_hashlife_root(1_024);
+    let shape = session
+        .hashlife_bounds()
+        .map(|(min_x, min_y, max_x, max_y)| {
+            let span = (max_x - min_x + 1).max(max_y - min_y + 1);
+            (
+                usize::try_from(session.hashlife_population().unwrap()).unwrap(),
+                span,
+            )
+        })
+        .unwrap();
+
+    assert_eq!(
+        session.planned_backend_from_session_metrics(shape.0, shape.1, 32),
+        SimulationBackend::HashLife
+    );
+}
+
+#[test]
+fn short_multi_step_mode_prefers_exact_simd_repeat_skip() {
+    let grid = crate::generators::pattern_by_name("glider").unwrap();
+    assert!(should_use_exact_simd_repeat_skip(&grid, 5));
+}
+
+#[test]
+fn exact_simd_repeat_skip_matches_manual_glider_translation() {
+    let grid = crate::generators::pattern_by_name("glider").unwrap();
+    let mut session = SimulationSession::new();
+    let (advanced, _) = session.advance_simd_chunk_exact(&grid, 257);
+
+    let mut expected = grid.clone();
+    for _ in 0..257 {
+        expected = step_grid(&expected);
+    }
+
+    assert_eq!(normalize(&advanced).0, normalize(&expected).0);
+}
+
+#[test]
+fn exact_simd_repeat_skip_matches_million_generation_blinker() {
+    let grid = crate::generators::pattern_by_name("blinker").unwrap();
+    let target = 1_000_003_u64;
+
+    let mut session = SimulationSession::new();
+    let (advanced, stats) = session.advance_simd_chunk_exact(&grid, target);
+    let remainder = target % 2;
+    let mut expected = grid.clone();
+    for _ in 0..remainder {
+        expected = step_grid(&expected);
+    }
+
+    assert_eq!(stats.backend, SimulationBackend::SimdChunk);
+    assert_eq!(stats.simd_generations, target);
+    assert!(stats.repeat_skip_events > 0);
+    assert!(stats.repeat_skip_generations > 0);
+    assert_eq!(normalize(&advanced).0, normalize(&expected).0);
+}
+
+#[test]
+fn exact_simd_repeat_skip_matches_million_generation_glider() {
+    let grid = crate::generators::pattern_by_name("glider").unwrap();
+    let target = 1_000_003_u64;
+
+    let mut session = SimulationSession::new();
+    let (advanced, stats) = session.advance_simd_chunk_exact(&grid, target);
+    let expected = crate::hashlife::HashLifeEngine::default().advance(&grid, target);
+
+    assert_eq!(stats.backend, SimulationBackend::SimdChunk);
+    assert_eq!(stats.simd_generations, target);
+    assert_eq!(normalize(&advanced).0, normalize(&expected).0);
 }

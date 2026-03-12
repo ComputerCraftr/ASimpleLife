@@ -22,8 +22,12 @@ fn main() -> ExitCode {
         families: (!parsed.families.is_empty()).then_some(parsed.families),
         prediction_max_generations: parsed.predictor_max_generations,
         oracle_max_generations: parsed.oracle_max_generations,
+        randomized: parsed.randomized,
+        seed: parsed.seed,
+        cases_per_family: parsed.cases_per_family,
         exhaustive_5x5: parsed.exhaustive_5x5,
         oracle_runtime_case: parsed.oracle_runtime_case,
+        oracle_representative_case: parsed.oracle_representative_case,
         oracle_runtime_target_generation: parsed.oracle_runtime_target_generation,
         progress: parsed.progress,
     };

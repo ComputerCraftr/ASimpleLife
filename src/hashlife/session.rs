@@ -1,6 +1,8 @@
-use super::{HashLifeEngine, NodeId};
 #[cfg(test)]
 use super::HashLifeRuntimeStats;
+use super::{
+    GridExtractionError, GridExtractionPolicy, HashLifeCheckpoint, HashLifeEngine, NodeId,
+};
 use crate::bitgrid::{BitGrid, Coord};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -18,8 +20,10 @@ pub struct HashLifeSession {
     current_origin_y: Coord,
     current_generation: u64,
     root_is_centered: bool,
-    sampled_grid: Option<BitGrid>,
     sampled_bounds: Option<Option<(Coord, Coord, Coord, Coord)>>,
+    sampled_checkpoint: Option<Option<HashLifeCheckpoint>>,
+    #[cfg(test)]
+    sample_materializations: usize,
 }
 
 impl HashLifeSession {
@@ -56,8 +60,8 @@ impl HashLifeSession {
         self.current_origin_y = origin_y;
         self.current_generation = 0;
         self.root_is_centered = false;
-        self.sampled_grid = Some(grid.clone());
         self.sampled_bounds = Some(grid.bounds());
+        self.sampled_checkpoint = None;
     }
 
     pub fn generation(&self) -> u64 {
@@ -102,8 +106,7 @@ impl HashLifeSession {
             .current_origin_y
             .checked_add(dy)
             .expect("hashlife origin y overflow");
-        self.sampled_grid = None;
-        self.sampled_bounds = None;
+        self.clear_cached_samples();
     }
 
     pub fn advance_root(&mut self, generations: u64) -> SessionAdvanceStats {
@@ -115,7 +118,9 @@ impl HashLifeSession {
         while remaining != 0 {
             let desired_step_exp = 63 - remaining.leading_zeros();
             self.ensure_centered_capacity(desired_step_exp);
-            let root = self.current_root.expect("hashlife session root disappeared");
+            let root = self
+                .current_root
+                .expect("hashlife session root disappeared");
             let level = self.engine.nodes[root as usize].level;
             let step_exp = desired_step_exp.min(level.saturating_sub(2));
             let step = 1_u64 << step_exp;
@@ -132,8 +137,8 @@ impl HashLifeSession {
             self.current_root = Some(advanced);
             self.current_generation = self.current_generation.saturating_add(step);
             self.root_is_centered = false;
-            self.sampled_grid = None;
-            self.sampled_bounds = None;
+            self.clear_cached_samples();
+            self.current_root = self.engine.maybe_collect_active_run(self.current_root);
             remaining -= step;
         }
         SessionAdvanceStats { generations }
@@ -153,8 +158,7 @@ impl HashLifeSession {
             root = self.center_expand_root(root);
             self.current_root = Some(root);
             self.root_is_centered = true;
-            self.sampled_grid = None;
-            self.sampled_bounds = None;
+            self.clear_cached_samples();
         }
     }
 
@@ -195,23 +199,57 @@ impl HashLifeSession {
             .join(upper_left, upper_right, lower_left, lower_right)
     }
 
-    pub fn sample_grid(&mut self) -> Option<&BitGrid> {
-        if self.sampled_grid.is_none() {
+    pub fn signature_checkpoint(&mut self) -> Option<&HashLifeCheckpoint> {
+        if self.sampled_checkpoint.is_none() {
             let root = self.current_root?;
-            self.sampled_grid = Some(
-                self.engine
-                    .node_to_grid(root, self.current_origin_x, self.current_origin_y),
+            let checkpoint = self.engine.node_checkpoint(
+                root,
+                self.current_origin_x,
+                self.current_origin_y,
+                self.current_generation,
             );
+            if let Some(checkpoint) = checkpoint.as_ref() {
+                self.sampled_bounds = Some(Some(checkpoint.bounds));
+            } else {
+                self.sampled_bounds = Some(None);
+            }
+            self.sampled_checkpoint = Some(checkpoint);
         }
-        self.sampled_grid.as_ref()
+        self.sampled_checkpoint.as_ref().and_then(Option::as_ref)
     }
 
-    pub fn advance(&mut self, grid: &BitGrid, generations: u64) -> BitGrid {
-        self.load_grid(grid);
-        self.advance_root(generations);
-        self.sample_grid()
-            .expect("hashlife session should have a sampled grid after advance")
-            .clone()
+    pub fn sample_grid(&mut self) -> Option<BitGrid> {
+        self.extract_grid(unrestricted_debug_full_grid_policy())
+            .ok()
+    }
+
+    pub fn extract_grid(
+        &mut self,
+        policy: GridExtractionPolicy,
+    ) -> Result<BitGrid, GridExtractionError> {
+        let root = self.current_root.ok_or(GridExtractionError::NotLoaded)?;
+        #[cfg(test)]
+        {
+            self.sample_materializations += 1;
+        }
+        self.engine
+            .node_to_grid(root, self.current_origin_x, self.current_origin_y, policy)
+    }
+
+    pub fn sample_region(
+        &mut self,
+        min_x: Coord,
+        min_y: Coord,
+        max_x: Coord,
+        max_y: Coord,
+    ) -> Option<BitGrid> {
+        let root = self.current_root?;
+        Some(self.engine.node_to_grid_clipped(
+            root,
+            self.current_origin_x,
+            self.current_origin_y,
+            (min_x, min_y, max_x, max_y),
+        ))
     }
 
     pub fn finish(&mut self) {
@@ -219,14 +257,32 @@ impl HashLifeSession {
         self.current_root = None;
         self.current_generation = 0;
         self.root_is_centered = false;
-        self.sampled_grid = None;
         self.sampled_bounds = None;
+        self.sampled_checkpoint = None;
     }
 
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn runtime_stats(&self) -> HashLifeRuntimeStats {
         self.engine.runtime_stats()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sample_materializations(&self) -> usize {
+        self.sample_materializations
+    }
+
+    fn clear_cached_samples(&mut self) {
+        self.sampled_bounds = None;
+        self.sampled_checkpoint = None;
+    }
+}
+
+fn unrestricted_debug_full_grid_policy() -> GridExtractionPolicy {
+    GridExtractionPolicy::FullGridIfUnder {
+        max_population: u64::MAX,
+        max_chunks: usize::MAX,
+        max_bounds_span: Coord::MAX,
     }
 }
 

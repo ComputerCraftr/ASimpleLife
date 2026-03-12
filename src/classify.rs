@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
-use crate::bitgrid::{BitGrid, Cell, Coord};
 use crate::benchmark::effective_generation_limit;
+use crate::bitgrid::{BitGrid, Cell, Coord};
 use crate::life::step_grid_with_changes_and_memo;
 use crate::memo::Memo;
 use crate::normalize::{NormalizedGridSignature, normalize};
@@ -185,14 +185,7 @@ fn run_classification_from_state(
         if let Some(bounds) = grid.bounds() {
             let (min_x, min_y, max_x, max_y) = bounds;
             let (width, height, span) = bounds_dimensions(bounds);
-            metrics_history.push((
-                grid.population(),
-                min_x,
-                max_x,
-                min_y,
-                max_y,
-                span,
-            ));
+            metrics_history.push((grid.population(), min_x, max_x, min_y, max_y, span));
             if width > limits.max_bounding_box || height > limits.max_bounding_box {
                 return (
                     Classification::LikelyInfinite {
@@ -259,10 +252,13 @@ fn settling_extension_limit(
     const MAX_SETTLING_SPAN: Coord = 64;
     const MAX_WIDE_SETTLING_POPULATION: usize = 16;
     const MAX_WIDE_SETTLING_SPAN: Coord = 256;
+    const MAX_ULTRA_WIDE_SETTLING_POPULATION: usize = 16;
+    const MAX_ULTRA_WIDE_SETTLING_SPAN: Coord = 1_024;
     const MIN_EXTENSION_LIMIT: u64 = 512;
     const MAX_EXTENSION_LIMIT: u64 = 1024;
+    const MAX_ULTRA_WIDE_EXTENSION_LIMIT: u64 = 20_000;
 
-    if limits.max_generations < 256 || generation_limit >= MAX_EXTENSION_LIMIT {
+    if limits.max_generations < 256 {
         return None;
     }
 
@@ -271,8 +267,23 @@ fn settling_extension_limit(
         current_population <= MAX_SETTLING_POPULATION && max_span <= MAX_SETTLING_SPAN;
     let bounded_wide_tiny_pattern =
         current_population <= MAX_WIDE_SETTLING_POPULATION && max_span <= MAX_WIDE_SETTLING_SPAN;
+    let bounded_ultra_wide_tiny_pattern = current_population <= MAX_ULTRA_WIDE_SETTLING_POPULATION
+        && max_span <= MAX_ULTRA_WIDE_SETTLING_SPAN;
 
-    if !bounded_small_pattern && !bounded_wide_tiny_pattern {
+    if !bounded_small_pattern && !bounded_wide_tiny_pattern && !bounded_ultra_wide_tiny_pattern {
+        return None;
+    }
+
+    if bounded_ultra_wide_tiny_pattern && generation_limit < MAX_ULTRA_WIDE_EXTENSION_LIMIT {
+        return Some(
+            limits
+                .max_generations
+                .saturating_mul(32)
+                .clamp(MIN_EXTENSION_LIMIT, MAX_ULTRA_WIDE_EXTENSION_LIMIT),
+        );
+    }
+
+    if generation_limit >= MAX_EXTENSION_LIMIT {
         return None;
     }
 
@@ -290,11 +301,13 @@ fn detect_persistent_expansion(
     grid: &BitGrid,
     limits: &ClassificationLimits,
 ) -> Option<Classification> {
-    const BURN_IN: u64 = 288;
+    const BURN_IN: u64 = 2_048;
+    const EMITTER_BURN_IN: u64 = 256;
     const WINDOW: usize = 32;
     const MIN_POPULATION_GROWTH_PER_WINDOW: usize = 1;
     const MIN_PERSISTENT_EXPANSION_SPAN: Coord = 64;
     const MIN_HEURISTIC_HORIZON: u64 = 512;
+    const MIN_EMITTER_EXPANSION_SPAN: Coord = 128;
 
     if limits.max_generations < MIN_HEURISTIC_HORIZON {
         return None;
@@ -371,10 +384,32 @@ fn detect_persistent_expansion(
         neg_y: y_negative_front,
     };
 
-    if monotone_population
+    let frontier_gliders = count_detached_frontier_gliders(grid, &fronts);
+    let trailing_blinkers = count_trailing_blinker_ash(grid, &fronts);
+    let detached_gliders = count_detached_gliders_anywhere(grid);
+    let detached_blinkers = count_detached_blinkers_anywhere(grid);
+    let confirmed_detached_emitter_signal = current_span >= MIN_EMITTER_EXPANSION_SPAN
+        && (frontier_gliders >= 3
+            || trailing_blinkers >= 3
+            || detached_gliders >= 3
+            || detached_blinkers >= 3);
+
+    if generation >= EMITTER_BURN_IN
+        && monotone_population
         && fronts.any()
-        && (has_detached_frontier_glider(grid, &fronts) || has_trailing_blinker_ash(grid, &fronts))
+        && confirmed_detached_emitter_signal
     {
+        return Some(Classification::LikelyInfinite {
+            reason: "persistent_expansion",
+            detected_at: generation,
+        });
+    }
+
+    let emitter_scale_population = current_population >= 512;
+    let confirmed_emitter_signal =
+        emitter_scale_population && (frontier_gliders >= 2 || trailing_blinkers >= 2);
+
+    if monotone_population && fronts.any() && confirmed_emitter_signal {
         return Some(Classification::LikelyInfinite {
             reason: "persistent_expansion",
             detected_at: generation,
@@ -418,19 +453,17 @@ fn edge_advances(
         && recent_orthogonal <= MAX_ORTHOGONAL_SPAN_GROWTH_PER_WINDOW
 }
 
-fn has_detached_frontier_glider(grid: &BitGrid, fronts: &FrontierDirections) -> bool {
+fn count_detached_frontier_gliders(grid: &BitGrid, fronts: &FrontierDirections) -> usize {
     const GLIDER_CELLS: usize = 5;
     const MAX_COMPONENT_SPAN: Coord = 4;
     const FRONT_MARGIN: Coord = 3;
     const MIN_GAP_FROM_MAIN: Coord = 8;
-    const MIN_FRONTIER_GLIDERS: usize = 1;
-
     let Some((global_min_x, global_min_y, global_max_x, global_max_y)) = grid.bounds() else {
-        return false;
+        return 0;
     };
     let components = connected_components(grid);
     if components.len() < 2 {
-        return false;
+        return 0;
     }
 
     let main = components
@@ -440,7 +473,7 @@ fn has_detached_frontier_glider(grid: &BitGrid, fronts: &FrontierDirections) -> 
         .unwrap_or_default();
     let (main_min_x, main_min_y, main_max_x, main_max_y) = component_bounds(&main);
 
-    let frontier_gliders = components
+    components
         .into_iter()
         .filter(|component| {
             if component == &main || component.len() != GLIDER_CELLS {
@@ -469,24 +502,20 @@ fn has_detached_frontier_glider(grid: &BitGrid, fronts: &FrontierDirections) -> 
 
             near_front && separated
         })
-        .count();
-
-    frontier_gliders >= MIN_FRONTIER_GLIDERS
+        .count()
 }
 
-fn has_trailing_blinker_ash(grid: &BitGrid, fronts: &FrontierDirections) -> bool {
+fn count_trailing_blinker_ash(grid: &BitGrid, fronts: &FrontierDirections) -> usize {
     const BLINKER_CELLS: usize = 3;
     const MAX_COMPONENT_SPAN: Coord = 3;
     const TRAIL_MARGIN: Coord = 6;
     const MIN_GAP_FROM_MAIN: Coord = 8;
-    const MIN_TRAILING_BLINKERS: usize = 2;
-
     let Some((global_min_x, global_min_y, global_max_x, global_max_y)) = grid.bounds() else {
-        return false;
+        return 0;
     };
     let components = connected_components(grid);
     if components.len() < 3 {
-        return false;
+        return 0;
     }
 
     let main = components
@@ -496,7 +525,7 @@ fn has_trailing_blinker_ash(grid: &BitGrid, fronts: &FrontierDirections) -> bool
         .unwrap_or_default();
     let (main_min_x, main_min_y, main_max_x, main_max_y) = component_bounds(&main);
 
-    let trailing_blinkers = components
+    components
         .into_iter()
         .filter(|component| {
             if component == &main || component.len() != BLINKER_CELLS {
@@ -524,9 +553,83 @@ fn has_trailing_blinker_ash(grid: &BitGrid, fronts: &FrontierDirections) -> bool
 
             near_trail && separated
         })
-        .count();
+        .count()
+}
 
-    trailing_blinkers >= MIN_TRAILING_BLINKERS
+fn count_detached_gliders_anywhere(grid: &BitGrid) -> usize {
+    const GLIDER_CELLS: usize = 5;
+    const MAX_COMPONENT_SPAN: Coord = 4;
+    const MIN_GAP_FROM_MAIN: Coord = 8;
+    let components = connected_components(grid);
+    if components.len() < 2 {
+        return 0;
+    }
+
+    let main = components
+        .iter()
+        .max_by_key(|component| component.len())
+        .cloned()
+        .unwrap_or_default();
+    let (main_min_x, main_min_y, main_max_x, main_max_y) = component_bounds(&main);
+
+    components
+        .into_iter()
+        .filter(|component| {
+            if component == &main || component.len() != GLIDER_CELLS {
+                return false;
+            }
+            let (min_x, min_y, max_x, max_y) = component_bounds(component);
+            let width = max_x - min_x + 1;
+            let height = max_y - min_y + 1;
+            if width > MAX_COMPONENT_SPAN || height > MAX_COMPONENT_SPAN {
+                return false;
+            }
+            let separated = max_x < main_min_x - MIN_GAP_FROM_MAIN
+                || min_x > main_max_x + MIN_GAP_FROM_MAIN
+                || max_y < main_min_y - MIN_GAP_FROM_MAIN
+                || min_y > main_max_y + MIN_GAP_FROM_MAIN;
+
+            separated && matches_glider(component)
+        })
+        .count()
+}
+
+fn count_detached_blinkers_anywhere(grid: &BitGrid) -> usize {
+    const BLINKER_CELLS: usize = 3;
+    const MAX_COMPONENT_SPAN: Coord = 3;
+    const MIN_GAP_FROM_MAIN: Coord = 8;
+    let components = connected_components(grid);
+    if components.len() < 2 {
+        return 0;
+    }
+
+    let main = components
+        .iter()
+        .max_by_key(|component| component.len())
+        .cloned()
+        .unwrap_or_default();
+    let (main_min_x, main_min_y, main_max_x, main_max_y) = component_bounds(&main);
+
+    components
+        .into_iter()
+        .filter(|component| {
+            if component == &main || component.len() != BLINKER_CELLS {
+                return false;
+            }
+            let (min_x, min_y, max_x, max_y) = component_bounds(component);
+            let width = max_x - min_x + 1;
+            let height = max_y - min_y + 1;
+            if width > MAX_COMPONENT_SPAN || height > MAX_COMPONENT_SPAN {
+                return false;
+            }
+            let separated = max_x < main_min_x - MIN_GAP_FROM_MAIN
+                || min_x > main_max_x + MIN_GAP_FROM_MAIN
+                || max_y < main_min_y - MIN_GAP_FROM_MAIN
+                || min_y > main_max_y + MIN_GAP_FROM_MAIN;
+
+            separated && matches_blinker(component)
+        })
+        .count()
 }
 
 fn matches_glider(component: &[Cell]) -> bool {

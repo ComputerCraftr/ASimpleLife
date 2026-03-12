@@ -1,7 +1,12 @@
 use crate::bitgrid::{BitGrid, Coord};
-use crate::hashlife::HashLifeSession;
-use crate::life::step_grid_with_chunk_changes_and_memo;
+use crate::hashlife::{
+    GridExtractionError, GridExtractionPolicy, HashLifeCheckpoint, HashLifeSession,
+};
+use crate::life::step_grid_with_changes_and_memo;
 use crate::memo::Memo;
+use crate::normalize::{NormalizedGridSignature, normalize};
+use std::collections::HashMap;
+use std::fmt;
 
 const SIMD_GENERATION_LIMIT: u64 = 64;
 const SIMD_POPULATION_LIMIT: usize = 512;
@@ -9,6 +14,9 @@ const SIMD_SPAN_LIMIT: Coord = 64;
 const HASHLIFE_GENERATION_LIMIT: u64 = 512;
 const HASHLIFE_DENSITY_LIMIT: f64 = 0.18;
 const HYBRID_PREFIX_LIMIT: u64 = 64;
+const EXACT_REPEAT_SKIP_GENERATION_LIMIT: u64 = 4_096;
+
+type SeenStates = HashMap<NormalizedGridSignature, (u64, (Coord, Coord))>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SimulationBackend {
@@ -17,22 +25,28 @@ pub enum SimulationBackend {
     HybridSegmented,
 }
 
+impl fmt::Display for SimulationBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::SimdChunk => "simd_chunk",
+            Self::HashLife => "hashlife",
+            Self::HybridSegmented => "hybrid_segmented",
+        };
+        f.write_str(name)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdvanceStats {
     pub backend: SimulationBackend,
     pub simd_generations: u64,
     pub hashlife_generations: u64,
-}
-
-#[derive(Clone, Debug)]
-pub struct AdvanceResult {
-    pub grid: BitGrid,
-    pub stats: AdvanceStats,
+    pub repeat_skip_events: u64,
+    pub repeat_skip_generations: u64,
 }
 
 #[derive(Debug, Default)]
 pub struct SimulationSession {
-    simd_memo: Memo,
     hashlife_session: HashLifeSession,
     preferred_backend: Option<SimulationBackend>,
 }
@@ -69,68 +83,9 @@ pub fn select_backend(grid: &BitGrid, generations: u64) -> SimulationBackend {
     SimulationBackend::HybridSegmented
 }
 
-pub fn advance_grid(grid: &BitGrid, generations: u64) -> AdvanceResult {
-    let mut session = SimulationSession::default();
-    let result = session.advance(grid, generations);
-    session.finish();
-    result
-}
-
 impl SimulationSession {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn advance(&mut self, grid: &BitGrid, generations: u64) -> AdvanceResult {
-        let backend = self.planned_backend(grid, generations);
-        let result = match backend {
-        SimulationBackend::SimdChunk => AdvanceResult {
-            grid: self.advance_simd_chunk(grid, generations),
-            stats: AdvanceStats {
-                backend,
-                simd_generations: generations,
-                hashlife_generations: 0,
-            },
-        },
-        SimulationBackend::HashLife => AdvanceResult {
-            grid: {
-                self.load_hashlife_state(grid);
-                self.advance_hashlife_root(generations);
-                self.sample_hashlife_state_grid()
-                    .expect("hashlife state should be sampleable after advance")
-                    .clone()
-            },
-            stats: AdvanceStats {
-                backend,
-                simd_generations: 0,
-                hashlife_generations: generations,
-            },
-        },
-        SimulationBackend::HybridSegmented => {
-            let simd_generations = hybrid_prefix_generations(grid, generations);
-            let simd_grid = self.advance_simd_chunk(grid, simd_generations);
-            let remaining = generations.saturating_sub(simd_generations);
-            let final_grid = if remaining == 0 {
-                simd_grid
-            } else {
-                self.load_hashlife_state(&simd_grid);
-                self.advance_hashlife_root(remaining);
-                self.sample_hashlife_state_grid()
-                    .expect("hashlife state should be sampleable after hybrid advance")
-                    .clone()
-            };
-            AdvanceResult {
-                grid: final_grid,
-                stats: AdvanceStats {
-                    backend,
-                    simd_generations,
-                    hashlife_generations: remaining,
-                },
-            }
-        }
-        };
-        self.preferred_backend = Some(backend);
-        result
     }
 
     pub fn finish(&mut self) {
@@ -142,9 +97,16 @@ impl SimulationSession {
         self.preferred_backend = Some(SimulationBackend::HashLife);
     }
 
-    pub fn advance_hashlife_root(&mut self, generations: u64) {
+    pub fn advance_hashlife_root(&mut self, generations: u64) -> AdvanceStats {
         self.hashlife_session.advance_root(generations);
         self.preferred_backend = Some(SimulationBackend::HashLife);
+        AdvanceStats {
+            backend: SimulationBackend::HashLife,
+            simd_generations: 0,
+            hashlife_generations: generations,
+            repeat_skip_events: 0,
+            repeat_skip_generations: 0,
+        }
     }
 
     pub fn hashlife_loaded(&self) -> bool {
@@ -163,12 +125,111 @@ impl SimulationSession {
         self.hashlife_session.bounds()
     }
 
+    pub fn hashlife_checkpoint(&mut self) -> Option<&HashLifeCheckpoint> {
+        self.hashlife_session.signature_checkpoint()
+    }
+
     pub fn shift_hashlife_origin(&mut self, dx: Coord, dy: Coord) {
         self.hashlife_session.shift_origin(dx, dy);
     }
 
-    pub fn sample_hashlife_state_grid(&mut self) -> Option<&BitGrid> {
-        self.hashlife_session.sample_grid()
+    pub fn sample_hashlife_state_grid(
+        &mut self,
+        policy: GridExtractionPolicy,
+    ) -> Result<BitGrid, GridExtractionError> {
+        self.hashlife_session.extract_grid(policy)
+    }
+
+    pub fn sample_hashlife_state_region(
+        &mut self,
+        min_x: Coord,
+        min_y: Coord,
+        max_x: Coord,
+        max_y: Coord,
+    ) -> Option<BitGrid> {
+        self.hashlife_session
+            .sample_region(min_x, min_y, max_x, max_y)
+    }
+
+    pub fn advance_simd_chunk_exact(
+        &mut self,
+        grid: &BitGrid,
+        generations: u64,
+    ) -> (BitGrid, AdvanceStats) {
+        if generations == 0 {
+            return (
+                grid.clone(),
+                AdvanceStats {
+                    backend: SimulationBackend::SimdChunk,
+                    simd_generations: 0,
+                    hashlife_generations: 0,
+                    repeat_skip_events: 0,
+                    repeat_skip_generations: 0,
+                },
+            );
+        }
+
+        let mut current = grid.clone();
+        let mut memo = Memo::default();
+        let mut seen: SeenStates = HashMap::new();
+        let mut generation = 0_u64;
+        let mut repeat_skip_events = 0_u64;
+        let mut repeat_skip_generations = 0_u64;
+
+        while generation < generations {
+            let (signature, origin) = normalize(&current);
+            if let Some(&(first_seen, first_origin)) = seen.get(&signature) {
+                let period = generation - first_seen;
+                if period > 0 {
+                    let remaining = generations - generation;
+                    let skip_cycles = remaining / period;
+                    if skip_cycles > 0 {
+                        let dx = origin.0 - first_origin.0;
+                        let dy = origin.1 - first_origin.1;
+                        if dx == 0 && dy == 0 {
+                            let skipped = skip_cycles * period;
+                            generation += skipped;
+                            repeat_skip_events += 1;
+                            repeat_skip_generations += skipped;
+                            continue;
+                        }
+                        let cycle_count =
+                            Coord::try_from(skip_cycles).expect("simd repeat skip exceeded Coord");
+                        current = translate_grid(
+                            &current,
+                            dx.checked_mul(cycle_count).expect("simd repeat x overflow"),
+                            dy.checked_mul(cycle_count).expect("simd repeat y overflow"),
+                        );
+                        let skipped = skip_cycles * period;
+                        generation += skipped;
+                        repeat_skip_events += 1;
+                        repeat_skip_generations += skipped;
+                        continue;
+                    }
+                }
+            }
+            seen.insert(signature, (generation, origin));
+            current = step_grid_with_changes_and_memo(&current, &mut memo).0;
+            memo.maybe_collect_transition_caches();
+            generation += 1;
+        }
+
+        self.preferred_backend = Some(SimulationBackend::SimdChunk);
+        (
+            current,
+            AdvanceStats {
+                backend: SimulationBackend::SimdChunk,
+                simd_generations: generations,
+                hashlife_generations: 0,
+                repeat_skip_events,
+                repeat_skip_generations,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hashlife_sample_materializations(&self) -> usize {
+        self.hashlife_session.sample_materializations()
     }
 
     pub fn planned_backend_from_metrics(
@@ -219,38 +280,52 @@ impl SimulationSession {
         SimulationBackend::HybridSegmented
     }
 
-    pub fn planned_backend(&self, grid: &BitGrid, generations: u64) -> SimulationBackend {
-        let span = grid
-            .bounds()
-            .map(|(min_x, min_y, max_x, max_y)| (max_x - min_x + 1).max(max_y - min_y + 1))
-            .unwrap_or(0);
-        self.planned_backend_from_metrics(grid.population(), span, generations)
-    }
-
-    fn advance_simd_chunk(&mut self, grid: &BitGrid, generations: u64) -> BitGrid {
-        if grid.is_empty() {
-            return BitGrid::empty();
-        }
-        if generations == 0 {
-            return grid.clone();
+    pub fn planned_backend_from_session_metrics(
+        &mut self,
+        population: usize,
+        span: Coord,
+        generations: u64,
+    ) -> SimulationBackend {
+        if generations == 0 || population == 0 {
+            return SimulationBackend::SimdChunk;
         }
 
-        let mut current = None::<BitGrid>;
-        for _ in 0..generations {
-            let next =
-                step_grid_with_chunk_changes_and_memo(current.as_ref().unwrap_or(grid), &mut self.simd_memo)
-                    .0;
-            current = Some(next);
+        if self.hashlife_loaded()
+            && generations > 1
+            && (self.hashlife_checkpoint().is_some()
+                || matches!(
+                    self.preferred_backend,
+                    Some(SimulationBackend::HashLife | SimulationBackend::HybridSegmented)
+                ))
+        {
+            return SimulationBackend::HashLife;
         }
-        current.unwrap_or_else(BitGrid::empty)
+
+        self.planned_backend_from_metrics(population, span, generations)
     }
 }
 
-fn hybrid_prefix_generations(grid: &BitGrid, generations: u64) -> u64 {
-    let population = grid.population() as u64;
-    let prefix = population
-        .saturating_div(32)
-        .clamp(16, HYBRID_PREFIX_LIMIT)
-        .min(generations);
-    prefix.max(1).min(generations)
+pub fn should_use_exact_simd_repeat_skip(grid: &BitGrid, generations: u64) -> bool {
+    if generations == 0 {
+        return true;
+    }
+    if generations > EXACT_REPEAT_SKIP_GENERATION_LIMIT {
+        return false;
+    }
+    matches!(
+        select_backend(grid, generations),
+        SimulationBackend::SimdChunk
+    )
+}
+
+fn translate_grid(grid: &BitGrid, dx: Coord, dy: Coord) -> BitGrid {
+    let live_cells = grid.live_cells();
+    let mut translated = Vec::with_capacity(live_cells.len());
+    for (x, y) in live_cells {
+        translated.push((
+            x.checked_add(dx).expect("simd translated grid x overflow"),
+            y.checked_add(dy).expect("simd translated grid y overflow"),
+        ));
+    }
+    BitGrid::from_cells(&translated)
 }

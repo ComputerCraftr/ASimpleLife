@@ -1,4 +1,6 @@
-use super::{GC_GROWTH_TRIGGER, GC_MIN_NODES, GC_MIN_RECLAIM, HashLifeEngine, NodeId, NodeKey};
+use crate::cache_policy::{HASHLIFE_GC_MIN_NODES, HASHLIFE_GC_MIN_RECLAIM, hashlife_gc_reason};
+
+use super::{HashLifeEngine, NodeId, NodeKey};
 
 impl HashLifeEngine {
     pub(super) fn initialize_runtime_state(&mut self) {
@@ -11,6 +13,8 @@ impl HashLifeEngine {
         self.jump_cache.clear();
         self.root_result_cache.clear();
         self.overlap_cache.clear();
+        self.transform_cache.clear();
+        self.canonical_node_cache.clear();
     }
 
     pub(super) fn gc_reason(
@@ -18,17 +22,11 @@ impl HashLifeEngine {
         previous_root: Option<NodeId>,
         current_root: Option<NodeId>,
     ) -> &'static str {
-        let root_changed = previous_root != current_root;
-        let grew = self.nodes.len().saturating_sub(self.last_gc_nodes) >= GC_GROWTH_TRIGGER;
-        if root_changed {
-            "root_changed"
-        } else if self.nodes.len() >= GC_MIN_NODES {
-            "node_threshold"
-        } else if grew {
-            "growth_threshold"
-        } else {
-            "skip"
-        }
+        hashlife_gc_reason(
+            previous_root != current_root,
+            self.nodes.len(),
+            self.last_gc_nodes,
+        )
     }
 
     pub(super) fn maybe_garbage_collect(&mut self, reason: &'static str) {
@@ -44,8 +42,8 @@ impl HashLifeEngine {
         self.stats.nodes_before_mark = self.nodes.len();
         self.stats.nodes_after_mark = live_nodes;
         let reclaimable = self.nodes.len().saturating_sub(live_nodes);
-        let should_compact = self.nodes.len() >= GC_MIN_NODES
-            && reclaimable >= GC_MIN_RECLAIM
+        let should_compact = self.nodes.len() >= HASHLIFE_GC_MIN_NODES
+            && reclaimable >= HASHLIFE_GC_MIN_RECLAIM
             && (reclaimable * 4 >= self.nodes.len() || reason != "skip");
 
         if should_compact {
@@ -170,6 +168,7 @@ impl HashLifeEngine {
             retained_roots: self.retained_roots.len(),
             overlap_cache: self.overlap_cache.len(),
             jump_cache_hits: self.stats.jump_cache_hits,
+            symmetric_jump_cache_hits: self.stats.symmetric_jump_cache_hits,
             jump_cache_misses: self.stats.jump_cache_misses,
             root_result_cache_hits: self.stats.root_result_cache_hits,
             root_result_cache_misses: self.stats.root_result_cache_misses,

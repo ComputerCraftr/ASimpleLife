@@ -1,5 +1,6 @@
 use crate::bitgrid::{BitGrid, Cell, Coord};
 use crate::life::ChunkDiff;
+use std::collections::{HashSet, VecDeque};
 use std::io::{self, Write};
 
 #[derive(Clone, Debug)]
@@ -61,6 +62,19 @@ impl TerminalBackbuffer {
             }
         }
 
+        self.flush_dirty(out)
+    }
+
+    pub fn render_at_origin_into<W: Write>(
+        &mut self,
+        grid: &BitGrid,
+        origin: Cell,
+        out: &mut W,
+    ) -> io::Result<()> {
+        if self.origin != Some(origin) {
+            self.origin = Some(origin);
+        }
+        self.rebuild_all(grid);
         self.flush_dirty(out)
     }
 
@@ -147,7 +161,9 @@ impl TerminalBackbuffer {
         }
 
         let min_row = (min_world_y - origin_y).div_euclid(2).max(0);
-        let max_row = (max_world_y - origin_y).div_euclid(2).min(self.height as Coord - 1);
+        let max_row = (max_world_y - origin_y)
+            .div_euclid(2)
+            .min(self.height as Coord - 1);
         if min_row > max_row {
             return;
         }
@@ -209,42 +225,170 @@ fn compute_origin(width: usize, height: usize, grid: &BitGrid) -> Cell {
     compute_origin_for_cells(width, height, &grid.live_cells())
 }
 
-pub(crate) fn compute_origin_for_cells(
-    width: usize,
-    height: usize,
-    cells: &[Cell],
-) -> Cell {
+pub(crate) fn compute_origin_for_cells(width: usize, height: usize, cells: &[Cell]) -> Cell {
     if cells.is_empty() {
         return (0, 0);
     }
 
+    let all_bounds = component_bounds(cells);
+    if bounds_fit_viewport(width, height, all_bounds) {
+        return compute_origin_for_bounds(width, height, all_bounds);
+    }
+
+    let focus_cells = dominant_component_cells(cells);
+
+    compute_origin_for_bounds(width, height, component_bounds(&focus_cells))
+}
+
+fn dominant_component_cells(cells: &[Cell]) -> Vec<Cell> {
+    let occupied: HashSet<Cell> = cells.iter().copied().collect();
+    let mut remaining = occupied.clone();
+    let mut best_component = Vec::new();
+    let mut best_bounds = (Coord::MAX, Coord::MAX, Coord::MIN, Coord::MIN);
+    let global_centroid = centroid(cells);
+
+    while let Some(&start) = remaining.iter().next() {
+        let mut queue = VecDeque::from([start]);
+        let mut component = Vec::new();
+        let mut bounds = (start.0, start.1, start.0, start.1);
+        remaining.remove(&start);
+
+        while let Some((x, y)) = queue.pop_front() {
+            component.push((x, y));
+            bounds.0 = bounds.0.min(x);
+            bounds.1 = bounds.1.min(y);
+            bounds.2 = bounds.2.max(x);
+            bounds.3 = bounds.3.max(y);
+
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let neighbor = (x + dx, y + dy);
+                    if remaining.remove(&neighbor) {
+                        queue.push_back(neighbor);
+                    }
+                }
+            }
+        }
+
+        if component_better_than(
+            &component,
+            bounds,
+            &best_component,
+            best_bounds,
+            global_centroid,
+        ) {
+            best_bounds = bounds;
+            best_component = component;
+        }
+    }
+
+    best_component
+}
+
+fn component_better_than(
+    candidate: &[Cell],
+    candidate_bounds: (Coord, Coord, Coord, Coord),
+    best: &[Cell],
+    best_bounds: (Coord, Coord, Coord, Coord),
+    global_centroid: (i64, i64),
+) -> bool {
+    if best.is_empty() {
+        return true;
+    }
+
+    let candidate_len = candidate.len();
+    let best_len = best.len();
+    if candidate_len != best_len {
+        return candidate_len > best_len;
+    }
+
+    let candidate_area = bounds_area(candidate_bounds);
+    let best_area = bounds_area(best_bounds);
+    if candidate_area != best_area {
+        return candidate_area < best_area;
+    }
+
+    let candidate_distance = centroid_distance_sq(centroid(candidate), global_centroid);
+    let best_distance = centroid_distance_sq(centroid(best), global_centroid);
+    if candidate_distance != best_distance {
+        return candidate_distance < best_distance;
+    }
+
+    let candidate_anchor = (candidate_bounds.0, candidate_bounds.1);
+    let best_anchor = (best_bounds.0, best_bounds.1);
+    candidate_anchor < best_anchor
+}
+
+fn component_bounds(cells: &[Cell]) -> (Coord, Coord, Coord, Coord) {
     let mut min_x = cells[0].0;
     let mut max_x = cells[0].0;
     let mut min_y = cells[0].1;
     let mut max_y = cells[0].1;
-    let mut sum_x: i64 = 0;
-    let mut sum_y: i64 = 0;
 
     for &(x, y) in cells {
         min_x = min_x.min(x);
         max_x = max_x.max(x);
         min_y = min_y.min(y);
         max_y = max_y.max(y);
+    }
+
+    (min_x, min_y, max_x, max_y)
+}
+
+fn bounds_area(bounds: (Coord, Coord, Coord, Coord)) -> i128 {
+    let (min_x, min_y, max_x, max_y) = bounds;
+    let width = i128::from(max_x - min_x + 1);
+    let height = i128::from(max_y - min_y + 1);
+    width * height
+}
+
+fn bounds_fit_viewport(width: usize, height: usize, bounds: (Coord, Coord, Coord, Coord)) -> bool {
+    let (min_x, min_y, max_x, max_y) = bounds;
+    let viewport_width = width as Coord;
+    let viewport_height = (height as Coord) * 2;
+    let bounds_width = max_x - min_x + 1;
+    let bounds_height = max_y - min_y + 1;
+
+    bounds_width <= viewport_width && bounds_height <= viewport_height
+}
+
+fn centroid(cells: &[Cell]) -> (i64, i64) {
+    let mut sum_x: i64 = 0;
+    let mut sum_y: i64 = 0;
+
+    for &(x, y) in cells {
         sum_x += x;
         sum_y += y;
     }
 
+    (sum_x / cells.len() as i64, sum_y / cells.len() as i64)
+}
+
+fn centroid_distance_sq(center: (i64, i64), global_centroid: (i64, i64)) -> i128 {
+    let dx = i128::from(center.0 - global_centroid.0);
+    let dy = i128::from(center.1 - global_centroid.1);
+    dx * dx + dy * dy
+}
+
+pub fn compute_origin_for_bounds(
+    width: usize,
+    height: usize,
+    bounds: (Coord, Coord, Coord, Coord),
+) -> Cell {
+    let (min_x, min_y, max_x, max_y) = bounds;
     let viewport_width = width as Coord;
     let viewport_height = (height as Coord) * 2;
-    let centroid_x = sum_x / cells.len() as i64;
-    let centroid_y = sum_y / cells.len() as i64;
-    let ideal_x = centroid_x - viewport_width / 2;
-    let ideal_y = centroid_y - viewport_height / 2;
+    let center_x = (min_x + max_x) / 2;
+    let center_y = (min_y + max_y) / 2;
+    let ideal_x = center_x - viewport_width / 2;
+    let ideal_y = center_y - viewport_height / 2;
     let min_origin_x = max_x - viewport_width + 1;
     let min_origin_y = max_y - viewport_height + 1;
     let max_origin_x = min_x;
     let max_origin_y = min_y;
-
     (
         clamp_coord(ideal_x, min_origin_x, max_origin_x),
         clamp_coord(ideal_y, min_origin_y, max_origin_y),

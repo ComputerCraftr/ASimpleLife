@@ -11,7 +11,11 @@ panic = "abort"
 
 [profile.release-debug]
 inherits = "release"
-debug = true
+debug = 2
+strip = "none"
+split-debuginfo = "packed"
+codegen-units = 16
+panic = "unwind"
 
 [dependencies]
 bytemuck = { version = "1.25.0", features = ["must_cast"] }

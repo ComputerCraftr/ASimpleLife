@@ -1,7 +1,45 @@
-use super::{EmbeddedCell, EmbeddedJump, HashLifeEngine, NodeId, hashlife_debug_enabled, morton_key, quadrant_end};
+use super::{
+    EmbeddedCell, EmbeddedJump, GridExtractionPolicy, HashLifeEngine, NodeId,
+    hashlife_debug_enabled, morton_key, quadrant_end,
+};
 use crate::bitgrid::{BitGrid, Coord};
 
+fn translated_embedded_cells(grid: &BitGrid, shift_x: Coord, shift_y: Coord) -> Vec<EmbeddedCell> {
+    let live_cells = grid.live_cells();
+    let mut translated = Vec::with_capacity(live_cells.len());
+    for (x, y) in live_cells {
+        let tx =
+            u64::try_from(x + shift_x).expect("hashlife translated x coordinate became invalid");
+        let ty =
+            u64::try_from(y + shift_y).expect("hashlife translated y coordinate became invalid");
+        translated.push(EmbeddedCell {
+            key: morton_key(tx, ty),
+        });
+    }
+    translated.sort_unstable_by_key(|cell| cell.key);
+    translated
+}
+
 impl HashLifeEngine {
+    pub(super) fn embed_grid_at_level(&mut self, grid: &BitGrid, level: u32) -> NodeId {
+        if grid.is_empty() {
+            return self.empty(level);
+        }
+        let size = 1_i64 << level;
+        if let Some((min_x, min_y, max_x, max_y)) = grid.bounds() {
+            assert!(
+                min_x >= 0 && min_y >= 0,
+                "grid must be non-negative for exact level embed"
+            );
+            assert!(
+                max_x < size && max_y < size,
+                "grid exceeded exact level embed bounds"
+            );
+        }
+        let translated = translated_embedded_cells(grid, 0, 0);
+        self.build_node_from_cells_iterative(&translated, level)
+    }
+
     pub(super) fn embed_grid_state(&mut self, grid: &BitGrid) -> (NodeId, Coord, Coord) {
         if grid.is_empty() {
             return (self.empty(2), 0, 0);
@@ -15,24 +53,14 @@ impl HashLifeEngine {
             .expect("hashlife state span became negative")
             .next_power_of_two()
             .max(4);
-        let root_size = Coord::try_from(root_size).expect("hashlife state root size exceeded Coord");
+        let root_size =
+            Coord::try_from(root_size).expect("hashlife state root size exceeded Coord");
         let size_u64 = u64::try_from(root_size).expect("hashlife state root size became negative");
         let level = size_u64.trailing_zeros();
         let shift_x = (root_size - width) / 2 - min_x;
         let shift_y = (root_size - height) / 2 - min_y;
 
-        let live_cells = grid.live_cells();
-        let mut translated = Vec::with_capacity(live_cells.len());
-        translated.extend(live_cells.into_iter().map(|(x, y)| {
-            let tx = u64::try_from(x + shift_x)
-                .expect("hashlife translated state x coordinate became invalid");
-            let ty = u64::try_from(y + shift_y)
-                .expect("hashlife translated state y coordinate became invalid");
-            EmbeddedCell {
-                key: morton_key(tx, ty),
-            }
-        }));
-        translated.sort_unstable_by_key(|cell| cell.key);
+        let translated = translated_embedded_cells(grid, shift_x, shift_y);
         let root = self.build_node_from_cells_iterative(&translated, level);
         (root, -shift_x, -shift_y)
     }
@@ -68,22 +96,7 @@ impl HashLifeEngine {
         let root_size = size;
         let shift_x = (root_size - width) / 2 - min_x;
         let shift_y = (root_size - height) / 2 - min_y;
-        let live_cells = grid.live_cells();
-        let mut translated = Vec::with_capacity(live_cells.len());
-        translated.extend(
-            live_cells
-            .into_iter()
-            .map(|(x, y)| {
-                let tx = u64::try_from(x + shift_x)
-                    .expect("hashlife translated x coordinate became invalid");
-                let ty = u64::try_from(y + shift_y)
-                    .expect("hashlife translated y coordinate became invalid");
-                EmbeddedCell {
-                    key: morton_key(tx, ty),
-                }
-            }),
-        );
-        translated.sort_unstable_by_key(|cell| cell.key);
+        let translated = translated_embedded_cells(grid, shift_x, shift_y);
         let root = self.build_node_from_cells_iterative(&translated, level);
         EmbeddedJump {
             root,
@@ -96,9 +109,16 @@ impl HashLifeEngine {
         }
     }
 
-    pub(super) fn extract_embedded_result(&self, embedded: EmbeddedJump, result: NodeId) -> BitGrid {
+    pub(super) fn extract_embedded_result(
+        &self,
+        embedded: EmbeddedJump,
+        result: NodeId,
+    ) -> BitGrid {
         debug_assert_eq!(self.nodes[result as usize].level + 1, embedded.root_level);
-        debug_assert_eq!(embedded.root_size / 2, 1_i64 << self.nodes[result as usize].level);
+        debug_assert_eq!(
+            embedded.root_size / 2,
+            1_i64 << self.nodes[result as usize].level
+        );
         debug_assert_eq!(
             embedded.result_origin_x,
             embedded.root_size / 4 - embedded.world_to_root_x
@@ -107,10 +127,24 @@ impl HashLifeEngine {
             embedded.result_origin_y,
             embedded.root_size / 4 - embedded.world_to_root_y
         );
-        self.node_to_grid(result, embedded.result_origin_x, embedded.result_origin_y)
+        self.node_to_grid(
+            result,
+            embedded.result_origin_x,
+            embedded.result_origin_y,
+            GridExtractionPolicy::FullGridIfUnder {
+                max_population: u64::MAX,
+                max_chunks: usize::MAX,
+                max_bounds_span: Coord::MAX,
+            },
+        )
+        .expect("embedded HashLife result extraction should be unrestricted")
     }
 
-    pub(super) fn build_node_from_cells_iterative(&mut self, cells: &[EmbeddedCell], level: u32) -> NodeId {
+    pub(super) fn build_node_from_cells_iterative(
+        &mut self,
+        cells: &[EmbeddedCell],
+        level: u32,
+    ) -> NodeId {
         let estimated_internal = (cells.len().max(1).next_power_of_two() * 2).min(1 << 16);
         let mut ops = Vec::with_capacity((estimated_internal / 2).max(1));
         ops.push(BuildOp::Enter {
@@ -150,7 +184,10 @@ impl HashLifeEngine {
                             end,
                             level,
                             bit_shift,
-                        } = ops.pop().unwrap() else { unreachable!() };
+                        } = ops.pop().unwrap()
+                        else {
+                            unreachable!()
+                        };
                         process_build_enter_impl(
                             self,
                             cells,
@@ -255,7 +292,12 @@ fn process_build_enter_impl(
     });
 }
 
-fn split_quadrants(cells: &[EmbeddedCell], start: usize, end: usize, bit_shift: u32) -> (usize, usize, usize) {
+fn split_quadrants(
+    cells: &[EmbeddedCell],
+    start: usize,
+    end: usize,
+    bit_shift: u32,
+) -> (usize, usize, usize) {
     const LINEAR_SPLIT_THRESHOLD: usize = 32;
     let len = end - start;
     let mut q0_end;

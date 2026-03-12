@@ -1,48 +1,12 @@
 use std::collections::HashMap;
 
+use crate::cache_policy::{SIMD_RETAINED_CACHE_CAPACITY, should_collect_simd_transition_caches};
 use crate::classify::Classification;
 use crate::normalize::NormalizedGridSignature;
+use crate::symmetry::D4Symmetry as Symmetry;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ChunkNeighborhood(pub [u64; 9]);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Symmetry {
-    Identity,
-    Rotate90,
-    Rotate180,
-    Rotate270,
-    MirrorX,
-    MirrorXRotate90,
-    MirrorXRotate180,
-    MirrorXRotate270,
-}
-
-impl Symmetry {
-    const ALL: [Self; 8] = [
-        Self::Identity,
-        Self::Rotate90,
-        Self::Rotate180,
-        Self::Rotate270,
-        Self::MirrorX,
-        Self::MirrorXRotate90,
-        Self::MirrorXRotate180,
-        Self::MirrorXRotate270,
-    ];
-
-    const fn inverse(self) -> Self {
-        match self {
-            Self::Identity => Self::Identity,
-            Self::Rotate90 => Self::Rotate270,
-            Self::Rotate180 => Self::Rotate180,
-            Self::Rotate270 => Self::Rotate90,
-            Self::MirrorX => Self::MirrorX,
-            Self::MirrorXRotate90 => Self::MirrorXRotate90,
-            Self::MirrorXRotate180 => Self::MirrorXRotate180,
-            Self::MirrorXRotate270 => Self::MirrorXRotate270,
-        }
-    }
-}
 
 #[derive(Clone, Debug, Default)]
 pub struct Memo {
@@ -81,6 +45,22 @@ impl Memo {
             .insert(canonical, transform_chunk_bits(next, symmetry));
     }
 
+    pub(crate) fn maybe_collect_transition_caches(&mut self) {
+        if !should_collect_simd_transition_caches(
+            self.chunk_transition_cache.len(),
+            self.chunk_canonicalization_cache.len(),
+        ) {
+            return;
+        }
+
+        self.chunk_transition_cache.clear();
+        self.chunk_transition_cache
+            .shrink_to(SIMD_RETAINED_CACHE_CAPACITY);
+        self.chunk_canonicalization_cache.clear();
+        self.chunk_canonicalization_cache
+            .shrink_to(SIMD_RETAINED_CACHE_CAPACITY);
+    }
+
     fn canonicalize_chunk_neighborhood(
         &mut self,
         neighborhood: &ChunkNeighborhood,
@@ -103,6 +83,12 @@ impl Memo {
     #[cfg(test)]
     pub(crate) fn chunk_canonicalization_cache_len(&self) -> usize {
         self.chunk_canonicalization_cache.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_collect_transition_caches(&mut self) {
+        self.chunk_transition_cache.clear();
+        self.chunk_canonicalization_cache.clear();
     }
 }
 
@@ -172,15 +158,5 @@ fn transform_chunk_bits(bits: u64, symmetry: Symmetry) -> u64 {
 }
 
 fn transform_coord(x: usize, y: usize, size: usize, symmetry: Symmetry) -> (usize, usize) {
-    let max = size - 1;
-    match symmetry {
-        Symmetry::Identity => (x, y),
-        Symmetry::Rotate90 => (max - y, x),
-        Symmetry::Rotate180 => (max - x, max - y),
-        Symmetry::Rotate270 => (y, max - x),
-        Symmetry::MirrorX => (max - x, y),
-        Symmetry::MirrorXRotate90 => (max - y, max - x),
-        Symmetry::MirrorXRotate180 => (x, max - y),
-        Symmetry::MirrorXRotate270 => (y, x),
-    }
+    symmetry.transform_coords(x, y, size - 1)
 }

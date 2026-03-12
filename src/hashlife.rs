@@ -3,15 +3,104 @@ use std::env;
 use std::sync::OnceLock;
 
 use crate::bitgrid::{BitGrid, Coord};
+use crate::cache_policy::{HASHLIFE_GC_MIN_NODES, should_run_active_hashlife_gc};
+use crate::symmetry::D4Symmetry as Symmetry;
 
 mod embed;
 mod gc;
 mod node;
 mod session;
+mod signature;
 
 pub use session::HashLifeSession;
+pub use signature::{HashLifeCheckpoint, HashLifeCheckpointKey, HashLifeCheckpointSignature};
 
 type NodeId = u64;
+
+const DENSE_SHORTCUT_MAX_LEVEL: u32 = 6;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GridExtractionPolicy {
+    ViewportOnly,
+    BoundedRegion {
+        min_x: Coord,
+        min_y: Coord,
+        max_x: Coord,
+        max_y: Coord,
+    },
+    FullGridIfUnder {
+        max_population: u64,
+        max_chunks: usize,
+        max_bounds_span: Coord,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GridExtractionError {
+    NotLoaded,
+    PopulationLimitExceeded { population: u64, limit: u64 },
+    ChunkLimitExceeded { chunks: usize, limit: usize },
+    BoundsSpanLimitExceeded { bounds_span: Coord, limit: Coord },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct CanonicalJumpKey {
+    node: NodeId,
+    step_exp: u32,
+}
+
+impl Symmetry {
+    const fn quadrant_permutation(self) -> [usize; 4] {
+        match self {
+            Self::Identity => [0, 1, 2, 3],
+            Self::Rotate90 => [1, 3, 0, 2],
+            Self::Rotate180 => [3, 2, 1, 0],
+            Self::Rotate270 => [2, 0, 3, 1],
+            Self::MirrorX => [1, 0, 3, 2],
+            Self::MirrorXRotate90 => [3, 1, 2, 0],
+            Self::MirrorXRotate180 => [2, 3, 0, 1],
+            Self::MirrorXRotate270 => [0, 2, 1, 3],
+        }
+    }
+
+    const fn overlap_permutation(self) -> [usize; 9] {
+        match self {
+            Self::Identity => [0, 1, 2, 3, 4, 5, 6, 7, 8],
+            Self::Rotate90 => [2, 5, 8, 1, 4, 7, 0, 3, 6],
+            Self::Rotate180 => [8, 7, 6, 5, 4, 3, 2, 1, 0],
+            Self::Rotate270 => [6, 3, 0, 7, 4, 1, 8, 5, 2],
+            Self::MirrorX => [2, 1, 0, 5, 4, 3, 8, 7, 6],
+            Self::MirrorXRotate90 => [8, 5, 2, 7, 4, 1, 6, 3, 0],
+            Self::MirrorXRotate180 => [6, 7, 8, 3, 4, 5, 0, 1, 2],
+            Self::MirrorXRotate270 => [0, 3, 6, 1, 4, 7, 2, 5, 8],
+        }
+    }
+
+    fn transform_quadrants(self, quadrants: [NodeId; 4]) -> [NodeId; 4] {
+        let permutation = self.quadrant_permutation();
+        [
+            quadrants[permutation[0]],
+            quadrants[permutation[1]],
+            quadrants[permutation[2]],
+            quadrants[permutation[3]],
+        ]
+    }
+
+    fn transform_overlap_nodes(
+        self,
+        engine: &mut HashLifeEngine,
+        overlaps: [NodeId; 9],
+    ) -> [NodeId; 9] {
+        let permutation = self.overlap_permutation();
+        let mut transformed = [0; 9];
+        let mut index = 0;
+        while index < overlaps.len() {
+            transformed[index] = engine.transform_node(overlaps[permutation[index]], self);
+            index += 1;
+        }
+        transformed
+    }
+}
 
 fn centered_2x2_from_4x4(mask: u16) -> u8 {
     let mut result = 0_u8;
@@ -87,9 +176,11 @@ pub struct HashLifeEngine {
     nodes: Vec<Node>,
     intern: HashMap<NodeKey, NodeId>,
     empty_by_level: Vec<NodeId>,
-    jump_cache: HashMap<(NodeId, u32), NodeId>,
+    jump_cache: HashMap<CanonicalJumpKey, NodeId>,
     root_result_cache: HashMap<(NodeId, u32), NodeId>,
     overlap_cache: HashMap<NodeId, [NodeId; 9]>,
+    transform_cache: HashMap<(NodeId, Symmetry), NodeId>,
+    canonical_node_cache: HashMap<NodeId, (NodeId, Symmetry)>,
     embed_layout_cache: HashMap<(u32, Coord, Coord, Coord), Coord>,
     retained_roots: Vec<NodeId>,
     dead_leaf: NodeId,
@@ -112,6 +203,7 @@ struct EmbeddedJump {
 #[derive(Clone, Copy, Debug, Default)]
 struct HashLifeStats {
     jump_cache_hits: usize,
+    symmetric_jump_cache_hits: usize,
     jump_cache_misses: usize,
     root_result_cache_hits: usize,
     root_result_cache_misses: usize,
@@ -182,6 +274,7 @@ pub(crate) struct HashLifeRuntimeStats {
     pub retained_roots: usize,
     pub overlap_cache: usize,
     pub jump_cache_hits: usize,
+    pub symmetric_jump_cache_hits: usize,
     pub jump_cache_misses: usize,
     pub root_result_cache_hits: usize,
     pub root_result_cache_misses: usize,
@@ -202,10 +295,9 @@ pub(crate) struct HashLifeRuntimeStats {
     pub scheduler_ready_max: usize,
 }
 
-const GC_MIN_NODES: usize = 4_096;
-const GC_GROWTH_TRIGGER: usize = 1_024;
-const GC_MIN_RECLAIM: usize = 256;
 const DISCOVER_BATCH: usize = 4;
+const JUMP_SYMMETRY_MAX_LEVEL: u32 = 8;
+const JUMP_SYMMETRY_MAX_POPULATION: u64 = 4_096;
 
 impl Default for HashLifeEngine {
     fn default() -> Self {
@@ -216,6 +308,8 @@ impl Default for HashLifeEngine {
             jump_cache: HashMap::new(),
             root_result_cache: HashMap::new(),
             overlap_cache: HashMap::new(),
+            transform_cache: HashMap::new(),
+            canonical_node_cache: HashMap::new(),
             embed_layout_cache: HashMap::new(),
             retained_roots: Vec::new(),
             dead_leaf: 0,
@@ -230,8 +324,133 @@ impl Default for HashLifeEngine {
 }
 
 impl HashLifeEngine {
-    fn cached_jump_result(&self, key: (NodeId, u32)) -> Option<NodeId> {
-        self.jump_cache.get(&key).copied()
+    fn node_tuple_key(&self, node: NodeId) -> (u32, NodeId, NodeId, NodeId, NodeId) {
+        let node_ref = &self.nodes[node as usize];
+        (
+            node_ref.level,
+            node_ref.nw,
+            node_ref.ne,
+            node_ref.sw,
+            node_ref.se,
+        )
+    }
+
+    fn transform_node(&mut self, node: NodeId, symmetry: Symmetry) -> NodeId {
+        if symmetry == Symmetry::Identity || self.nodes[node as usize].level == 0 {
+            return node;
+        }
+        if let Some(&transformed) = self.transform_cache.get(&(node, symmetry)) {
+            return transformed;
+        }
+
+        let (nw, ne, sw, se) = {
+            let node_ref = self.nodes[node as usize];
+            (node_ref.nw, node_ref.ne, node_ref.sw, node_ref.se)
+        };
+        let transformed_children = [
+            self.transform_node(nw, symmetry),
+            self.transform_node(ne, symmetry),
+            self.transform_node(sw, symmetry),
+            self.transform_node(se, symmetry),
+        ];
+        let [next_nw, next_ne, next_sw, next_se] =
+            symmetry.transform_quadrants(transformed_children);
+        let transformed = self.join(next_nw, next_ne, next_sw, next_se);
+        self.transform_cache.insert((node, symmetry), transformed);
+        transformed
+    }
+
+    fn canonicalize_node(&mut self, node: NodeId) -> (NodeId, Symmetry) {
+        if self.nodes[node as usize].level == 0 {
+            return (node, Symmetry::Identity);
+        }
+        if let Some(&canonical) = self.canonical_node_cache.get(&node) {
+            return canonical;
+        }
+
+        let mut best_node = node;
+        let mut best_symmetry = Symmetry::Identity;
+        let mut best_key = self.node_tuple_key(node);
+        for symmetry in Symmetry::ALL {
+            let transformed = self.transform_node(node, symmetry);
+            let transformed_key = self.node_tuple_key(transformed);
+            if transformed_key < best_key {
+                best_key = transformed_key;
+                best_node = transformed;
+                best_symmetry = symmetry;
+            }
+        }
+
+        let canonical = (best_node, best_symmetry);
+        self.canonical_node_cache.insert(node, canonical);
+        canonical
+    }
+
+    fn canonical_jump_key(&mut self, key: (NodeId, u32)) -> (CanonicalJumpKey, Symmetry) {
+        let (canonical_node, symmetry) = if self.should_symmetry_canonicalize_jump_node(key.0) {
+            self.canonicalize_node(key.0)
+        } else {
+            (key.0, Symmetry::Identity)
+        };
+        (
+            CanonicalJumpKey {
+                node: canonical_node,
+                step_exp: key.1,
+            },
+            symmetry,
+        )
+    }
+
+    fn should_symmetry_canonicalize_jump_node(&self, node: NodeId) -> bool {
+        let node_ref = &self.nodes[node as usize];
+        node_ref.level <= JUMP_SYMMETRY_MAX_LEVEL
+            && node_ref.population <= JUMP_SYMMETRY_MAX_POPULATION
+    }
+
+    fn canonicalized_cache_node(&mut self, node: NodeId) -> (NodeId, Symmetry) {
+        if self.should_symmetry_canonicalize_jump_node(node) {
+            self.canonicalize_node(node)
+        } else {
+            (node, Symmetry::Identity)
+        }
+    }
+
+    fn cached_jump_result(&mut self, key: (NodeId, u32)) -> Option<NodeId> {
+        let (canonical_key, symmetry) = self.canonical_jump_key(key);
+        let inverse = symmetry.inverse();
+        let result = self.jump_cache.get(&canonical_key).copied()?;
+        if symmetry != Symmetry::Identity {
+            self.stats.symmetric_jump_cache_hits += 1;
+        }
+        Some(self.transform_node(result, inverse))
+    }
+
+    fn insert_jump_result(&mut self, key: (NodeId, u32), result: NodeId) {
+        let (canonical_key, symmetry) = self.canonical_jump_key(key);
+        let canonical_result = self.transform_node(result, symmetry);
+        self.jump_cache.insert(canonical_key, canonical_result);
+    }
+
+    fn jump_result(&mut self, key: (NodeId, u32)) -> NodeId {
+        self.cached_jump_result(key)
+            .expect("missing HashLife jump result")
+    }
+
+    fn cached_root_result(&mut self, key: (NodeId, u32)) -> Option<NodeId> {
+        let (canonical_node, symmetry) = self.canonicalized_cache_node(key.0);
+        let inverse = symmetry.inverse();
+        let result = self
+            .root_result_cache
+            .get(&(canonical_node, key.1))
+            .copied()?;
+        Some(self.transform_node(result, inverse))
+    }
+
+    fn insert_root_result(&mut self, key: (NodeId, u32), result: NodeId) {
+        let (canonical_node, symmetry) = self.canonicalized_cache_node(key.0);
+        let canonical_result = self.transform_node(result, symmetry);
+        self.root_result_cache
+            .insert((canonical_node, key.1), canonical_result);
     }
 
     pub(super) fn begin_persistent_run(&mut self) -> Option<NodeId> {
@@ -337,6 +556,26 @@ impl HashLifeEngine {
         }
     }
 
+    pub(super) fn maybe_collect_active_run(
+        &mut self,
+        current_root: Option<NodeId>,
+    ) -> Option<NodeId> {
+        let root = current_root?;
+        if !should_run_active_hashlife_gc(self.nodes.len(), self.last_gc_nodes) {
+            return Some(root);
+        }
+
+        self.record_retained_root(root);
+        self.stats.jump_cache_before_clear = self.jump_cache.len();
+        let gc_reason = if self.nodes.len() >= HASHLIFE_GC_MIN_NODES {
+            "node_threshold"
+        } else {
+            "growth_threshold"
+        };
+        self.maybe_garbage_collect(gc_reason);
+        self.retained_roots.last().copied()
+    }
+
     pub fn advance(&mut self, grid: &BitGrid, generations: u64) -> BitGrid {
         let previous_root = self.begin_persistent_run();
         let (advanced, last_root) = self.advance_segment(grid, generations);
@@ -351,13 +590,13 @@ impl HashLifeEngine {
 
         let embedded = self.embed_for_jump(grid, step_exp);
         let cache_key = (embedded.root, step_exp);
-        let advanced = if let Some(&cached) = self.root_result_cache.get(&cache_key) {
+        let advanced = if let Some(cached) = self.cached_root_result(cache_key) {
             self.stats.root_result_cache_hits += 1;
             cached
         } else {
             self.stats.root_result_cache_misses += 1;
             let result = self.advance_pow2(embedded.root, step_exp);
-            self.root_result_cache.insert(cache_key, result);
+            self.insert_root_result(cache_key, result);
             result
         };
         (self.extract_embedded_result(embedded, advanced), advanced)
@@ -376,19 +615,27 @@ impl HashLifeEngine {
         let level = self.nodes[root_node as usize].level as usize;
         let task_capacity = 1usize << level.saturating_sub(root_step_exp as usize + 1).min(10);
         let mut discover = Vec::with_capacity(task_capacity.max(8));
-        discover.push((root_node, root_step_exp));
-        let mut task_index: HashMap<(NodeId, u32), usize> = HashMap::with_capacity(task_capacity);
+        discover.push(self.canonical_jump_key((root_node, root_step_exp)).0);
+        let mut task_index: HashMap<CanonicalJumpKey, usize> =
+            HashMap::with_capacity(task_capacity);
         let mut tasks = Vec::<Option<TaskRecord>>::with_capacity(task_capacity);
-        let mut task_keys = Vec::<Option<(NodeId, u32)>>::with_capacity(task_capacity);
-        let mut dependents: HashMap<(NodeId, u32), Vec<usize>> = HashMap::with_capacity(task_capacity);
+        let mut task_keys = Vec::<Option<CanonicalJumpKey>>::with_capacity(task_capacity);
+        let mut dependents: HashMap<CanonicalJumpKey, Vec<usize>> =
+            HashMap::with_capacity(task_capacity);
         let mut ready = Vec::<usize>::with_capacity(task_capacity);
-        let mut batch = [(0_u64, 0_u32); DISCOVER_BATCH];
+        let mut batch = [CanonicalJumpKey {
+            node: 0,
+            step_exp: 0,
+        }; DISCOVER_BATCH];
         let mut iterations = 0_usize;
         let mut max_stack = discover.len();
         let mut next_iteration_log = 100_000_usize;
         let mut next_stack_log = 10_000_usize;
 
-        while !self.jump_cache.contains_key(&(root_node, root_step_exp)) {
+        while self
+            .cached_jump_result((root_node, root_step_exp))
+            .is_none()
+        {
             while !discover.is_empty() {
                 let mut batch_len = 0;
                 while batch_len < DISCOVER_BATCH {
@@ -398,7 +645,9 @@ impl HashLifeEngine {
                     batch[batch_len] = entry;
                     batch_len += 1;
                 }
-                for &(discovered_node, discovered_step_exp) in &batch[..batch_len] {
+                for &canonical_task in &batch[..batch_len] {
+                    let discovered_node = canonical_task.node;
+                    let discovered_step_exp = canonical_task.step_exp;
                     iterations += 1;
                     if discover.len() > max_stack {
                         max_stack = discover.len();
@@ -425,8 +674,11 @@ impl HashLifeEngine {
                         );
                         next_stack_log = next_stack_log.saturating_mul(2);
                     }
-                    let cache_key = (discovered_node, discovered_step_exp);
-                    if self.cached_jump_result(cache_key).is_some() {
+                    let cache_key = canonical_task;
+                    if self
+                        .cached_jump_result((cache_key.node, cache_key.step_exp))
+                        .is_some()
+                    {
                         self.stats.jump_cache_hits += 1;
                         continue;
                     }
@@ -441,7 +693,7 @@ impl HashLifeEngine {
 
                     if discovered_step_exp == 0 {
                         let result = self.advance_one_generation_centered(discovered_node);
-                        self.jump_cache.insert(cache_key, result);
+                        self.insert_jump_result((cache_key.node, cache_key.step_exp), result);
                         notify_dependents(&cache_key, &mut tasks, &mut dependents, &mut ready);
                         if ready.len() > self.stats.scheduler_ready_max {
                             self.stats.scheduler_ready_max = ready.len();
@@ -451,7 +703,7 @@ impl HashLifeEngine {
 
                     if self.nodes[discovered_node as usize].population == 0 {
                         let result = self.empty(discovered_level - 1);
-                        self.jump_cache.insert(cache_key, result);
+                        self.insert_jump_result((cache_key.node, cache_key.step_exp), result);
                         notify_dependents(&cache_key, &mut tasks, &mut dependents, &mut ready);
                         if ready.len() > self.stats.scheduler_ready_max {
                             self.stats.scheduler_ready_max = ready.len();
@@ -461,7 +713,18 @@ impl HashLifeEngine {
 
                     if discovered_level == 2 {
                         let result = self.base_transition(discovered_node);
-                        self.jump_cache.insert(cache_key, result);
+                        self.insert_jump_result((cache_key.node, cache_key.step_exp), result);
+                        notify_dependents(&cache_key, &mut tasks, &mut dependents, &mut ready);
+                        if ready.len() > self.stats.scheduler_ready_max {
+                            self.stats.scheduler_ready_max = ready.len();
+                        }
+                        continue;
+                    }
+
+                    if discovered_level <= DENSE_SHORTCUT_MAX_LEVEL {
+                        let result =
+                            self.dense_advance_centered(discovered_node, discovered_step_exp);
+                        self.insert_jump_result((cache_key.node, cache_key.step_exp), result);
                         notify_dependents(&cache_key, &mut tasks, &mut dependents, &mut ready);
                         if ready.len() > self.stats.scheduler_ready_max {
                             self.stats.scheduler_ready_max = ready.len();
@@ -511,8 +774,11 @@ impl HashLifeEngine {
                         upper_center,
                         upper_left,
                     ] {
-                        let child_key = (child_node, child_step_exp);
-                        if self.cached_jump_result(child_key).is_none() {
+                        let child_key = self.canonical_jump_key((child_node, child_step_exp)).0;
+                        if self
+                            .cached_jump_result((child_key.node, child_key.step_exp))
+                            .is_none()
+                        {
                             dependents.entry(child_key).or_default().push(task_id);
                             tasks[task_id].as_mut().unwrap().remaining += 1;
                             if !task_index.contains_key(&child_key) {
@@ -529,12 +795,15 @@ impl HashLifeEngine {
                 }
             }
 
-            if self.jump_cache.contains_key(&(root_node, root_step_exp)) {
+            if self
+                .cached_jump_result((root_node, root_step_exp))
+                .is_some()
+            {
                 break;
             }
 
             let Some(task_id) = ready.pop() else {
-                let sample = task_index.iter().next().map(|(&(pending_node, pending_exp), &task_id)| {
+                let sample = task_index.iter().next().map(|(&pending_key, &task_id)| {
                     let task = tasks[task_id].unwrap();
                     let (recurse_exp, missing) = match task.task {
                         PendingTask::PhaseOne {
@@ -552,7 +821,9 @@ impl HashLifeEngine {
                             next_exp,
                             [a, b, c, d, e, f, g, h, i]
                                 .into_iter()
-                                .filter(|&child| self.cached_jump_result((child, next_exp)).is_none())
+                                .filter(|&child| {
+                                    self.cached_jump_result((child, next_exp)).is_none()
+                                })
                                 .collect::<Vec<_>>(),
                         ),
                         PendingTask::PhaseTwo {
@@ -565,11 +836,13 @@ impl HashLifeEngine {
                             next_exp,
                             [nw, ne, sw, se]
                                 .into_iter()
-                                .filter(|&child| self.cached_jump_result((child, next_exp)).is_none())
+                                .filter(|&child| {
+                                    self.cached_jump_result((child, next_exp)).is_none()
+                                })
                                 .collect::<Vec<_>>(),
                         ),
                     };
-                    (pending_node, pending_exp, recurse_exp, missing)
+                    (pending_key.node, pending_key.step_exp, recurse_exp, missing)
                 });
                 panic!(
                     "hashlife dependency resolution stalled root_node={root_node} root_step_exp={root_step_exp} pending={} ready={} cache={} sample={sample:?}",
@@ -586,7 +859,8 @@ impl HashLifeEngine {
             debug_assert_eq!(task.remaining, 0);
             match task.task {
                 PendingTask::PhaseOne { .. } => {
-                    let (pending_node, pending_exp) = task_key;
+                    let pending_node = task_key.node;
+                    let pending_exp = task_key.step_exp;
                     let PendingTask::PhaseOne {
                         next_exp,
                         a,
@@ -598,26 +872,48 @@ impl HashLifeEngine {
                         g,
                         h,
                         i,
-                    } = task.task else { unreachable!() };
-                    let upper_left_result = self.jump_cache[&(a, next_exp)];
-                    let upper_center_result = self.jump_cache[&(b, next_exp)];
-                    let upper_right_result = self.jump_cache[&(c, next_exp)];
-                    let middle_left_result = self.jump_cache[&(d, next_exp)];
-                    let center_result = self.jump_cache[&(e, next_exp)];
-                    let middle_right_result = self.jump_cache[&(f, next_exp)];
-                    let lower_left_result = self.jump_cache[&(g, next_exp)];
-                    let lower_center_result = self.jump_cache[&(h, next_exp)];
-                    let lower_right_result = self.jump_cache[&(i, next_exp)];
+                    } = task.task
+                    else {
+                        unreachable!()
+                    };
+                    let upper_left_result = self.jump_result((a, next_exp));
+                    let upper_center_result = self.jump_result((b, next_exp));
+                    let upper_right_result = self.jump_result((c, next_exp));
+                    let middle_left_result = self.jump_result((d, next_exp));
+                    let center_result = self.jump_result((e, next_exp));
+                    let middle_right_result = self.jump_result((f, next_exp));
+                    let lower_left_result = self.jump_result((g, next_exp));
+                    let lower_center_result = self.jump_result((h, next_exp));
+                    let lower_right_result = self.jump_result((i, next_exp));
 
-                    let next_upper_left =
-                        self.join(upper_left_result, upper_center_result, middle_left_result, center_result);
-                    let next_upper_right =
-                        self.join(upper_center_result, upper_right_result, center_result, middle_right_result);
-                    let next_lower_left =
-                        self.join(middle_left_result, center_result, lower_left_result, lower_center_result);
-                    let next_lower_right =
-                        self.join(center_result, middle_right_result, lower_center_result, lower_right_result);
-                    let parent_key = (pending_node, pending_exp);
+                    let next_upper_left = self.join(
+                        upper_left_result,
+                        upper_center_result,
+                        middle_left_result,
+                        center_result,
+                    );
+                    let next_upper_right = self.join(
+                        upper_center_result,
+                        upper_right_result,
+                        center_result,
+                        middle_right_result,
+                    );
+                    let next_lower_left = self.join(
+                        middle_left_result,
+                        center_result,
+                        lower_left_result,
+                        lower_center_result,
+                    );
+                    let next_lower_right = self.join(
+                        center_result,
+                        middle_right_result,
+                        lower_center_result,
+                        lower_right_result,
+                    );
+                    let parent_key = CanonicalJumpKey {
+                        node: pending_node,
+                        step_exp: pending_exp,
+                    };
                     let parent_id = task_id;
                     task_index.insert(parent_key, parent_id);
                     task_keys[parent_id] = Some(parent_key);
@@ -637,8 +933,11 @@ impl HashLifeEngine {
                         next_upper_right,
                         next_upper_left,
                     ] {
-                        let child_key = (child_node, next_exp);
-                        if self.cached_jump_result(child_key).is_none() {
+                        let child_key = self.canonical_jump_key((child_node, next_exp)).0;
+                        if self
+                            .cached_jump_result((child_key.node, child_key.step_exp))
+                            .is_none()
+                        {
                             dependents.entry(child_key).or_default().push(parent_id);
                             tasks[parent_id].as_mut().unwrap().remaining += 1;
                             if !task_index.contains_key(&child_key) {
@@ -654,22 +953,31 @@ impl HashLifeEngine {
                     }
                 }
                 PendingTask::PhaseTwo { .. } => {
-                    let (pending_node, pending_exp) = task_key;
+                    let pending_node = task_key.node;
+                    let pending_exp = task_key.step_exp;
                     let PendingTask::PhaseTwo {
                         next_exp,
                         nw,
                         ne,
                         sw,
                         se,
-                    } = task.task else { unreachable!() };
-                    let q00 = self.jump_cache[&(nw, next_exp)];
-                    let q01 = self.jump_cache[&(ne, next_exp)];
-                    let q10 = self.jump_cache[&(sw, next_exp)];
-                    let q11 = self.jump_cache[&(se, next_exp)];
+                    } = task.task
+                    else {
+                        unreachable!()
+                    };
+                    let q00 = self.jump_result((nw, next_exp));
+                    let q01 = self.jump_result((ne, next_exp));
+                    let q10 = self.jump_result((sw, next_exp));
+                    let q11 = self.jump_result((se, next_exp));
                     let result = self.join(q00, q01, q10, q11);
                     let key = (pending_node, pending_exp);
-                    self.jump_cache.insert(key, result);
-                    notify_dependents(&key, &mut tasks, &mut dependents, &mut ready);
+                    self.insert_jump_result(key, result);
+                    notify_dependents(
+                        &self.canonical_jump_key(key).0,
+                        &mut tasks,
+                        &mut dependents,
+                        &mut ready,
+                    );
                     if ready.len() > self.stats.scheduler_ready_max {
                         self.stats.scheduler_ready_max = ready.len();
                     }
@@ -687,30 +995,35 @@ impl HashLifeEngine {
             );
         }
 
-        self.jump_cache[&(root_node, root_step_exp)]
+        self.jump_result((root_node, root_step_exp))
     }
 
     fn advance_one_generation_centered(&mut self, root_node: NodeId) -> NodeId {
         let root_key = (root_node, 0);
-        if self.jump_cache.contains_key(&root_key) {
+        if self.cached_jump_result(root_key).is_some() {
             self.stats.jump_cache_hits += 1;
-            return self.jump_cache[&root_key];
+            return self.jump_result(root_key);
         }
 
         let debug = hashlife_debug_enabled();
         let level = self.nodes[root_node as usize].level as usize;
         let task_capacity = 1usize << level.saturating_sub(1).min(10);
         let mut discover = Vec::with_capacity(task_capacity.max(8));
-        discover.push(root_node);
-        let mut task_index: HashMap<NodeId, usize> = HashMap::with_capacity(task_capacity);
+        discover.push(self.canonical_jump_key((root_node, 0)).0);
+        let mut task_index: HashMap<CanonicalJumpKey, usize> =
+            HashMap::with_capacity(task_capacity);
         let mut tasks = Vec::<Option<Step0TaskRecord>>::with_capacity(task_capacity);
-        let mut task_keys = Vec::<Option<NodeId>>::with_capacity(task_capacity);
-        let mut dependents: HashMap<NodeId, Vec<usize>> = HashMap::with_capacity(task_capacity);
+        let mut task_keys = Vec::<Option<CanonicalJumpKey>>::with_capacity(task_capacity);
+        let mut dependents: HashMap<CanonicalJumpKey, Vec<usize>> =
+            HashMap::with_capacity(task_capacity);
         let mut ready = Vec::<usize>::with_capacity(task_capacity);
-        let mut batch = [0_u64; DISCOVER_BATCH];
+        let mut batch = [CanonicalJumpKey {
+            node: 0,
+            step_exp: 0,
+        }; DISCOVER_BATCH];
         let mut iterations = 0_usize;
 
-        while !self.jump_cache.contains_key(&root_key) {
+        while self.cached_jump_result(root_key).is_none() {
             while !discover.is_empty() {
                 let mut batch_len = 0;
                 while batch_len < DISCOVER_BATCH {
@@ -720,15 +1033,19 @@ impl HashLifeEngine {
                     batch[batch_len] = entry;
                     batch_len += 1;
                 }
-                for &discovered_node in &batch[..batch_len] {
+                for &canonical_task in &batch[..batch_len] {
+                    let discovered_node = canonical_task.node;
                     iterations += 1;
-                    let cache_key = (discovered_node, 0);
-                    if self.cached_jump_result(cache_key).is_some() {
+                    let cache_key = canonical_task;
+                    if self
+                        .cached_jump_result((cache_key.node, cache_key.step_exp))
+                        .is_some()
+                    {
                         self.stats.jump_cache_hits += 1;
                         continue;
                     }
                     self.stats.jump_cache_misses += 1;
-                    if task_index.contains_key(&discovered_node) {
+                    if task_index.contains_key(&canonical_task) {
                         continue;
                     }
 
@@ -737,8 +1054,8 @@ impl HashLifeEngine {
 
                     if self.nodes[discovered_node as usize].population == 0 {
                         let result = self.empty(discovered_level - 1);
-                        self.jump_cache.insert(cache_key, result);
-                        notify_step0_dependents(discovered_node, &mut tasks, &mut dependents, &mut ready);
+                        self.insert_jump_result((cache_key.node, cache_key.step_exp), result);
+                        notify_step0_dependents(cache_key, &mut tasks, &mut dependents, &mut ready);
                         if ready.len() > self.stats.scheduler_ready_max {
                             self.stats.scheduler_ready_max = ready.len();
                         }
@@ -747,8 +1064,18 @@ impl HashLifeEngine {
 
                     if discovered_level == 2 {
                         let result = self.base_transition(discovered_node);
-                        self.jump_cache.insert(cache_key, result);
-                        notify_step0_dependents(discovered_node, &mut tasks, &mut dependents, &mut ready);
+                        self.insert_jump_result((cache_key.node, cache_key.step_exp), result);
+                        notify_step0_dependents(cache_key, &mut tasks, &mut dependents, &mut ready);
+                        if ready.len() > self.stats.scheduler_ready_max {
+                            self.stats.scheduler_ready_max = ready.len();
+                        }
+                        continue;
+                    }
+
+                    if discovered_level <= DENSE_SHORTCUT_MAX_LEVEL {
+                        let result = self.dense_advance_centered(discovered_node, 0);
+                        self.insert_jump_result((cache_key.node, cache_key.step_exp), result);
+                        notify_step0_dependents(cache_key, &mut tasks, &mut dependents, &mut ready);
                         if ready.len() > self.stats.scheduler_ready_max {
                             self.stats.scheduler_ready_max = ready.len();
                         }
@@ -775,16 +1102,32 @@ impl HashLifeEngine {
                     let next_lower_left = self.centered_subnode(lower_left);
                     let next_lower_center = self.centered_subnode(lower_center);
                     let next_lower_right = self.centered_subnode(lower_right);
-                    let combined_upper_left =
-                        self.join(next_upper_left, next_upper_center, next_middle_left, next_center);
-                    let combined_upper_right =
-                        self.join(next_upper_center, next_upper_right, next_center, next_middle_right);
-                    let combined_lower_left =
-                        self.join(next_middle_left, next_center, next_lower_left, next_lower_center);
-                    let combined_lower_right =
-                        self.join(next_center, next_middle_right, next_lower_center, next_lower_right);
+                    let combined_upper_left = self.join(
+                        next_upper_left,
+                        next_upper_center,
+                        next_middle_left,
+                        next_center,
+                    );
+                    let combined_upper_right = self.join(
+                        next_upper_center,
+                        next_upper_right,
+                        next_center,
+                        next_middle_right,
+                    );
+                    let combined_lower_left = self.join(
+                        next_middle_left,
+                        next_center,
+                        next_lower_left,
+                        next_lower_center,
+                    );
+                    let combined_lower_right = self.join(
+                        next_center,
+                        next_middle_right,
+                        next_lower_center,
+                        next_lower_right,
+                    );
                     let task_id = tasks.len();
-                    task_index.insert(discovered_node, task_id);
+                    task_index.insert(canonical_task, task_id);
                     tasks.push(Some(Step0TaskRecord {
                         remaining: 0,
                         children: [
@@ -794,7 +1137,7 @@ impl HashLifeEngine {
                             combined_lower_right,
                         ],
                     }));
-                    task_keys.push(Some(discovered_node));
+                    task_keys.push(Some(canonical_task));
                     self.stats.scheduler_tasks += 1;
 
                     for child_node in [
@@ -803,11 +1146,12 @@ impl HashLifeEngine {
                         combined_upper_right,
                         combined_upper_left,
                     ] {
+                        let child_key = self.canonical_jump_key((child_node, 0)).0;
                         if self.cached_jump_result((child_node, 0)).is_none() {
-                            dependents.entry(child_node).or_default().push(task_id);
+                            dependents.entry(child_key).or_default().push(task_id);
                             tasks[task_id].as_mut().unwrap().remaining += 1;
-                            if !task_index.contains_key(&child_node) {
-                                discover.push(child_node);
+                            if !task_index.contains_key(&child_key) {
+                                discover.push(child_key);
                             }
                         }
                     }
@@ -820,14 +1164,14 @@ impl HashLifeEngine {
                 }
             }
 
-            if self.jump_cache.contains_key(&root_key) {
+            if self.cached_jump_result(root_key).is_some() {
                 break;
             }
 
             let Some(task_id) = ready.pop() else {
-                let sample = task_index.iter().next().map(|(&pending_node, &task_id)| {
+                let sample = task_index.iter().next().map(|(&pending_key, &task_id)| {
                     let task = tasks[task_id].unwrap();
-                    (pending_node, task.remaining, task.children)
+                    (pending_key.node, task.remaining, task.children)
                 });
                 panic!(
                     "hashlife step-0 dependency resolution stalled root_node={root_node} pending={} ready={} cache={} sample={sample:?}",
@@ -836,20 +1180,20 @@ impl HashLifeEngine {
                     self.jump_cache.len(),
                 );
             };
-            let Some(task_node) = task_keys[task_id].take() else {
+            let Some(task_key) = task_keys[task_id].take() else {
                 continue;
             };
-            task_index.remove(&task_node);
+            task_index.remove(&task_key);
             let task = tasks[task_id].take().unwrap();
             debug_assert_eq!(task.remaining, 0);
             let [nw, ne, sw, se] = task.children;
-            let q00 = self.jump_cache[&(nw, 0)];
-            let q01 = self.jump_cache[&(ne, 0)];
-            let q10 = self.jump_cache[&(sw, 0)];
-            let q11 = self.jump_cache[&(se, 0)];
+            let q00 = self.jump_result((nw, 0));
+            let q01 = self.jump_result((ne, 0));
+            let q10 = self.jump_result((sw, 0));
+            let q11 = self.jump_result((se, 0));
             let result = self.join(q00, q01, q10, q11);
-            self.jump_cache.insert((task_node, 0), result);
-            notify_step0_dependents(task_node, &mut tasks, &mut dependents, &mut ready);
+            self.insert_jump_result((task_key.node, 0), result);
+            notify_step0_dependents(task_key, &mut tasks, &mut dependents, &mut ready);
             if ready.len() > self.stats.scheduler_ready_max {
                 self.stats.scheduler_ready_max = ready.len();
             }
@@ -864,16 +1208,17 @@ impl HashLifeEngine {
             );
         }
 
-        self.jump_cache[&root_key]
+        self.jump_result(root_key)
     }
 
     fn overlapping_subnodes(&mut self, node: NodeId) -> [NodeId; 9] {
-        if let Some(overlaps) = self.overlap_cache.get(&node) {
+        let (canonical_node, symmetry) = self.canonicalized_cache_node(node);
+        if let Some(&overlaps) = self.overlap_cache.get(&canonical_node) {
             self.stats.overlap_cache_hits += 1;
-            return *overlaps;
+            return symmetry.inverse().transform_overlap_nodes(self, overlaps);
         }
         self.stats.overlap_cache_misses += 1;
-        let node_ref = &self.nodes[node as usize];
+        let node_ref = &self.nodes[canonical_node as usize];
         let nw = node_ref.nw;
         let ne = node_ref.ne;
         let sw = node_ref.sw;
@@ -906,8 +1251,8 @@ impl HashLifeEngine {
             self.join(sw_ne, se_nw, sw_se, se_sw),
             se,
         ];
-        self.overlap_cache.insert(node, overlaps);
-        overlaps
+        self.overlap_cache.insert(canonical_node, overlaps);
+        symmetry.inverse().transform_overlap_nodes(self, overlaps)
     }
 
     fn centered_subnode(&mut self, node: NodeId) -> NodeId {
@@ -923,7 +1268,6 @@ impl HashLifeEngine {
         let se_nw = self.nodes[node_ref.se as usize].nw;
         self.join(nw_se, ne_sw, sw_ne, se_nw)
     }
-
 }
 
 fn max_hashlife_safe_jump(current: &BitGrid) -> u64 {
@@ -949,13 +1293,16 @@ fn required_root_size_for_jump(span: u64, jump: u64) -> u64 {
 }
 
 fn hashlife_debug_enabled() -> bool {
-    matches!(env::var("HASHLIFE_DEBUG").as_deref(), Ok("1") | Ok("true") | Ok("TRUE"))
+    matches!(
+        env::var("HASHLIFE_DEBUG").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
 }
 
 fn notify_dependents(
-    key: &(NodeId, u32),
+    key: &CanonicalJumpKey,
     tasks: &mut [Option<TaskRecord>],
-    dependents: &mut HashMap<(NodeId, u32), Vec<usize>>,
+    dependents: &mut HashMap<CanonicalJumpKey, Vec<usize>>,
     ready: &mut Vec<usize>,
 ) {
     if let Some(waiters) = dependents.remove(key) {
@@ -971,12 +1318,12 @@ fn notify_dependents(
 }
 
 fn notify_step0_dependents(
-    node: NodeId,
+    key: CanonicalJumpKey,
     tasks: &mut [Option<Step0TaskRecord>],
-    dependents: &mut HashMap<NodeId, Vec<usize>>,
+    dependents: &mut HashMap<CanonicalJumpKey, Vec<usize>>,
     ready: &mut Vec<usize>,
 ) {
-    if let Some(waiters) = dependents.remove(&node) {
+    if let Some(waiters) = dependents.remove(&key) {
         for waiter_id in waiters {
             if let Some(task) = tasks[waiter_id].as_mut() {
                 task.remaining -= 1;
@@ -1007,7 +1354,5 @@ fn quadrant_end(
     quadrant: u128,
 ) -> usize {
     let upper = quadrant + 1;
-    start
-        + cells[start..end]
-            .partition_point(|cell| ((cell.key >> bit_shift) & 0b11) < upper)
+    start + cells[start..end].partition_point(|cell| ((cell.key >> bit_shift) & 0b11) < upper)
 }

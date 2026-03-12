@@ -51,26 +51,31 @@ impl BitGrid {
         self.population
     }
 
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.population == 0
     }
 
     pub fn get(&self, x: Coord, y: Coord) -> bool {
         let (chunk, bit) = chunk_and_bit(x, y);
-        self.chunks
-            .get(&chunk)
-            .map(|chunk| (chunk.bits & (1_u64 << bit)) != 0)
-            .unwrap_or(false)
+        if let Some(chunk) = self.chunks.get(&chunk) {
+            (chunk.bits & (1_u64 << bit)) != 0
+        } else {
+            false
+        }
     }
 
     pub fn set(&mut self, x: Coord, y: Coord, alive: bool) {
         let (chunk, bit) = chunk_and_bit(x, y);
         let mask = 1_u64 << bit;
-        let current = self
-            .chunks
-            .get(&chunk)
-            .map(|chunk| (chunk.bits & mask) != 0)
-            .unwrap_or(false);
+        let current = if let Some(chunk) = self.chunks.get(&chunk) {
+            (chunk.bits & mask) != 0
+        } else {
+            false
+        };
 
         if current == alive {
             return;
@@ -105,26 +110,43 @@ impl BitGrid {
     }
 
     pub fn bounds(&self) -> Option<Bounds> {
-        let mut iter = self.live_cells().into_iter();
-        let (mut min_x, mut min_y) = iter.next()?;
-        let mut max_x = min_x;
-        let mut max_y = min_y;
+        let mut found = false;
+        let mut min_x = 0;
+        let mut min_y = 0;
+        let mut max_x = 0;
+        let mut max_y = 0;
 
-        for (x, y) in iter {
-            min_x = min_x.min(x);
-            min_y = min_y.min(y);
-            max_x = max_x.max(x);
-            max_y = max_y.max(y);
+        for (&(cx, cy), chunk) in &self.chunks {
+            let mut remaining = chunk.bits;
+            while remaining != 0 {
+                let bit = remaining.trailing_zeros() as Coord;
+                let x = cx * CHUNK_SIZE + (bit % CHUNK_SIZE);
+                let y = cy * CHUNK_SIZE + (bit / CHUNK_SIZE);
+                if !found {
+                    min_x = x;
+                    min_y = y;
+                    max_x = x;
+                    max_y = y;
+                    found = true;
+                } else {
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+                remaining &= remaining - 1;
+            }
         }
 
-        Some((min_x, min_y, max_x, max_y))
+        found.then_some((min_x, min_y, max_x, max_y))
     }
 
     pub(crate) fn chunk_bits(&self, cx: Coord, cy: Coord) -> u64 {
-        self.chunks
-            .get(&(cx, cy))
-            .map(|chunk| chunk.bits)
-            .unwrap_or(0)
+        if let Some(chunk) = self.chunks.get(&(cx, cy)) {
+            chunk.bits
+        } else {
+            0
+        }
     }
 
     pub(crate) fn chunk_coords(&self) -> Vec<Cell> {
@@ -146,6 +168,15 @@ impl BitGrid {
         self.population += bits.count_ones() as usize;
         self.chunks.insert((cx, cy), Chunk { bits });
     }
+
+    pub(crate) fn from_chunk_bits_map(chunks: HashMap<Cell, u64>) -> Self {
+        let population = chunks.values().map(|bits| bits.count_ones() as usize).sum();
+        let chunks = chunks
+            .into_iter()
+            .filter_map(|(coord, bits)| (bits != 0).then_some((coord, Chunk { bits })))
+            .collect();
+        Self { chunks, population }
+    }
 }
 
 impl Default for BitGrid {
@@ -163,4 +194,50 @@ fn chunk_and_bit(x: Coord, y: Coord) -> (Cell, u32) {
         (cx, cy),
         u32::try_from(ly * CHUNK_SIZE + lx).expect("chunk bit index exceeded u32"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BitGrid, Cell};
+    use std::collections::HashMap;
+
+    #[test]
+    fn from_chunk_bits_map_matches_cell_construction() {
+        let cells: Vec<Cell> = vec![
+            (-9, -1),
+            (-8, -1),
+            (0, 0),
+            (1, 0),
+            (7, 7),
+            (8, 8),
+            (15, 15),
+            (16, 0),
+        ];
+        let expected = BitGrid::from_cells(&cells);
+
+        let mut chunks = HashMap::new();
+        for &(x, y) in &cells {
+            let cx = x.div_euclid(super::CHUNK_SIZE);
+            let cy = y.div_euclid(super::CHUNK_SIZE);
+            let lx = x.rem_euclid(super::CHUNK_SIZE);
+            let ly = y.rem_euclid(super::CHUNK_SIZE);
+            let bit = u32::try_from(ly * super::CHUNK_SIZE + lx).unwrap();
+            *chunks.entry((cx, cy)).or_insert(0_u64) |= 1_u64 << bit;
+        }
+
+        let actual = BitGrid::from_chunk_bits_map(chunks);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn from_chunk_bits_map_drops_zero_chunks() {
+        let mut chunks = HashMap::new();
+        chunks.insert((0, 0), 0_u64);
+        chunks.insert((1, 1), 1_u64);
+
+        let grid = BitGrid::from_chunk_bits_map(chunks);
+        assert_eq!(grid.chunk_count(), 1);
+        assert_eq!(grid.population(), 1);
+        assert!(grid.get(8, 8));
+    }
 }
