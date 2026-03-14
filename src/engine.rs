@@ -195,8 +195,7 @@ impl SimulationSession {
                         }
                         let cycle_count =
                             Coord::try_from(skip_cycles).expect("simd repeat skip exceeded Coord");
-                        current = translate_grid(
-                            &current,
+                        current = current.translated(
                             dx.checked_mul(cycle_count).expect("simd repeat x overflow"),
                             dy.checked_mul(cycle_count).expect("simd repeat y overflow"),
                         );
@@ -316,16 +315,4 @@ pub fn should_use_exact_simd_repeat_skip(grid: &BitGrid, generations: u64) -> bo
         select_backend(grid, generations),
         SimulationBackend::SimdChunk
     )
-}
-
-fn translate_grid(grid: &BitGrid, dx: Coord, dy: Coord) -> BitGrid {
-    let live_cells = grid.live_cells();
-    let mut translated = Vec::with_capacity(live_cells.len());
-    for (x, y) in live_cells {
-        translated.push((
-            x.checked_add(dx).expect("simd translated grid x overflow"),
-            y.checked_add(dy).expect("simd translated grid y overflow"),
-        ));
-    }
-    BitGrid::from_cells(&translated)
 }

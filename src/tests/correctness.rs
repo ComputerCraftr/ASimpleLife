@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::bitgrid::{BitGrid, Cell, Coord};
 use crate::classify::{Classification, ClassificationLimits, classify_seed};
-use crate::generators::{mix_seed, pattern_by_name, random_soup};
+use crate::generators::{pattern_by_name, random_soup};
+use crate::hashing::{SPLITMIX64_GAMMA, mix_seed};
 use crate::life::{ChunkDiff, GameOfLife, step_grid, step_grid_with_changes_and_memo};
 use crate::memo::Memo;
 use crate::normalize::normalize;
@@ -228,7 +229,7 @@ fn rpentomino_survives_short_horizon() {
 #[test]
 fn bounded_iid_soup_reaches_repeat_before_extended_limit() {
     let seed =
-        mix_seed(((16_u64) ^ ((30_u64) << 16) ^ (2_u64 << 32)).wrapping_add(0x9E3779B97F4A7C15));
+        mix_seed(((16_u64) ^ ((30_u64) << 16) ^ (2_u64 << 32)).wrapping_add(SPLITMIX64_GAMMA));
     let grid = random_soup(16, 16, 30, seed);
     let limits = ClassificationLimits {
         max_generations: 256,
@@ -755,7 +756,7 @@ fn clustered_noise_soup(width: Coord, height: Coord, fill_percent: u32, seed: u6
 
 fn structured_random_soup(width: Coord, height: Coord, seed: u64) -> BitGrid {
     let left = random_soup(width / 2, height, 18, seed);
-    let right = random_soup(width / 2, height, 12, seed ^ 0x9E3779B97F4A7C15);
+    let right = random_soup(width / 2, height, 12, seed ^ SPLITMIX64_GAMMA);
     let mut cells = left.live_cells();
     cells.extend(
         right
@@ -781,7 +782,7 @@ fn structured_random_soup(width: Coord, height: Coord, seed: u64) -> BitGrid {
 }
 
 fn hash_seed(a: Coord, b: u32, c: u64) -> u64 {
-    mix_seed(((a as u64) ^ ((b as u64) << 16) ^ (c << 32)).wrapping_add(0x9E3779B97F4A7C15))
+    mix_seed(((a as u64) ^ ((b as u64) << 16) ^ (c << 32)).wrapping_add(SPLITMIX64_GAMMA))
 }
 
 pub(super) fn reference_classify(seed: &BitGrid, limits: &ClassificationLimits) -> Classification {

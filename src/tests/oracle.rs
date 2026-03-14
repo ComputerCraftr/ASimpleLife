@@ -60,7 +60,7 @@ fn simulation_session_segmented_matches_single_call() {
 #[test]
 fn oracle_session_uses_exact_repeat_to_reach_target() {
     let grid = pattern_by_name("block").unwrap();
-    let target = 1_000_000_u64;
+    let target = 10_000_000_u64;
     let mut simulation = SimulationSession::new();
     let outcome = OracleSession::new(grid.clone(), 0, Default::default(), &mut simulation)
         .advance_to_target(target, None);

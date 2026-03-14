@@ -1,5 +1,3 @@
-#[cfg(test)]
-use super::HashLifeRuntimeStats;
 use super::{
     GridExtractionError, GridExtractionPolicy, HashLifeCheckpoint, HashLifeEngine, NodeId,
 };
@@ -74,7 +72,7 @@ impl HashLifeSession {
 
     pub fn population(&self) -> Option<u64> {
         self.current_root
-            .map(|root| self.engine.nodes[root as usize].population)
+            .map(|root| self.engine.node_columns.population(root))
     }
 
     pub fn origin(&self) -> Option<(Coord, Coord)> {
@@ -121,7 +119,7 @@ impl HashLifeSession {
             let root = self
                 .current_root
                 .expect("hashlife session root disappeared");
-            let level = self.engine.nodes[root as usize].level;
+            let level = self.engine.node_columns.level(root);
             let step_exp = desired_step_exp.min(level.saturating_sub(2));
             let step = 1_u64 << step_exp;
             let root_size = 1_i64 << level;
@@ -150,7 +148,7 @@ impl HashLifeSession {
         };
 
         loop {
-            let level = self.engine.nodes[root as usize].level;
+            let level = self.engine.node_columns.level(root);
             let needs_expansion = !self.root_is_centered || level < desired_step_exp + 2;
             if !needs_expansion {
                 break;
@@ -163,8 +161,8 @@ impl HashLifeSession {
     }
 
     fn center_expand_root(&mut self, root: NodeId) -> NodeId {
-        let node = self.engine.nodes[root as usize];
-        if node.level == 0 {
+        let level = self.engine.node_columns.level(root);
+        if level == 0 {
             let empty = self.engine.dead_leaf;
             let nw = self.engine.join(empty, empty, empty, root);
             let ne = self.engine.join(empty, empty, empty, empty);
@@ -181,12 +179,13 @@ impl HashLifeSession {
             return self.engine.join(nw, ne, sw, se);
         }
 
-        let empty = self.engine.empty(node.level - 1);
-        let upper_left = self.engine.join(empty, empty, empty, node.nw);
-        let upper_right = self.engine.join(empty, empty, node.ne, empty);
-        let lower_left = self.engine.join(empty, node.sw, empty, empty);
-        let lower_right = self.engine.join(node.se, empty, empty, empty);
-        let child_size = 1_i64 << (node.level - 1);
+        let empty = self.engine.empty(level - 1);
+        let [node_nw, node_ne, node_sw, node_se] = self.engine.node_columns.quadrants(root);
+        let upper_left = self.engine.join(empty, empty, empty, node_nw);
+        let upper_right = self.engine.join(empty, empty, node_ne, empty);
+        let lower_left = self.engine.join(empty, node_sw, empty, empty);
+        let lower_right = self.engine.join(node_se, empty, empty, empty);
+        let child_size = 1_i64 << (level - 1);
         self.current_origin_x = self
             .current_origin_x
             .checked_sub(child_size)
@@ -259,12 +258,6 @@ impl HashLifeSession {
         self.root_is_centered = false;
         self.sampled_bounds = None;
         self.sampled_checkpoint = None;
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn runtime_stats(&self) -> HashLifeRuntimeStats {
-        self.engine.runtime_stats()
     }
 
     #[cfg(test)]

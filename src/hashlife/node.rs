@@ -1,6 +1,7 @@
 use super::{
     GridExtractionError, GridExtractionPolicy, HashLifeCheckpoint, HashLifeCheckpointSignature,
-    HashLifeEngine, Node, NodeId, NodeKey, base_transitions,
+    HASHLIFE_CHECKPOINT_MAX_BOUNDS_SPAN, HASHLIFE_CHECKPOINT_MAX_POPULATION, HashLifeEngine,
+    NodeId, PackedNodeKey, base_transitions,
 };
 use crate::bitgrid::{BitGrid, CHUNK_SIZE, Cell, Coord};
 use crate::life::step_grid_with_changes_and_memo;
@@ -9,7 +10,7 @@ use std::collections::HashMap;
 
 impl HashLifeEngine {
     pub(super) fn dense_advance_centered(&mut self, node: NodeId, step_exp: u32) -> NodeId {
-        let level = self.nodes[node as usize].level;
+        let level = self.node_columns.level(node);
         debug_assert!(level >= 2);
         let size = 1_i64 << level;
         let result_size = size / 2;
@@ -44,11 +45,11 @@ impl HashLifeEngine {
     }
 
     pub(super) fn base_transition(&mut self, node: NodeId) -> NodeId {
-        let node_ref = &self.nodes[node as usize];
-        let mask = self.level1_to_4x4_mask(node_ref.nw, 0, 0)
-            | self.level1_to_4x4_mask(node_ref.ne, 2, 0)
-            | self.level1_to_4x4_mask(node_ref.sw, 0, 2)
-            | self.level1_to_4x4_mask(node_ref.se, 2, 2);
+        let [nw_node, ne_node, sw_node, se_node] = self.node_columns.quadrants(node);
+        let mask = self.level1_to_4x4_mask(nw_node, 0, 0)
+            | self.level1_to_4x4_mask(ne_node, 2, 0)
+            | self.level1_to_4x4_mask(sw_node, 0, 2)
+            | self.level1_to_4x4_mask(se_node, 2, 2);
         let centered = base_transitions()[mask as usize];
         let leaves = [self.dead_leaf, self.live_leaf];
         let nw = leaves[(centered & 0b0001 != 0) as usize];
@@ -59,14 +60,14 @@ impl HashLifeEngine {
     }
 
     fn level1_to_4x4_mask(&self, node: NodeId, base_x: u16, base_y: u16) -> u16 {
-        let node_ref = &self.nodes[node as usize];
-        debug_assert_eq!(node_ref.level, 1);
-        (u16::from(self.nodes[node_ref.nw as usize].population != 0) << (base_y * 4 + base_x))
-            | (u16::from(self.nodes[node_ref.ne as usize].population != 0)
+        let [nw, ne, sw, se] = self.node_columns.quadrants(node);
+        debug_assert_eq!(self.node_columns.level(node), 1);
+        (u16::from(self.node_columns.population(nw) != 0) << (base_y * 4 + base_x))
+            | (u16::from(self.node_columns.population(ne) != 0)
                 << (base_y * 4 + base_x + 1))
-            | (u16::from(self.nodes[node_ref.sw as usize].population != 0)
+            | (u16::from(self.node_columns.population(sw) != 0)
                 << ((base_y + 1) * 4 + base_x))
-            | (u16::from(self.nodes[node_ref.se as usize].population != 0)
+            | (u16::from(self.node_columns.population(se) != 0)
                 << ((base_y + 1) * 4 + base_x + 1))
     }
 
@@ -77,7 +78,7 @@ impl HashLifeEngine {
         offset_y: Coord,
         policy: GridExtractionPolicy,
     ) -> Result<BitGrid, GridExtractionError> {
-        let size = 1_i64 << self.nodes[node as usize].level;
+        let size = 1_i64 << self.node_columns.level(node);
         let limits = extraction_limits(self, node, offset_x, offset_y, policy)?;
         let mut chunks = HashMap::new();
         self.collect_chunks_iterative(
@@ -98,7 +99,7 @@ impl HashLifeEngine {
         offset_y: Coord,
         clip_bounds: (Coord, Coord, Coord, Coord),
     ) -> BitGrid {
-        let size = 1_i64 << self.nodes[node as usize].level;
+        let size = 1_i64 << self.node_columns.level(node);
         let mut chunks = HashMap::new();
         self.collect_chunks_iterative(
             node,
@@ -118,12 +119,12 @@ impl HashLifeEngine {
         origin_x: Coord,
         origin_y: Coord,
     ) -> Option<(Coord, Coord, Coord, Coord)> {
-        if self.nodes[node as usize].population == 0 {
+        if self.node_columns.population(node) == 0 {
             return None;
         }
 
-        let mut stack = Vec::with_capacity(self.nodes[node as usize].level as usize + 1);
-        let size = 1_i64 << self.nodes[node as usize].level;
+        let mut stack = Vec::with_capacity(self.node_columns.level(node) as usize + 1);
+        let size = 1_i64 << self.node_columns.level(node);
         stack.push((node, origin_x, origin_y, size));
         let mut min_x = Coord::MAX;
         let mut min_y = Coord::MAX;
@@ -131,11 +132,11 @@ impl HashLifeEngine {
         let mut max_y = Coord::MIN;
 
         while let Some((node, origin_x, origin_y, size)) = stack.pop() {
-            let node_ref = &self.nodes[node as usize];
-            if node_ref.population == 0 {
+            let level = self.node_columns.level(node);
+            if self.node_columns.population(node) == 0 {
                 continue;
             }
-            if node_ref.level == 0 {
+            if level == 0 {
                 min_x = min_x.min(origin_x);
                 min_y = min_y.min(origin_y);
                 max_x = max_x.max(origin_x);
@@ -144,10 +145,11 @@ impl HashLifeEngine {
             }
 
             let half = size / 2;
-            stack.push((node_ref.se, origin_x + half, origin_y + half, half));
-            stack.push((node_ref.sw, origin_x, origin_y + half, half));
-            stack.push((node_ref.ne, origin_x + half, origin_y, half));
-            stack.push((node_ref.nw, origin_x, origin_y, half));
+            let [nw, ne, sw, se] = self.node_columns.quadrants(node);
+            stack.push((se, origin_x + half, origin_y + half, half));
+            stack.push((sw, origin_x, origin_y + half, half));
+            stack.push((ne, origin_x + half, origin_y, half));
+            stack.push((nw, origin_x, origin_y, half));
         }
 
         (min_x != Coord::MAX).then_some((min_x, min_y, max_x, max_y))
@@ -164,11 +166,13 @@ impl HashLifeEngine {
         let (min_x, min_y, max_x, max_y) = bounds;
         let width = max_x - min_x + 1;
         let height = max_y - min_y + 1;
-        let population = self.nodes[node as usize].population;
-        if population > 250_000 || width.max(height) > 65_536 {
+        let population = self.node_columns.population(node);
+        if population > HASHLIFE_CHECKPOINT_MAX_POPULATION
+            || width.max(height) > HASHLIFE_CHECKPOINT_MAX_BOUNDS_SPAN
+        {
             return None;
         }
-        let size = 1_i64 << self.nodes[node as usize].level;
+        let size = 1_i64 << self.node_columns.level(node);
         let mut cells = Vec::with_capacity(
             usize::try_from(population).expect("hashlife population exceeded usize"),
         );
@@ -203,11 +207,11 @@ impl HashLifeEngine {
         out: &mut HashMap<Cell, u64>,
     ) -> Result<(), GridExtractionError> {
         let (clip_min_x, clip_min_y, clip_max_x, clip_max_y) = clip_bounds;
-        let mut stack = Vec::with_capacity(self.nodes[node as usize].level as usize + 1);
+        let mut stack = Vec::with_capacity(self.node_columns.level(node) as usize + 1);
         stack.push((node, origin.0, origin.1, size));
         while let Some((node, origin_x, origin_y, size)) = stack.pop() {
-            let node_ref = &self.nodes[node as usize];
-            if node_ref.population == 0 {
+            let level = self.node_columns.level(node);
+            if self.node_columns.population(node) == 0 {
                 continue;
             }
 
@@ -221,7 +225,7 @@ impl HashLifeEngine {
                 continue;
             }
 
-            if node_ref.level == 0 {
+            if level == 0 {
                 let cx = origin_x.div_euclid(CHUNK_SIZE);
                 let cy = origin_y.div_euclid(CHUNK_SIZE);
                 let lx = origin_x.rem_euclid(CHUNK_SIZE);
@@ -244,10 +248,11 @@ impl HashLifeEngine {
             }
 
             let half = size / 2;
-            stack.push((node_ref.se, origin_x + half, origin_y + half, half));
-            stack.push((node_ref.sw, origin_x, origin_y + half, half));
-            stack.push((node_ref.ne, origin_x + half, origin_y, half));
-            stack.push((node_ref.nw, origin_x, origin_y, half));
+            let [nw, ne, sw, se] = self.node_columns.quadrants(node);
+            stack.push((se, origin_x + half, origin_y + half, half));
+            stack.push((sw, origin_x, origin_y + half, half));
+            stack.push((ne, origin_x + half, origin_y, half));
+            stack.push((nw, origin_x, origin_y, half));
         }
         Ok(())
     }
@@ -260,23 +265,24 @@ impl HashLifeEngine {
         size: Coord,
         out: &mut Vec<Cell>,
     ) {
-        let mut stack = Vec::with_capacity(self.nodes[node as usize].level as usize + 1);
+        let mut stack = Vec::with_capacity(self.node_columns.level(node) as usize + 1);
         stack.push((node, origin_x, origin_y, size));
         while let Some((node, origin_x, origin_y, size)) = stack.pop() {
-            let node_ref = &self.nodes[node as usize];
-            if node_ref.population == 0 {
+            let level = self.node_columns.level(node);
+            if self.node_columns.population(node) == 0 {
                 continue;
             }
-            if node_ref.level == 0 {
+            if level == 0 {
                 out.push((origin_x, origin_y));
                 continue;
             }
 
             let half = size / 2;
-            stack.push((node_ref.se, origin_x + half, origin_y + half, half));
-            stack.push((node_ref.sw, origin_x, origin_y + half, half));
-            stack.push((node_ref.ne, origin_x + half, origin_y, half));
-            stack.push((node_ref.nw, origin_x, origin_y, half));
+            let [nw, ne, sw, se] = self.node_columns.quadrants(node);
+            stack.push((se, origin_x + half, origin_y + half, half));
+            stack.push((sw, origin_x, origin_y + half, half));
+            stack.push((ne, origin_x + half, origin_y, half));
+            stack.push((nw, origin_x, origin_y, half));
         }
     }
 
@@ -290,51 +296,30 @@ impl HashLifeEngine {
     }
 
     pub(super) fn join(&mut self, nw: NodeId, ne: NodeId, sw: NodeId, se: NodeId) -> NodeId {
-        let level = self.nodes[nw as usize].level + 1;
-        let key = NodeKey::Internal {
-            level,
-            nw,
-            ne,
-            sw,
-            se,
-        };
-        if let Some(&existing) = self.intern.get(&key) {
+        let level = self.node_columns.level(nw) + 1;
+        let key = PackedNodeKey::new(level, [nw, ne, sw, se]);
+        if let Some(existing) = self.intern.get(&key) {
             return existing;
         }
 
-        let population = self.nodes[nw as usize].population
-            + self.nodes[ne as usize].population
-            + self.nodes[sw as usize].population
-            + self.nodes[se as usize].population;
+        let population = self.node_columns.population(nw)
+            + self.node_columns.population(ne)
+            + self.node_columns.population(sw)
+            + self.node_columns.population(se);
 
-        let node_id = self.nodes.len() as NodeId;
-        self.nodes.push(Node {
-            level,
-            population,
-            nw,
-            ne,
-            sw,
-            se,
-        });
+        let node_id = self.push_node(level, population, nw, ne, sw, se);
         self.intern.insert(key, node_id);
         node_id
     }
 
     pub(super) fn intern_leaf(&mut self, alive: bool) -> NodeId {
-        let key = NodeKey::Leaf(alive);
-        if let Some(&existing) = self.intern.get(&key) {
+        let key = HashLifeEngine::packed_leaf_key(alive);
+        if let Some(existing) = self.intern.get(&key) {
             return existing;
         }
 
-        let node_id = self.nodes.len() as NodeId;
-        self.nodes.push(Node {
-            level: 0,
-            population: u64::from(alive),
-            nw: node_id,
-            ne: node_id,
-            sw: node_id,
-            se: node_id,
-        });
+        let node_id = self.node_count() as NodeId;
+        let node_id = self.push_node(0, u64::from(alive), node_id, node_id, node_id, node_id);
         self.intern.insert(key, node_id);
         node_id
     }
@@ -371,7 +356,7 @@ fn extraction_limits(
             max_chunks,
             max_bounds_span,
         } => {
-            let population = engine.nodes[node as usize].population;
+            let population = engine.node_columns.population(node);
             if population == 0 {
                 return Ok(ExtractionLimits {
                     clip_bounds: (0, 0, -1, -1),

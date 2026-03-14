@@ -8,7 +8,9 @@ use a_simple_life::bitgrid::{BitGrid, Coord};
 use a_simple_life::classify::{ClassificationLimits, classify_seed};
 use a_simple_life::cli;
 use a_simple_life::engine::{SimulationSession, should_use_exact_simd_repeat_skip};
-use a_simple_life::hashlife::GridExtractionPolicy;
+use a_simple_life::hashlife::{
+    GridExtractionPolicy, HASHLIFE_FULL_GRID_MAX_CHUNKS, HASHLIFE_FULL_GRID_MAX_POPULATION,
+};
 use a_simple_life::life::GameOfLife;
 use a_simple_life::memo::Memo;
 use a_simple_life::oracle::OracleSession;
@@ -219,8 +221,8 @@ fn main() {
 
 fn interactive_full_grid_policy() -> GridExtractionPolicy {
     GridExtractionPolicy::FullGridIfUnder {
-        max_population: 250_000,
-        max_chunks: 100_000,
+        max_population: HASHLIFE_FULL_GRID_MAX_POPULATION,
+        max_chunks: HASHLIFE_FULL_GRID_MAX_CHUNKS,
         max_bounds_span: i64::MAX,
     }
 }

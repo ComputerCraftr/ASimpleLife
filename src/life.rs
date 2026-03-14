@@ -1,10 +1,12 @@
-use std::collections::HashSet;
-
 use bytemuck::{must_cast, must_cast_mut, must_cast_ref};
-use wide::{i8x16, u8x16, u16x8, u16x16, u16x32, u64x8};
+use wide::{i8x16, u16x8, u16x32, u64x8};
 
-use crate::bitgrid::{BitGrid, CHUNK_SIZE, Cell, Coord};
-use crate::memo::{ChunkNeighborhood, Memo};
+use crate::bitgrid::{BitGrid, Cell, Coord, append_live_bits_as_cells};
+use crate::memo::{ChunkNeighborhood, ChunkTransitionMemoIntent, Memo};
+use crate::simd_layout::{
+    AlignedU16LaneChunkRows9, SIMD_BATCH_LANES, transpose_chunk_row_staging9,
+    widen_u64_pair_to_u16_rows, widen_u64_quad_to_u16_rows,
+};
 
 const ROW_LOW_BYTE_MASK: u16x8 = u16x8::splat(0x00FF);
 const ROW_BLOCK_LOW_BYTE_MASK: u16x32 = u16x32::splat(0x00FF);
@@ -12,15 +14,86 @@ const SHIFT_ROWS_DOWN_BYTES: i8x16 =
     i8x16::new([-1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
 const SHIFT_ROWS_UP_BYTES: i8x16 =
     i8x16::new([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, -1, -1]);
-
-type ChunkRowBatch = [u16x32; 2];
-type ChunkRowView = [u16x8; 8];
+const CHUNK_NEIGHBORHOOD_OFFSETS_3X3: [(Coord, Coord); 9] = [
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+    (-1, 0),
+    (0, 0),
+    (1, 0),
+    (-1, 1),
+    (0, 1),
+    (1, 1),
+];
+const EMPTY_CHUNK_NEIGHBORHOOD: ChunkNeighborhood = ChunkNeighborhood([0; 9]);
+const EMPTY_MEMO_INTENT: ChunkTransitionMemoIntent = ChunkTransitionMemoIntent {
+    canonical: EMPTY_CHUNK_NEIGHBORHOOD,
+    symmetry: crate::symmetry::D4Symmetry::Identity,
+};
 
 struct DiagonalSpec {
     edge_row: usize,
     edge_col: usize,
     shift_cols: i32,
     shift_rows: i32,
+}
+
+#[derive(Clone, Copy)]
+struct PendingChunkBatch {
+    len: usize,
+    cx: [Coord; SIMD_BATCH_LANES],
+    cy: [Coord; SIMD_BATCH_LANES],
+    current_bits: [u64; SIMD_BATCH_LANES],
+    neighborhoods: [ChunkNeighborhood; SIMD_BATCH_LANES],
+    memo_intents: [ChunkTransitionMemoIntent; SIMD_BATCH_LANES],
+}
+
+#[derive(Clone, Copy)]
+struct StagedNeighborhoodBatch {
+    _words: [[u64; SIMD_BATCH_LANES]; 9],
+    neighborhoods: [ChunkNeighborhood; SIMD_BATCH_LANES],
+}
+
+impl PendingChunkBatch {
+    fn new() -> Self {
+        Self {
+            len: 0,
+            cx: [0; SIMD_BATCH_LANES],
+            cy: [0; SIMD_BATCH_LANES],
+            current_bits: [0; SIMD_BATCH_LANES],
+            neighborhoods: [EMPTY_CHUNK_NEIGHBORHOOD; SIMD_BATCH_LANES],
+            memo_intents: [EMPTY_MEMO_INTENT; SIMD_BATCH_LANES],
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn is_full(&self) -> bool {
+        self.len == SIMD_BATCH_LANES
+    }
+
+    fn push(
+        &mut self,
+        cx: Coord,
+        cy: Coord,
+        current_bits: u64,
+        neighborhood: ChunkNeighborhood,
+        memo_intent: ChunkTransitionMemoIntent,
+    ) {
+        let lane = self.len;
+        self.cx[lane] = cx;
+        self.cy[lane] = cy;
+        self.current_bits[lane] = current_bits;
+        self.neighborhoods[lane] = neighborhood;
+        self.memo_intents[lane] = memo_intent;
+        self.len += 1;
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
 }
 
 impl DiagonalSpec {
@@ -111,19 +184,35 @@ pub fn step_grid_with_chunk_changes_and_memo(
     let target_chunks = collect_target_chunks(grid);
     let mut next = BitGrid::with_chunk_capacity(target_chunks.len());
     let mut changed = Vec::new();
-    let mut pending = Vec::with_capacity(8);
+    let mut pending = PendingChunkBatch::new();
+    let mut target_index = 0;
 
-    for (cx, cy) in target_chunks {
-        let neighborhood = build_neighborhood(grid, cx, cy);
-        let current_bits = grid.chunk_bits(cx, cy);
-        if let Some(next_bits) = memo.get_chunk_transition(&neighborhood) {
-            apply_chunk_step(&mut next, &mut changed, cx, cy, current_bits, next_bits);
-        } else {
-            pending.push((cx, cy, current_bits, neighborhood));
-            if pending.len() == 8 {
-                flush_pending_chunks(&mut pending, memo, &mut next, &mut changed);
+    while target_index < target_chunks.len() {
+        let batch_end = (target_index + SIMD_BATCH_LANES).min(target_chunks.len());
+        let staged = gather_neighborhoods_staged(grid, &target_chunks[target_index..batch_end]);
+        let probe = memo.canonicalize_and_probe_chunk_transitions_staged(
+            &staged.neighborhoods,
+            batch_end - target_index,
+        );
+        for (offset, &(cx, cy)) in target_chunks[target_index..batch_end].iter().enumerate() {
+            let current_bits = grid.chunk_bits(cx, cy);
+            if let Some(next_bits) = probe.hits[offset] {
+                apply_chunk_step(&mut next, &mut changed, cx, cy, current_bits, next_bits);
+            } else {
+                pending.push(
+                    cx,
+                    cy,
+                    current_bits,
+                    staged.neighborhoods[offset],
+                    probe.miss_intents[offset]
+                        .expect("memo probe miss lanes must carry canonicalized insert intent"),
+                );
+                if pending.is_full() {
+                    flush_pending_chunks(&mut pending, memo, &mut next, &mut changed);
+                }
             }
         }
+        target_index = batch_end;
     }
     flush_pending_chunks(&mut pending, memo, &mut next, &mut changed);
 
@@ -131,7 +220,7 @@ pub fn step_grid_with_chunk_changes_and_memo(
 }
 
 fn flush_pending_chunks(
-    pending: &mut Vec<(Coord, Coord, u64, ChunkNeighborhood)>,
+    pending: &mut PendingChunkBatch,
     memo: &mut Memo,
     next: &mut BitGrid,
     changed: &mut Vec<ChunkDiff>,
@@ -142,12 +231,89 @@ fn flush_pending_chunks(
 
     let next_bits = evolve_center_chunks_bitwise_batch_from_pending(pending);
 
-    for ((cx, cy, current_bits, neighborhood), next_bits) in
-        pending.drain(..).zip(next_bits.into_iter())
-    {
-        memo.insert_chunk_transition(neighborhood, next_bits);
+    for lane in 0..pending.len {
+        let cx = pending.cx[lane];
+        let cy = pending.cy[lane];
+        let current_bits = pending.current_bits[lane];
+        let next_bits = next_bits[lane];
+        memo.insert_chunk_transition_from_intent(pending.memo_intents[lane], next_bits);
         apply_chunk_step(next, changed, cx, cy, current_bits, next_bits);
     }
+    pending.clear();
+}
+
+// Neighborhood collection
+fn collect_target_chunks(grid: &BitGrid) -> Vec<Cell> {
+    let chunk_coords = grid.chunk_coords();
+    let mut targets = Vec::with_capacity(chunk_coords.len().saturating_mul(9));
+    for (cx, cy) in chunk_coords {
+        targets.push((cx - 1, cy - 1));
+        targets.push((cx, cy - 1));
+        targets.push((cx + 1, cy - 1));
+        targets.push((cx - 1, cy));
+        targets.push((cx, cy));
+        targets.push((cx + 1, cy));
+        targets.push((cx - 1, cy + 1));
+        targets.push((cx, cy + 1));
+        targets.push((cx + 1, cy + 1));
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+}
+
+fn gather_neighborhood_words_9xn(
+    grid: &BitGrid,
+    targets: &[Cell],
+) -> [[u64; SIMD_BATCH_LANES]; 9] {
+    let mut words = [[0_u64; SIMD_BATCH_LANES]; 9];
+    for (word, (dx, dy)) in CHUNK_NEIGHBORHOOD_OFFSETS_3X3.into_iter().enumerate() {
+        for (lane, &(cx, cy)) in targets.iter().enumerate() {
+            words[word][lane] = grid.chunk_bits(cx + dx, cy + dy);
+        }
+    }
+    words
+}
+
+fn transpose_words_9xn_to_neighborhoods(
+    words: &[[u64; SIMD_BATCH_LANES]; 9],
+    active_lanes: usize,
+) -> [ChunkNeighborhood; SIMD_BATCH_LANES] {
+    let mut neighborhoods = [EMPTY_CHUNK_NEIGHBORHOOD; SIMD_BATCH_LANES];
+    for lane in 0..active_lanes {
+        neighborhoods[lane] = ChunkNeighborhood([
+            words[0][lane], words[1][lane], words[2][lane], words[3][lane], words[4][lane],
+            words[5][lane], words[6][lane], words[7][lane], words[8][lane],
+        ]);
+    }
+    neighborhoods
+}
+
+fn gather_neighborhoods_staged(
+    grid: &BitGrid,
+    targets: &[Cell],
+) -> StagedNeighborhoodBatch {
+    let words = gather_neighborhood_words_9xn(grid, targets);
+    let neighborhoods = transpose_words_9xn_to_neighborhoods(&words, targets.len());
+    StagedNeighborhoodBatch {
+        _words: words,
+        neighborhoods,
+    }
+}
+
+#[cfg(test)]
+fn build_neighborhood(grid: &BitGrid, cx: Coord, cy: Coord) -> ChunkNeighborhood {
+    ChunkNeighborhood([
+        grid.chunk_bits(cx - 1, cy - 1),
+        grid.chunk_bits(cx, cy - 1),
+        grid.chunk_bits(cx + 1, cy - 1),
+        grid.chunk_bits(cx - 1, cy),
+        grid.chunk_bits(cx, cy),
+        grid.chunk_bits(cx + 1, cy),
+        grid.chunk_bits(cx - 1, cy + 1),
+        grid.chunk_bits(cx, cy + 1),
+        grid.chunk_bits(cx + 1, cy + 1),
+    ])
 }
 
 fn apply_chunk_step(
@@ -165,31 +331,6 @@ fn apply_chunk_step(
     if diff_bits != 0 {
         changed.push(ChunkDiff { cx, cy, diff_bits });
     }
-}
-
-// Neighborhood collection
-fn collect_target_chunks(grid: &BitGrid) -> HashSet<Cell> {
-    let mut targets = HashSet::new();
-    for (cx, cy) in grid.chunk_coords() {
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                targets.insert((cx + dx, cy + dy));
-            }
-        }
-    }
-    targets
-}
-
-fn build_neighborhood(grid: &BitGrid, cx: Coord, cy: Coord) -> ChunkNeighborhood {
-    let mut chunks = [0_u64; 9];
-    let mut index = 0;
-    for dy in -1..=1 {
-        for dx in -1..=1 {
-            chunks[index] = grid.chunk_bits(cx + dx, cy + dy);
-            index += 1;
-        }
-    }
-    ChunkNeighborhood(chunks)
 }
 
 // Evolution kernels
@@ -227,20 +368,21 @@ fn evolve_center_chunk_bitwise(neighborhood: &ChunkNeighborhood) -> u64 {
 }
 
 fn evolve_center_chunks_bitwise_batch_from_pending(
-    pending: &[(Coord, Coord, u64, ChunkNeighborhood)],
-) -> Vec<u64> {
+    pending: &PendingChunkBatch,
+) -> [u64; SIMD_BATCH_LANES] {
     debug_assert!(!pending.is_empty());
-    debug_assert!(pending.len() <= 8);
-    if pending.len() == 1 {
-        return vec![evolve_center_chunk_bitwise(&pending[0].3)];
+    debug_assert!(pending.len <= SIMD_BATCH_LANES);
+    if pending.len == 1 {
+        let mut next = [0; SIMD_BATCH_LANES];
+        next[0] = evolve_center_chunk_bitwise(&pending.neighborhoods[0]);
+        return next;
     }
 
     let chunks = build_chunk_row_batches_from_pending(pending);
-    let next = evolve_packed_chunk_rows(&chunks);
-    next[..pending.len()].to_vec()
+    evolve_packed_chunk_rows(&chunks)
 }
 
-fn evolve_packed_chunk_rows(chunks: &[ChunkRowBatch; 9]) -> [u64; 8] {
+fn evolve_packed_chunk_rows(chunks: &[[u16x32; 2]; 9]) -> [u64; 8] {
     let center = pack_row_batch(&chunks[4]);
     let neighbors = packed_neighbor_boards(chunks);
     let (bit0, bit1, bit2, bit3) = accumulate_neighbor_bitplanes(&neighbors);
@@ -249,7 +391,7 @@ fn evolve_packed_chunk_rows(chunks: &[ChunkRowBatch; 9]) -> [u64; 8] {
     must_cast(exactly_three | (center & exactly_two))
 }
 
-fn packed_neighbor_boards(chunks: &[ChunkRowBatch; 9]) -> [u64x8; 8] {
+fn packed_neighbor_boards(chunks: &[[u16x32; 2]; 9]) -> [u64x8; 8] {
     [
         pack_row_batch(&align_vertical_rows(&chunks[4], &chunks[1], 7, 1)),
         pack_row_batch(&align_vertical_rows(&chunks[4], &chunks[7], 0, -1)),
@@ -307,52 +449,46 @@ fn accumulate_neighbor_bitplanes(neighbors: &[u64x8; 8]) -> (u64x8, u64x8, u64x8
 
 // Batched row layout
 fn build_chunk_row_batches_from_pending(
-    pending: &[(Coord, Coord, u64, ChunkNeighborhood)],
-) -> [ChunkRowBatch; 9] {
-    let mut chunks = [[[0_u16; 8]; 8]; 9];
+    pending: &PendingChunkBatch,
+) -> [[u16x32; 2]; 9] {
+    let mut chunks = AlignedU16LaneChunkRows9::default();
 
-    for (lane, (_, _, _, neighborhood)) in pending.iter().enumerate() {
-        let first_batch = chunk_rows_batch_4([
+    for lane in 0..pending.len {
+        let neighborhood = pending.neighborhoods[lane];
+        let first_batch = widen_u64_quad_to_u16_rows([
             neighborhood.0[0],
             neighborhood.0[1],
             neighborhood.0[2],
             neighborhood.0[3],
         ]);
-        let second_batch = chunk_rows_batch_4([
+        let second_batch = widen_u64_quad_to_u16_rows([
             neighborhood.0[4],
             neighborhood.0[5],
             neighborhood.0[6],
             neighborhood.0[7],
         ]);
-        store_rows_batch_4(&mut chunks[0..4], lane, first_batch);
-        store_rows_batch_4(&mut chunks[4..8], lane, second_batch);
-        store_rows_for_lane(&mut chunks[8], lane, chunk_rows(neighborhood.0[8]));
+        store_rows_batch_4(&mut chunks.0[lane], 0, first_batch);
+        store_rows_batch_4(&mut chunks.0[lane], 4, second_batch);
+        chunks.0[lane][8] = chunk_rows(neighborhood.0[8]);
     }
 
-    chunks.map(must_cast)
+    transpose_chunk_row_staging9(&chunks, pending.len).map(must_cast)
 }
 
-fn store_rows_for_lane(chunk: &mut [[u16; 8]; 8], lane: usize, rows: [u16; 8]) {
-    chunk[0][lane] = rows[0];
-    chunk[1][lane] = rows[1];
-    chunk[2][lane] = rows[2];
-    chunk[3][lane] = rows[3];
-    chunk[4][lane] = rows[4];
-    chunk[5][lane] = rows[5];
-    chunk[6][lane] = rows[6];
-    chunk[7][lane] = rows[7];
-}
-
-fn store_rows_batch_4(chunks: &mut [[[u16; 8]; 8]], lane: usize, rows_batch: [[u16; 8]; 4]) {
+fn store_rows_batch_4(
+    lane_chunks: &mut [[u16; 8]; 9],
+    chunk_offset: usize,
+    rows_batch: [[u16; 8]; 4],
+) {
     let [first_rows, second_rows, third_rows, fourth_rows] = rows_batch;
-    store_rows_for_lane(&mut chunks[0], lane, first_rows);
-    store_rows_for_lane(&mut chunks[1], lane, second_rows);
-    store_rows_for_lane(&mut chunks[2], lane, third_rows);
-    store_rows_for_lane(&mut chunks[3], lane, fourth_rows);
+    lane_chunks[chunk_offset] = first_rows;
+    lane_chunks[chunk_offset + 1] = second_rows;
+    lane_chunks[chunk_offset + 2] = third_rows;
+    lane_chunks[chunk_offset + 3] = fourth_rows;
 }
 
 // Batched row transforms
-fn pack_row_batch(rows: &ChunkRowBatch) -> u64x8 {
+fn pack_row_batch(rows: &[u16x32; 2]) -> u64x8 {
     pack_row_block(rows[0], 0) | pack_row_block(rows[1], 32)
 }
 
@@ -380,14 +516,14 @@ fn pack_row_lanes(lanes: u16x8, shift: u64) -> u64x8 {
 }
 
 fn align_vertical_rows(
-    center: &ChunkRowBatch,
-    edge: &ChunkRowBatch,
+    center: &[u16x32; 2],
+    edge: &[u16x32; 2],
     edge_row: usize,
     shift_rows: i32,
-) -> ChunkRowBatch {
-    let edge_view: &ChunkRowView = must_cast_ref(edge);
+) -> [u16x32; 2] {
+    let edge_view: &[u16x8; 8] = must_cast_ref(edge);
     let mut shifted = *center;
-    let shifted_view: &mut ChunkRowView = must_cast_mut(&mut shifted);
+    let shifted_view: &mut [u16x8; 8] = must_cast_mut(&mut shifted);
     match shift_rows {
         1 => {
             shifted_view.copy_within(0..7, 1);
@@ -403,11 +539,11 @@ fn align_vertical_rows(
 }
 
 fn align_horizontal_rows(
-    center: &ChunkRowBatch,
-    edge: &ChunkRowBatch,
+    center: &[u16x32; 2],
+    edge: &[u16x32; 2],
     edge_col: usize,
     shift_cols: i32,
-) -> ChunkRowBatch {
+) -> [u16x32; 2] {
     let edge_mask = edge_column_mask_batch(edge, edge_col, edge_target_col(shift_cols));
     if shift_cols > 0 {
         [
@@ -476,12 +612,12 @@ fn align_diagonal_neighbor(
 
 // Row packing and view helpers
 fn align_diagonal_rows(
-    center: &ChunkRowBatch,
-    vertical: &ChunkRowBatch,
-    horizontal: &ChunkRowBatch,
-    corner: &ChunkRowBatch,
+    center: &[u16x32; 2],
+    vertical: &[u16x32; 2],
+    horizontal: &[u16x32; 2],
+    corner: &[u16x32; 2],
     spec: DiagonalSpec,
-) -> ChunkRowBatch {
+) -> [u16x32; 2] {
     let source_rows = align_vertical_rows(center, vertical, spec.edge_row, spec.shift_rows);
     let edge_source_rows = align_vertical_rows(horizontal, corner, spec.edge_row, spec.shift_rows);
     let edge_target = edge_target_col(spec.shift_cols);
@@ -504,17 +640,17 @@ fn align_diagonal_rows(
 fn shift_rows_with_edge(rows: [u16; 8], edge_fill: u16, shift_rows: i32) -> u16x8 {
     let row_bytes: i8x16 = must_cast(rows);
     let (edge_bytes, shifted_bytes): (i8x16, i8x16) = match shift_rows {
-        1 => (
-            must_cast([edge_fill, 0, 0, 0, 0, 0, 0, 0]),
-            row_bytes.swizzle(SHIFT_ROWS_DOWN_BYTES),
-        ),
-        -1 => (
-            must_cast([0, 0, 0, 0, 0, 0, 0, edge_fill]),
-            row_bytes.swizzle(SHIFT_ROWS_UP_BYTES),
-        ),
+        1 => (edge_fill_bytes(edge_fill, 0), row_bytes.swizzle(SHIFT_ROWS_DOWN_BYTES)),
+        -1 => (edge_fill_bytes(edge_fill, 7), row_bytes.swizzle(SHIFT_ROWS_UP_BYTES)),
         _ => panic!("unsupported row shift: {shift_rows}"),
     };
     must_cast(shifted_bytes | edge_bytes)
+}
+
+fn edge_fill_bytes(edge_fill: u16, target_row: usize) -> i8x16 {
+    let mut fill_rows = [0_u16; 8];
+    fill_rows[target_row] = edge_fill;
+    must_cast(fill_rows)
 }
 
 fn chunk_rows(chunk: u64) -> [u16; 8] {
@@ -522,17 +658,7 @@ fn chunk_rows(chunk: u64) -> [u16; 8] {
 }
 
 fn chunk_rows_batch_2(chunks: [u64; 2]) -> [[u16; 8]; 2] {
-    let byte_lanes: u8x16 = must_cast(chunks);
-    must_cast(u16x16::from(byte_lanes))
-}
-
-fn chunk_rows_batch_4(chunks: [u64; 4]) -> [[u16; 8]; 4] {
-    let byte_lane_halves: [u8x16; 2] = must_cast(chunks);
-    let widened_halves = [
-        u16x16::from(byte_lane_halves[0]),
-        u16x16::from(byte_lane_halves[1]),
-    ];
-    must_cast(widened_halves)
+    widen_u64_pair_to_u16_rows(chunks)
 }
 
 fn pack_rows(rows: u16x8) -> u64 {
@@ -559,10 +685,10 @@ fn edge_column_mask_rows(rows: u16x8, edge_col: usize, target_col: u16) -> u16x8
 }
 
 fn edge_column_mask_batch(
-    chunk: &ChunkRowBatch,
+    chunk: &[u16x32; 2],
     edge_col: usize,
     target_col: u16,
-) -> ChunkRowBatch {
+) -> [u16x32; 2] {
     [
         ((chunk[0] >> (edge_col as u16)) & u16x32::ONE) << target_col,
         ((chunk[1] >> (edge_col as u16)) & u16x32::ONE) << target_col,
@@ -574,15 +700,7 @@ fn append_changed_cells(changed: &mut Vec<Cell>, cx: Coord, cy: Coord, diff_bits
     if diff_bits == 0 {
         return;
     }
-
-    let mut remaining = diff_bits;
-    while remaining != 0 {
-        let bit = remaining.trailing_zeros() as Coord;
-        let local_x = bit % 8;
-        let local_y = bit / 8;
-        changed.push((cx * CHUNK_SIZE + local_x, cy * CHUNK_SIZE + local_y));
-        remaining &= remaining - 1;
-    }
+    append_live_bits_as_cells(changed, cx, cy, diff_bits);
 }
 
 fn expand_chunk_diffs_to_cells(chunk_diffs: &[ChunkDiff]) -> Vec<Cell> {

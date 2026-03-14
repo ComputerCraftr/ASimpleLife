@@ -31,7 +31,7 @@ impl TerminalBackbuffer {
         changed_cells: Option<&[Cell]>,
         out: &mut W,
     ) -> io::Result<()> {
-        let next_origin = compute_origin(self.width, self.height, grid);
+        let next_origin = compute_origin_for_cells(self.width, self.height, &grid.live_cells());
 
         if self.origin != Some(next_origin) || changed_cells.is_none() {
             self.origin = Some(next_origin);
@@ -51,7 +51,7 @@ impl TerminalBackbuffer {
         changed_chunks: Option<&[ChunkDiff]>,
         out: &mut W,
     ) -> io::Result<()> {
-        let next_origin = compute_origin(self.width, self.height, grid);
+        let next_origin = compute_origin_for_cells(self.width, self.height, &grid.live_cells());
 
         if self.origin != Some(next_origin) || changed_chunks.is_none() {
             self.origin = Some(next_origin);
@@ -219,10 +219,6 @@ impl TerminalBackbuffer {
 
         Ok(())
     }
-}
-
-fn compute_origin(width: usize, height: usize, grid: &BitGrid) -> Cell {
-    compute_origin_for_cells(width, height, &grid.live_cells())
 }
 
 pub(crate) fn compute_origin_for_cells(width: usize, height: usize, cells: &[Cell]) -> Cell {

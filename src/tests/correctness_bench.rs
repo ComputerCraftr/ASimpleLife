@@ -1,7 +1,7 @@
 use crate::benchmark::{
     BenchmarkOptions, assert_same_outcome, benchmark_case_names_for_options,
-    benchmark_report_json_for_options, benchmark_report_json_value, bitmask_pattern,
-    canonical_small_box_mask, oracle_representative_case_for_tests, oracle_runtime_case_for_tests,
+    benchmark_report_json_value, bitmask_pattern, build_benchmark_report, canonical_small_box_mask,
+    special_oracle_case_for_tests,
     reference_classify_from_checkpoint, reference_is_decisive,
 };
 use crate::bitgrid::Coord;
@@ -95,7 +95,7 @@ fn oracle_runtime_case_honors_generation_override() {
 #[test]
 fn oracle_runtime_case_reports_runtime_data() {
     let (pattern, target_generation, reached_target, population, bounds_span) =
-        oracle_runtime_case_for_tests();
+        special_oracle_case_for_tests(true);
     assert_eq!(pattern, "gosper_glider_gun");
     assert_eq!(target_generation, 4_096);
     assert!(reached_target);
@@ -136,7 +136,7 @@ fn oracle_representative_case_is_reported_when_requested() {
 #[test]
 fn oracle_representative_case_reports_runtime_data() {
     let (pattern, target_generation, reached_target, population, bounds_span) =
-        oracle_representative_case_for_tests();
+        special_oracle_case_for_tests(false);
     assert_eq!(pattern, "random_seed420_53x24_37");
     assert_eq!(target_generation, 4_096);
     assert!(
@@ -149,10 +149,10 @@ fn oracle_representative_case_reports_runtime_data() {
 
 #[test]
 fn delayed_family_is_compatible_by_default() {
-    let json = benchmark_report_json_for_options(&BenchmarkOptions {
+    let json = serde_json::to_value(build_benchmark_report(&BenchmarkOptions {
         families: Some(vec!["delayed".to_string()]),
         ..BenchmarkOptions::default()
-    });
+    }).to_json()).unwrap();
     assert_eq!(json.get("total").and_then(|value| value.as_u64()), Some(4));
     assert_eq!(
         json.get("compatible").and_then(|value| value.as_u64()),
@@ -162,13 +162,13 @@ fn delayed_family_is_compatible_by_default() {
 
 #[test]
 fn default_seeded_report_uses_canonical_seed_and_no_threshold() {
-    let json = benchmark_report_json_for_options(&BenchmarkOptions {
+    let json = serde_json::to_value(build_benchmark_report(&BenchmarkOptions {
         families: Some(vec!["gadget".to_string()]),
         prediction_max_generations: Some(64),
         oracle_max_generations: Some(256),
         cases_per_family: Some(1),
         ..BenchmarkOptions::default()
-    });
+    }).to_json()).unwrap();
     assert_eq!(
         json.get("mode").and_then(|value| value.as_str()),
         Some("default_seeded")
@@ -183,7 +183,7 @@ fn default_seeded_report_uses_canonical_seed_and_no_threshold() {
 
 #[test]
 fn seeded_report_includes_seed_mode_and_threshold() {
-    let json = benchmark_report_json_for_options(&BenchmarkOptions {
+    let json = serde_json::to_value(build_benchmark_report(&BenchmarkOptions {
         families: Some(vec!["iid".to_string()]),
         prediction_max_generations: Some(128),
         oracle_max_generations: Some(512),
@@ -191,7 +191,7 @@ fn seeded_report_includes_seed_mode_and_threshold() {
         seed: Some(42),
         cases_per_family: Some(2),
         ..BenchmarkOptions::default()
-    });
+    }).to_json()).unwrap();
     assert_eq!(
         json.get("mode").and_then(|value| value.as_str()),
         Some("seeded")
@@ -257,14 +257,14 @@ fn seeded_case_names_change_with_seed() {
 
 #[test]
 fn time_seeded_report_has_threshold_and_seed() {
-    let json = benchmark_report_json_for_options(&BenchmarkOptions {
+    let json = serde_json::to_value(build_benchmark_report(&BenchmarkOptions {
         families: Some(vec!["structured".to_string()]),
         prediction_max_generations: Some(128),
         oracle_max_generations: Some(512),
         randomized: true,
         cases_per_family: Some(2),
         ..BenchmarkOptions::default()
-    });
+    }).to_json()).unwrap();
     assert_eq!(
         json.get("mode").and_then(|value| value.as_str()),
         Some("time_seeded")

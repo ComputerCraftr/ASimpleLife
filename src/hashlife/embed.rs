@@ -1,20 +1,37 @@
 use super::{
-    EmbeddedCell, EmbeddedJump, GridExtractionPolicy, HashLifeEngine, NodeId,
-    hashlife_debug_enabled, morton_key, quadrant_end,
+    EmbedLayoutCacheKey, EmbeddedCell, EmbeddedJump, GridExtractionPolicy, HashLifeEngine, NodeId,
+    hashlife_debug_enabled, quadrant_end,
 };
 use crate::bitgrid::{BitGrid, Coord};
+use crate::hashing::morton_interleave_u64_batch;
+use crate::simd_layout::{AlignedU64Batch, SIMD_BATCH_LANES};
+
+const HASHLIFE_LINEAR_SPLIT_THRESHOLD: usize = 32;
 
 fn translated_embedded_cells(grid: &BitGrid, shift_x: Coord, shift_y: Coord) -> Vec<EmbeddedCell> {
     let live_cells = grid.live_cells();
     let mut translated = Vec::with_capacity(live_cells.len());
-    for (x, y) in live_cells {
-        let tx =
-            u64::try_from(x + shift_x).expect("hashlife translated x coordinate became invalid");
-        let ty =
-            u64::try_from(y + shift_y).expect("hashlife translated y coordinate became invalid");
-        translated.push(EmbeddedCell {
-            key: morton_key(tx, ty),
-        });
+    let mut index = 0;
+    while index < live_cells.len() {
+        let batch_len = (live_cells.len() - index).min(SIMD_BATCH_LANES);
+        let mut xs = AlignedU64Batch::default();
+        let mut ys = AlignedU64Batch::default();
+        let mut lane = 0;
+        while lane < batch_len {
+            let (x, y) = live_cells[index + lane];
+            xs.0[lane] =
+                u64::try_from(x + shift_x).expect("hashlife translated x coordinate became invalid");
+            ys.0[lane] =
+                u64::try_from(y + shift_y).expect("hashlife translated y coordinate became invalid");
+            lane += 1;
+        }
+        let keys = morton_interleave_u64_batch(xs.0, ys.0);
+        let mut lane = 0;
+        while lane < batch_len {
+            translated.push(EmbeddedCell { key: keys[lane] });
+            lane += 1;
+        }
+        index += batch_len;
     }
     translated.sort_unstable_by_key(|cell| cell.key);
     translated
@@ -84,7 +101,12 @@ impl HashLifeEngine {
         let span = width.max(height);
         let size = *self
             .embed_layout_cache
-            .entry((step_exp, width, height, span))
+            .entry(EmbedLayoutCacheKey {
+                step_exp,
+                width,
+                height,
+                span,
+            })
             .or_insert_with(|| Self::required_root_size(span, jump));
         let size_u64 = u64::try_from(size).expect("hashlife root size became negative");
         let level = size_u64.trailing_zeros();
@@ -114,10 +136,10 @@ impl HashLifeEngine {
         embedded: EmbeddedJump,
         result: NodeId,
     ) -> BitGrid {
-        debug_assert_eq!(self.nodes[result as usize].level + 1, embedded.root_level);
+        debug_assert_eq!(self.node_columns.level(result) + 1, embedded.root_level);
         debug_assert_eq!(
             embedded.root_size / 2,
-            1_i64 << self.nodes[result as usize].level
+            1_i64 << self.node_columns.level(result)
         );
         debug_assert_eq!(
             embedded.result_origin_x,
@@ -298,12 +320,11 @@ fn split_quadrants(
     end: usize,
     bit_shift: u32,
 ) -> (usize, usize, usize) {
-    const LINEAR_SPLIT_THRESHOLD: usize = 32;
     let len = end - start;
     let mut q0_end;
     let mut q1_end;
     let mut q2_end;
-    if len <= LINEAR_SPLIT_THRESHOLD {
+    if len <= HASHLIFE_LINEAR_SPLIT_THRESHOLD {
         q0_end = start;
         while q0_end < end && ((cells[q0_end].key >> bit_shift) & 0b11) == 0 {
             q0_end += 1;

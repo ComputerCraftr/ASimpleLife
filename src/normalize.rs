@@ -1,8 +1,10 @@
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 use crate::bitgrid::{BitGrid, Cell, Coord};
+use crate::hashing::hash_normalized_grid_signature;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormalizedGridSignature {
     pub width: Coord,
     pub height: Coord,
@@ -12,6 +14,18 @@ pub struct NormalizedGridSignature {
 impl fmt::Display for NormalizedGridSignature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}x{} {:?}", self.width, self.height, self.cells)
+    }
+}
+
+impl NormalizedGridSignature {
+    pub fn fingerprint(&self) -> u64 {
+        hash_normalized_grid_signature(self.width, self.height, &self.cells)
+    }
+}
+
+impl Hash for NormalizedGridSignature {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.fingerprint());
     }
 }
 

@@ -7,6 +7,38 @@ use crate::life::step_grid_with_changes_and_memo;
 use crate::memo::Memo;
 use crate::normalize::{NormalizedGridSignature, normalize};
 
+const SETTLING_MAX_POPULATION: usize = 256;
+const SETTLING_MAX_SPAN: Coord = 64;
+const SETTLING_WIDE_MAX_POPULATION: usize = 16;
+const SETTLING_WIDE_MAX_SPAN: Coord = 256;
+const SETTLING_ULTRA_WIDE_MAX_POPULATION: usize = 16;
+const SETTLING_ULTRA_WIDE_MAX_SPAN: Coord = 1_024;
+const SETTLING_MIN_EXTENSION_LIMIT: u64 = 512;
+const SETTLING_MAX_EXTENSION_LIMIT: u64 = 1_024;
+const SETTLING_ULTRA_WIDE_MAX_EXTENSION_LIMIT: u64 = 20_000;
+
+const PERSISTENT_EXPANSION_BURN_IN: u64 = 2_048;
+const PERSISTENT_EXPANSION_EMITTER_BURN_IN: u64 = 256;
+const PERSISTENT_EXPANSION_WINDOW: usize = 32;
+const PERSISTENT_EXPANSION_MIN_POPULATION_GROWTH_PER_WINDOW: usize = 1;
+const PERSISTENT_EXPANSION_MIN_SPAN: Coord = 64;
+const PERSISTENT_EXPANSION_MIN_HEURISTIC_HORIZON: u64 = 512;
+const PERSISTENT_EXPANSION_MIN_EMITTER_SPAN: Coord = 128;
+const PERSISTENT_EXPANSION_MIN_EMITTER_SCALE_POPULATION: usize = 512;
+
+const FRONTIER_MIN_EDGE_ADVANCE_PER_WINDOW: Coord = 6;
+const FRONTIER_MAX_OPPOSITE_EDGE_DRIFT: Coord = 4;
+const FRONTIER_MAX_ORTHOGONAL_SPAN_GROWTH_PER_WINDOW: Coord = 8;
+
+const GLIDER_COMPONENT_CELLS: usize = 5;
+const GLIDER_MAX_COMPONENT_SPAN: Coord = 4;
+const GLIDER_FRONT_MARGIN: Coord = 3;
+const DETACHED_PATTERN_MIN_GAP_FROM_MAIN: Coord = 8;
+
+const BLINKER_COMPONENT_CELLS: usize = 3;
+const BLINKER_MAX_COMPONENT_SPAN: Coord = 3;
+const BLINKER_TRAIL_MARGIN: Coord = 6;
+
 fn bounds_dimensions(bounds: (Coord, Coord, Coord, Coord)) -> (Coord, Coord, Coord) {
     let (min_x, min_y, max_x, max_y) = bounds;
     let width = max_x - min_x + 1;
@@ -248,42 +280,38 @@ fn settling_extension_limit(
     generation_limit: u64,
     metrics_history: &[(usize, Coord, Coord, Coord, Coord, Coord)],
 ) -> Option<u64> {
-    const MAX_SETTLING_POPULATION: usize = 256;
-    const MAX_SETTLING_SPAN: Coord = 64;
-    const MAX_WIDE_SETTLING_POPULATION: usize = 16;
-    const MAX_WIDE_SETTLING_SPAN: Coord = 256;
-    const MAX_ULTRA_WIDE_SETTLING_POPULATION: usize = 16;
-    const MAX_ULTRA_WIDE_SETTLING_SPAN: Coord = 1_024;
-    const MIN_EXTENSION_LIMIT: u64 = 512;
-    const MAX_EXTENSION_LIMIT: u64 = 1024;
-    const MAX_ULTRA_WIDE_EXTENSION_LIMIT: u64 = 20_000;
-
     if limits.max_generations < 256 {
         return None;
     }
 
     let &(current_population, _, _, _, _, max_span) = metrics_history.last()?;
     let bounded_small_pattern =
-        current_population <= MAX_SETTLING_POPULATION && max_span <= MAX_SETTLING_SPAN;
+        current_population <= SETTLING_MAX_POPULATION && max_span <= SETTLING_MAX_SPAN;
     let bounded_wide_tiny_pattern =
-        current_population <= MAX_WIDE_SETTLING_POPULATION && max_span <= MAX_WIDE_SETTLING_SPAN;
-    let bounded_ultra_wide_tiny_pattern = current_population <= MAX_ULTRA_WIDE_SETTLING_POPULATION
-        && max_span <= MAX_ULTRA_WIDE_SETTLING_SPAN;
+        current_population <= SETTLING_WIDE_MAX_POPULATION && max_span <= SETTLING_WIDE_MAX_SPAN;
+    let bounded_ultra_wide_tiny_pattern =
+        current_population <= SETTLING_ULTRA_WIDE_MAX_POPULATION
+            && max_span <= SETTLING_ULTRA_WIDE_MAX_SPAN;
 
     if !bounded_small_pattern && !bounded_wide_tiny_pattern && !bounded_ultra_wide_tiny_pattern {
         return None;
     }
 
-    if bounded_ultra_wide_tiny_pattern && generation_limit < MAX_ULTRA_WIDE_EXTENSION_LIMIT {
+    if bounded_ultra_wide_tiny_pattern
+        && generation_limit < SETTLING_ULTRA_WIDE_MAX_EXTENSION_LIMIT
+    {
         return Some(
             limits
                 .max_generations
                 .saturating_mul(32)
-                .clamp(MIN_EXTENSION_LIMIT, MAX_ULTRA_WIDE_EXTENSION_LIMIT),
+                .clamp(
+                    SETTLING_MIN_EXTENSION_LIMIT,
+                    SETTLING_ULTRA_WIDE_MAX_EXTENSION_LIMIT,
+                ),
         );
     }
 
-    if generation_limit >= MAX_EXTENSION_LIMIT {
+    if generation_limit >= SETTLING_MAX_EXTENSION_LIMIT {
         return None;
     }
 
@@ -291,7 +319,7 @@ fn settling_extension_limit(
         limits
             .max_generations
             .saturating_mul(2)
-            .clamp(MIN_EXTENSION_LIMIT, MAX_EXTENSION_LIMIT),
+            .clamp(SETTLING_MIN_EXTENSION_LIMIT, SETTLING_MAX_EXTENSION_LIMIT),
     )
 }
 
@@ -301,26 +329,20 @@ fn detect_persistent_expansion(
     grid: &BitGrid,
     limits: &ClassificationLimits,
 ) -> Option<Classification> {
-    const BURN_IN: u64 = 2_048;
-    const EMITTER_BURN_IN: u64 = 256;
-    const WINDOW: usize = 32;
-    const MIN_POPULATION_GROWTH_PER_WINDOW: usize = 1;
-    const MIN_PERSISTENT_EXPANSION_SPAN: Coord = 64;
-    const MIN_HEURISTIC_HORIZON: u64 = 512;
-    const MIN_EMITTER_EXPANSION_SPAN: Coord = 128;
-
-    if limits.max_generations < MIN_HEURISTIC_HORIZON {
+    if limits.max_generations < PERSISTENT_EXPANSION_MIN_HEURISTIC_HORIZON {
         return None;
     }
 
-    if generation < BURN_IN || metrics_history.len() <= WINDOW * 2 {
+    if generation < PERSISTENT_EXPANSION_BURN_IN
+        || metrics_history.len() <= PERSISTENT_EXPANSION_WINDOW * 2
+    {
         return None;
     }
 
     let (old_population, old_min_x, old_max_x, old_min_y, old_max_y, _) =
-        metrics_history[metrics_history.len() - (WINDOW * 2) - 1];
+        metrics_history[metrics_history.len() - (PERSISTENT_EXPANSION_WINDOW * 2) - 1];
     let (mid_population, mid_min_x, mid_max_x, mid_min_y, mid_max_y, _) =
-        metrics_history[metrics_history.len() - WINDOW - 1];
+        metrics_history[metrics_history.len() - PERSISTENT_EXPANSION_WINDOW - 1];
     let (
         current_population,
         current_min_x,
@@ -330,14 +352,16 @@ fn detect_persistent_expansion(
         current_span,
     ) = metrics_history[metrics_history.len() - 1];
 
-    if current_span < MIN_PERSISTENT_EXPANSION_SPAN {
+    if current_span < PERSISTENT_EXPANSION_MIN_SPAN {
         return None;
     }
 
     let monotone_population = current_population >= mid_population
         && mid_population >= old_population
-        && current_population.saturating_sub(mid_population) >= MIN_POPULATION_GROWTH_PER_WINDOW
-        && mid_population.saturating_sub(old_population) >= MIN_POPULATION_GROWTH_PER_WINDOW;
+        && current_population.saturating_sub(mid_population)
+            >= PERSISTENT_EXPANSION_MIN_POPULATION_GROWTH_PER_WINDOW
+        && mid_population.saturating_sub(old_population)
+            >= PERSISTENT_EXPANSION_MIN_POPULATION_GROWTH_PER_WINDOW;
 
     let width_growth_1 = (mid_max_x - mid_min_x) - (old_max_x - old_min_x);
     let width_growth_2 = (current_max_x - current_min_x) - (mid_max_x - mid_min_x);
@@ -388,13 +412,14 @@ fn detect_persistent_expansion(
     let trailing_blinkers = count_trailing_blinker_ash(grid, &fronts);
     let detached_gliders = count_detached_gliders_anywhere(grid);
     let detached_blinkers = count_detached_blinkers_anywhere(grid);
-    let confirmed_detached_emitter_signal = current_span >= MIN_EMITTER_EXPANSION_SPAN
+    let confirmed_detached_emitter_signal =
+        current_span >= PERSISTENT_EXPANSION_MIN_EMITTER_SPAN
         && (frontier_gliders >= 3
             || trailing_blinkers >= 3
             || detached_gliders >= 3
             || detached_blinkers >= 3);
 
-    if generation >= EMITTER_BURN_IN
+    if generation >= PERSISTENT_EXPANSION_EMITTER_BURN_IN
         && monotone_population
         && fronts.any()
         && confirmed_detached_emitter_signal
@@ -405,7 +430,8 @@ fn detect_persistent_expansion(
         });
     }
 
-    let emitter_scale_population = current_population >= 512;
+    let emitter_scale_population =
+        current_population >= PERSISTENT_EXPANSION_MIN_EMITTER_SCALE_POPULATION;
     let confirmed_emitter_signal =
         emitter_scale_population && (frontier_gliders >= 2 || trailing_blinkers >= 2);
 
@@ -441,23 +467,15 @@ fn edge_advances(
     prior_orthogonal: Coord,
     recent_orthogonal: Coord,
 ) -> bool {
-    const MIN_EDGE_ADVANCE_PER_WINDOW: Coord = 6;
-    const MAX_OPPOSITE_EDGE_DRIFT: Coord = 4;
-    const MAX_ORTHOGONAL_SPAN_GROWTH_PER_WINDOW: Coord = 8;
-
-    prior_front >= MIN_EDGE_ADVANCE_PER_WINDOW
-        && recent_front >= MIN_EDGE_ADVANCE_PER_WINDOW
-        && prior_back <= MAX_OPPOSITE_EDGE_DRIFT
-        && recent_back <= MAX_OPPOSITE_EDGE_DRIFT
-        && prior_orthogonal <= MAX_ORTHOGONAL_SPAN_GROWTH_PER_WINDOW
-        && recent_orthogonal <= MAX_ORTHOGONAL_SPAN_GROWTH_PER_WINDOW
+    prior_front >= FRONTIER_MIN_EDGE_ADVANCE_PER_WINDOW
+        && recent_front >= FRONTIER_MIN_EDGE_ADVANCE_PER_WINDOW
+        && prior_back <= FRONTIER_MAX_OPPOSITE_EDGE_DRIFT
+        && recent_back <= FRONTIER_MAX_OPPOSITE_EDGE_DRIFT
+        && prior_orthogonal <= FRONTIER_MAX_ORTHOGONAL_SPAN_GROWTH_PER_WINDOW
+        && recent_orthogonal <= FRONTIER_MAX_ORTHOGONAL_SPAN_GROWTH_PER_WINDOW
 }
 
 fn count_detached_frontier_gliders(grid: &BitGrid, fronts: &FrontierDirections) -> usize {
-    const GLIDER_CELLS: usize = 5;
-    const MAX_COMPONENT_SPAN: Coord = 4;
-    const FRONT_MARGIN: Coord = 3;
-    const MIN_GAP_FROM_MAIN: Coord = 8;
     let Some((global_min_x, global_min_y, global_max_x, global_max_y)) = grid.bounds() else {
         return 0;
     };
@@ -476,13 +494,13 @@ fn count_detached_frontier_gliders(grid: &BitGrid, fronts: &FrontierDirections) 
     components
         .into_iter()
         .filter(|component| {
-            if component == &main || component.len() != GLIDER_CELLS {
+            if component == &main || component.len() != GLIDER_COMPONENT_CELLS {
                 return false;
             }
             let (min_x, min_y, max_x, max_y) = component_bounds(component);
             let width = max_x - min_x + 1;
             let height = max_y - min_y + 1;
-            if width > MAX_COMPONENT_SPAN || height > MAX_COMPONENT_SPAN {
+            if width > GLIDER_MAX_COMPONENT_SPAN || height > GLIDER_MAX_COMPONENT_SPAN {
                 return false;
             }
 
@@ -490,15 +508,15 @@ fn count_detached_frontier_gliders(grid: &BitGrid, fronts: &FrontierDirections) 
                 return false;
             }
 
-            let near_front = (fronts.pos_x && global_max_x - max_x <= FRONT_MARGIN)
-                || (fronts.neg_x && min_x - global_min_x <= FRONT_MARGIN)
-                || (fronts.pos_y && global_max_y - max_y <= FRONT_MARGIN)
-                || (fronts.neg_y && min_y - global_min_y <= FRONT_MARGIN);
+            let near_front = (fronts.pos_x && global_max_x - max_x <= GLIDER_FRONT_MARGIN)
+                || (fronts.neg_x && min_x - global_min_x <= GLIDER_FRONT_MARGIN)
+                || (fronts.pos_y && global_max_y - max_y <= GLIDER_FRONT_MARGIN)
+                || (fronts.neg_y && min_y - global_min_y <= GLIDER_FRONT_MARGIN);
 
-            let separated = max_x < main_min_x - MIN_GAP_FROM_MAIN
-                || min_x > main_max_x + MIN_GAP_FROM_MAIN
-                || max_y < main_min_y - MIN_GAP_FROM_MAIN
-                || min_y > main_max_y + MIN_GAP_FROM_MAIN;
+            let separated = max_x < main_min_x - DETACHED_PATTERN_MIN_GAP_FROM_MAIN
+                || min_x > main_max_x + DETACHED_PATTERN_MIN_GAP_FROM_MAIN
+                || max_y < main_min_y - DETACHED_PATTERN_MIN_GAP_FROM_MAIN
+                || min_y > main_max_y + DETACHED_PATTERN_MIN_GAP_FROM_MAIN;
 
             near_front && separated
         })
@@ -506,10 +524,6 @@ fn count_detached_frontier_gliders(grid: &BitGrid, fronts: &FrontierDirections) 
 }
 
 fn count_trailing_blinker_ash(grid: &BitGrid, fronts: &FrontierDirections) -> usize {
-    const BLINKER_CELLS: usize = 3;
-    const MAX_COMPONENT_SPAN: Coord = 3;
-    const TRAIL_MARGIN: Coord = 6;
-    const MIN_GAP_FROM_MAIN: Coord = 8;
     let Some((global_min_x, global_min_y, global_max_x, global_max_y)) = grid.bounds() else {
         return 0;
     };
@@ -528,28 +542,28 @@ fn count_trailing_blinker_ash(grid: &BitGrid, fronts: &FrontierDirections) -> us
     components
         .into_iter()
         .filter(|component| {
-            if component == &main || component.len() != BLINKER_CELLS {
+            if component == &main || component.len() != BLINKER_COMPONENT_CELLS {
                 return false;
             }
             let (min_x, min_y, max_x, max_y) = component_bounds(component);
             let width = max_x - min_x + 1;
             let height = max_y - min_y + 1;
-            if width > MAX_COMPONENT_SPAN || height > MAX_COMPONENT_SPAN {
+            if width > BLINKER_MAX_COMPONENT_SPAN || height > BLINKER_MAX_COMPONENT_SPAN {
                 return false;
             }
             if !matches_blinker(component) {
                 return false;
             }
 
-            let near_trail = (fronts.pos_x && min_x - global_min_x <= TRAIL_MARGIN)
-                || (fronts.neg_x && global_max_x - max_x <= TRAIL_MARGIN)
-                || (fronts.pos_y && min_y - global_min_y <= TRAIL_MARGIN)
-                || (fronts.neg_y && global_max_y - max_y <= TRAIL_MARGIN);
+            let near_trail = (fronts.pos_x && min_x - global_min_x <= BLINKER_TRAIL_MARGIN)
+                || (fronts.neg_x && global_max_x - max_x <= BLINKER_TRAIL_MARGIN)
+                || (fronts.pos_y && min_y - global_min_y <= BLINKER_TRAIL_MARGIN)
+                || (fronts.neg_y && global_max_y - max_y <= BLINKER_TRAIL_MARGIN);
 
-            let separated = max_x < main_min_x - MIN_GAP_FROM_MAIN
-                || min_x > main_max_x + MIN_GAP_FROM_MAIN
-                || max_y < main_min_y - MIN_GAP_FROM_MAIN
-                || min_y > main_max_y + MIN_GAP_FROM_MAIN;
+            let separated = max_x < main_min_x - DETACHED_PATTERN_MIN_GAP_FROM_MAIN
+                || min_x > main_max_x + DETACHED_PATTERN_MIN_GAP_FROM_MAIN
+                || max_y < main_min_y - DETACHED_PATTERN_MIN_GAP_FROM_MAIN
+                || min_y > main_max_y + DETACHED_PATTERN_MIN_GAP_FROM_MAIN;
 
             near_trail && separated
         })
@@ -557,9 +571,6 @@ fn count_trailing_blinker_ash(grid: &BitGrid, fronts: &FrontierDirections) -> us
 }
 
 fn count_detached_gliders_anywhere(grid: &BitGrid) -> usize {
-    const GLIDER_CELLS: usize = 5;
-    const MAX_COMPONENT_SPAN: Coord = 4;
-    const MIN_GAP_FROM_MAIN: Coord = 8;
     let components = connected_components(grid);
     if components.len() < 2 {
         return 0;
@@ -575,19 +586,19 @@ fn count_detached_gliders_anywhere(grid: &BitGrid) -> usize {
     components
         .into_iter()
         .filter(|component| {
-            if component == &main || component.len() != GLIDER_CELLS {
+            if component == &main || component.len() != GLIDER_COMPONENT_CELLS {
                 return false;
             }
             let (min_x, min_y, max_x, max_y) = component_bounds(component);
             let width = max_x - min_x + 1;
             let height = max_y - min_y + 1;
-            if width > MAX_COMPONENT_SPAN || height > MAX_COMPONENT_SPAN {
+            if width > GLIDER_MAX_COMPONENT_SPAN || height > GLIDER_MAX_COMPONENT_SPAN {
                 return false;
             }
-            let separated = max_x < main_min_x - MIN_GAP_FROM_MAIN
-                || min_x > main_max_x + MIN_GAP_FROM_MAIN
-                || max_y < main_min_y - MIN_GAP_FROM_MAIN
-                || min_y > main_max_y + MIN_GAP_FROM_MAIN;
+            let separated = max_x < main_min_x - DETACHED_PATTERN_MIN_GAP_FROM_MAIN
+                || min_x > main_max_x + DETACHED_PATTERN_MIN_GAP_FROM_MAIN
+                || max_y < main_min_y - DETACHED_PATTERN_MIN_GAP_FROM_MAIN
+                || min_y > main_max_y + DETACHED_PATTERN_MIN_GAP_FROM_MAIN;
 
             separated && matches_glider(component)
         })
@@ -595,9 +606,6 @@ fn count_detached_gliders_anywhere(grid: &BitGrid) -> usize {
 }
 
 fn count_detached_blinkers_anywhere(grid: &BitGrid) -> usize {
-    const BLINKER_CELLS: usize = 3;
-    const MAX_COMPONENT_SPAN: Coord = 3;
-    const MIN_GAP_FROM_MAIN: Coord = 8;
     let components = connected_components(grid);
     if components.len() < 2 {
         return 0;
@@ -613,19 +621,19 @@ fn count_detached_blinkers_anywhere(grid: &BitGrid) -> usize {
     components
         .into_iter()
         .filter(|component| {
-            if component == &main || component.len() != BLINKER_CELLS {
+            if component == &main || component.len() != BLINKER_COMPONENT_CELLS {
                 return false;
             }
             let (min_x, min_y, max_x, max_y) = component_bounds(component);
             let width = max_x - min_x + 1;
             let height = max_y - min_y + 1;
-            if width > MAX_COMPONENT_SPAN || height > MAX_COMPONENT_SPAN {
+            if width > BLINKER_MAX_COMPONENT_SPAN || height > BLINKER_MAX_COMPONENT_SPAN {
                 return false;
             }
-            let separated = max_x < main_min_x - MIN_GAP_FROM_MAIN
-                || min_x > main_max_x + MIN_GAP_FROM_MAIN
-                || max_y < main_min_y - MIN_GAP_FROM_MAIN
-                || min_y > main_max_y + MIN_GAP_FROM_MAIN;
+            let separated = max_x < main_min_x - DETACHED_PATTERN_MIN_GAP_FROM_MAIN
+                || min_x > main_max_x + DETACHED_PATTERN_MIN_GAP_FROM_MAIN
+                || max_y < main_min_y - DETACHED_PATTERN_MIN_GAP_FROM_MAIN
+                || min_y > main_max_y + DETACHED_PATTERN_MIN_GAP_FROM_MAIN;
 
             separated && matches_blinker(component)
         })
