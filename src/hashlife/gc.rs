@@ -1,33 +1,188 @@
-use crate::cache_policy::{HASHLIFE_GC_MIN_NODES, HASHLIFE_GC_MIN_RECLAIM, hashlife_gc_reason};
-#[cfg(test)]
-use crate::bitgrid::BitGrid;
-#[cfg(test)]
-use crate::symmetry::D4Symmetry as Symmetry;
-
-use super::{FlatTable, HashLifeEngine, NodeColumns, NodeId};
+use super::arena::NodeColumns;
+use super::{HashLifeEngine, NodeId};
+use crate::RequiredExt;
+use crate::cache_policy::{
+    HASHLIFE_GC_MIN_NODES, HASHLIFE_GC_MIN_RECLAIM, HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER,
+    hashlife_gc_reason,
+};
 
 const HASHLIFE_MAX_RETAINED_ROOTS: usize = 1;
 
 impl HashLifeEngine {
+    fn dynamic_total_hot_budget(&self) -> usize {
+        let canonical_entries = self.canonical_cache_entries().max(1);
+        let transient_entries = self.transient_cache_entries().max(canonical_entries);
+        let observed_before = self
+            .stats
+            .gc
+            .gc_canonical_cache_entries_before
+            .max(canonical_entries);
+        let min_budget = (HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER / 1024).max(64);
+        let max_budget = (HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER / 4).max(min_budget);
+        (observed_before / 4 + transient_entries / 16).clamp(min_budget, max_budget)
+    }
+
+    pub(super) fn rebalance_hot_canonical_budgets(&mut self) {
+        let total_budget = self.dynamic_total_hot_budget();
+        let packed_weight = self
+            .stats
+            .canonical_cache
+            .canonical_packed_cache_hits
+            .max(1);
+        let oriented_weight = self
+            .stats
+            .canonical_cache
+            .canonical_oriented_cache_hits
+            .max(1);
+        let direct_parent_weight = (self.stats.canonical_cache.direct_parent_cached_result_hits
+            + self.stats.canonical_cache.direct_parent_winner_hits)
+            .max(1);
+        let total_weight = packed_weight + oriented_weight + direct_parent_weight;
+
+        self.canonical_caches.hot_packed_budget =
+            (total_budget * packed_weight / total_weight).max(1);
+        self.canonical_caches.hot_oriented_budget =
+            (total_budget * oriented_weight / total_weight).max(1);
+        self.canonical_caches.hot_direct_parent_budget =
+            (total_budget * direct_parent_weight / total_weight).max(1);
+
+        let assigned = self.canonical_caches.hot_packed_budget
+            + self.canonical_caches.hot_oriented_budget
+            + self.canonical_caches.hot_direct_parent_budget;
+        if assigned < total_budget {
+            self.canonical_caches.hot_direct_parent_budget += total_budget - assigned;
+        }
+
+        self.trim_hot_canonical_caches_to_budget();
+    }
+
+    fn trim_hot_canonical_caches_to_budget(&mut self) {
+        if self.canonical_caches.hot_packed.len() > self.canonical_caches.hot_packed_budget {
+            self.canonical_caches.hot_packed.clear();
+        }
+        if self.canonical_caches.hot_oriented.len() > self.canonical_caches.hot_oriented_budget {
+            self.canonical_caches.hot_oriented.clear();
+        }
+        if self.canonical_caches.hot_direct_parent.len()
+            > self.canonical_caches.hot_direct_parent_budget
+        {
+            self.canonical_caches.hot_direct_parent.clear();
+        }
+    }
+
+    pub(super) fn canonical_cache_entries(&self) -> usize {
+        self.canonical_caches.packed.len()
+            + self.canonical_caches.hot_packed.len()
+            + self.canonical_caches.oriented.len()
+            + self.canonical_caches.hot_oriented.len()
+            + self.canonical_caches.direct_parent.len()
+            + self.canonical_caches.hot_direct_parent.len()
+            + self.result_caches.structural_fast_path.len()
+            + self.result_caches.packed_structural_fast_path.len()
+            + self.canonical_caches.symmetry_refs.len()
+    }
+
+    pub(super) fn transient_cache_entries(&self) -> usize {
+        self.result_caches.jump.len()
+            + self.result_caches.root.len()
+            + self.result_caches.overlap.len()
+            + self.result_caches.oriented.len()
+            + self.result_caches.shells.len()
+            + self.result_caches.bounds.len()
+            + self.canonical_caches.packed.len()
+            + self.canonical_caches.hot_packed.len()
+            + self.canonical_caches.oriented.len()
+            + self.canonical_caches.hot_oriented.len()
+            + self.canonical_caches.direct_parent.len()
+            + self.canonical_caches.hot_direct_parent.len()
+            + self.result_caches.structural_fast_path.len()
+            + self.result_caches.packed_structural_fast_path.len()
+            + self.transform_state.canonical_cache.len()
+            + self.transform_state.compare_cache.len()
+            + self.transform_state.intern.len()
+            + self.result_caches.materialized_packed.len()
+            + self.embed_layout_cache.len()
+    }
+
+    pub(super) fn transient_cache_pressure_entries(&self) -> usize {
+        self.result_caches.jump.len()
+            + self.result_caches.root.len()
+            + self.result_caches.overlap.len()
+            + self.result_caches.oriented.len()
+            + self.result_caches.shells.len()
+            + self.result_caches.bounds.len()
+            + self.canonical_caches.packed.len()
+            + self.canonical_caches.oriented.len()
+            + self.canonical_caches.direct_parent.len()
+            + self.result_caches.structural_fast_path.len()
+            + self.result_caches.packed_structural_fast_path.len()
+            + self.transform_state.canonical_cache.len()
+            + self.transform_state.compare_cache.len()
+            + self.transform_state.intern.len()
+            + self.result_caches.materialized_packed.len()
+            + self.embed_layout_cache.len()
+    }
+
     pub(super) fn initialize_runtime_state(&mut self) {
+        let dead_shape = self.intern_canonical_shape(super::CanonicalStructKey::leaf(false));
+        let live_shape = self.intern_canonical_shape(super::CanonicalStructKey::leaf(true));
+        debug_assert_eq!((dead_shape, live_shape), (0, 1));
         self.dead_leaf = self.intern_leaf(false);
         self.live_leaf = self.intern_leaf(true);
         self.empty_by_level.push(self.dead_leaf);
         self.reset_packed_transform_state();
     }
 
-    pub(super) fn clear_transient_state(&mut self) {
-        self.jump_cache.clear();
-        self.root_result_cache.clear();
-        self.overlap_cache.clear();
+    pub(super) fn clear_transient_state(&mut self, preserve_hot_canonical: bool) {
+        self.rebalance_hot_canonical_budgets();
+        self.result_caches.jump.reset();
+        self.result_caches.root.reset();
+        self.result_caches.overlap.reset();
         #[cfg(test)]
-        self.transform_cache.clear();
-        self.canonical_transform_cache.clear();
-        self.oriented_result_cache.clear();
-        self.packed_transform_compare_cache.clear();
-        self.packed_symmetry_children_cache.clear();
+        {
+            self.transform_state.cache = crate::flat_table::FlatTable::with_capacity(64);
+        }
+        self.result_caches.oriented.reset();
+        self.result_caches.materialized_packed.reset();
+        self.result_caches.shells.reset();
+        self.embed_layout_cache.clear();
         self.reset_packed_transform_state();
-        self.canonical_node_cache.clear();
+        self.canonical_caches.node.reset();
+        self.canonical_caches.packed.reset();
+        self.canonical_caches.oriented.reset();
+        self.canonical_caches.direct_parent.reset();
+        self.canonical_caches.symmetry_refs.reset();
+        if !preserve_hot_canonical {
+            self.canonical_caches.hot_packed.reset();
+            self.canonical_caches.hot_oriented.reset();
+            self.canonical_caches.hot_direct_parent.reset();
+        }
+        self.result_caches.structural_fast_path.reset();
+        self.result_caches.packed_structural_fast_path.reset();
+    }
+
+    fn release_optional_cache_storage(&mut self) {
+        self.result_caches.jump.release_storage();
+        self.result_caches.root.release_storage();
+        self.result_caches.overlap.release_storage();
+        self.result_caches.oriented.release_storage();
+        self.result_caches.materialized_packed.release_storage();
+        self.result_caches.structural_fast_path.release_storage();
+        self.result_caches
+            .packed_structural_fast_path
+            .release_storage();
+        self.result_caches.shells.release_storage();
+        self.result_caches.bounds.release_storage();
+        self.canonical_caches.node.release_storage();
+        self.canonical_caches.packed.release_storage();
+        self.canonical_caches.hot_packed.release_storage();
+        self.canonical_caches.oriented.release_storage();
+        self.canonical_caches.hot_oriented.release_storage();
+        self.canonical_caches.direct_parent.release_storage();
+        self.canonical_caches.hot_direct_parent.release_storage();
+        self.canonical_caches.symmetry_refs.release_storage();
+        self.embed_layout_cache = std::collections::HashMap::new();
+        self.release_packed_transform_state();
     }
 
     pub(super) fn gc_reason(
@@ -42,81 +197,170 @@ impl HashLifeEngine {
         )
     }
 
-    pub(super) fn maybe_garbage_collect(&mut self, reason: &'static str) {
+    pub(super) fn maybe_garbage_collect_with_budget(
+        &mut self,
+        reason: &'static str,
+        hard_memory_bytes: u128,
+    ) {
+        if !self.at_gc_safepoint() {
+            self.stats.gc.gc_reason = if self.scheduler_active {
+                "scheduler_active"
+            } else {
+                "transaction_active"
+            };
+            self.stats.gc.gc_skips += 1;
+            return;
+        }
         if reason == "skip" {
-            self.stats.gc_reason = "skip";
-            self.stats.gc_skips += 1;
-            self.clear_transient_state();
+            self.stats.gc.gc_reason = "skip";
+            self.stats.gc.gc_skips += 1;
+            if self.transient_cache_pressure_entries() >= HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER {
+                self.stats.gc.gc_skipped_with_transient_growth += 1;
+            }
             return;
         }
 
-        self.stats.gc_runs += 1;
-        let (marked, live_nodes) = self.mark_live_nodes();
-        self.stats.nodes_before_mark = self.node_count();
-        self.stats.nodes_after_mark = live_nodes;
+        self.stats.gc.gc_runs += 1;
+        self.stats.gc.gc_transient_pressure_entries_before =
+            self.transient_cache_pressure_entries();
+        self.stats.gc.gc_canonical_cache_entries_before = self.canonical_cache_entries();
+        let live_nodes = self.mark_live_nodes();
+        self.stats.gc.nodes_before_mark = self.node_count();
+        self.stats.gc.nodes_after_mark = live_nodes;
         let reclaimable = self.node_count().saturating_sub(live_nodes);
         let should_compact = self.node_count() >= HASHLIFE_GC_MIN_NODES
             && reclaimable >= HASHLIFE_GC_MIN_RECLAIM
-            && (reclaimable * 4 >= self.node_count() || reason != "skip");
+            && reclaimable * 4 >= self.node_count();
 
-        if should_compact {
-            self.stats.gc_reason = "compacted";
-            self.stats.nodes_before_compact = self.node_count();
-            self.compact_marked_nodes(marked);
-            self.stats.nodes_after_compact = self.node_count();
+        if should_compact && self.can_repack_mandatory_indexes(live_nodes) {
+            self.stats.gc.gc_reason = "compacted";
+            self.stats.gc.nodes_before_compact = self.node_count();
+            self.compact_marked_nodes();
+            self.stats.gc.nodes_after_compact = self.node_count();
             self.last_gc_nodes = self.node_count();
+            self.clear_transient_state(true);
         } else {
-            self.stats.gc_reason = if reason == "root_changed" {
+            self.stats.gc.gc_reason = if reason == "root_changed" {
                 "root_changed_mark_only"
             } else {
                 reason
             };
-            self.stats.nodes_before_compact = self.node_count();
-            self.stats.nodes_after_compact = self.node_count();
-            self.last_gc_nodes = live_nodes;
+            self.stats.gc.nodes_before_compact = self.node_count();
+            self.stats.gc.nodes_after_compact = self.node_count();
+            self.last_gc_nodes = self.node_count();
+            self.filter_caches_to_live_nodes();
+            self.reset_packed_transform_state();
         }
-
-        self.clear_transient_state();
+        let release_threshold = hard_memory_bytes.saturating_sub(hard_memory_bytes / 5);
+        if super::memory::wide_allocated_bytes(self.allocated_bytes()) >= release_threshold {
+            self.release_optional_cache_storage();
+        }
     }
 
-    pub(super) fn mark_live_nodes(&mut self) -> (Vec<u64>, usize) {
-        let mut marked = vec![0_u64; self.node_count().div_ceil(64)];
-        let mut stack =
-            Vec::with_capacity(self.empty_by_level.len() + self.retained_roots.len() + 2);
-        stack.extend(self.empty_by_level.iter().copied());
-        stack.extend(self.retained_roots.iter().copied());
-        stack.push(self.dead_leaf);
-        stack.push(self.live_leaf);
+    fn can_repack_mandatory_indexes(&self, live_nodes: usize) -> bool {
+        self.at_gc_safepoint()
+            && self.intern.can_rebuild_without_allocation(live_nodes)
+            && self
+                .canonical_caches
+                .shape_intern
+                .can_rebuild_without_allocation(live_nodes)
+    }
 
-        let mut batch = [0_u64; 8];
-        while !stack.is_empty() {
-            let batch_len = stack.len().min(batch.len());
-            self.stats.gc_mark_batches += 1;
-            for slot in &mut batch[..batch_len] {
-                *slot = stack.pop().expect("stack length already checked");
+    fn filter_caches_to_live_nodes(&mut self) {
+        let columns = &self.node_columns;
+        self.intern.retain_for_gc(|key, node| {
+            node_is_live(node, columns) && packed_node_is_live(key, columns)
+        });
+        self.result_caches
+            .jump
+            .retain(|_, result| packed_node_is_live(result.packed, columns));
+        self.result_caches
+            .root
+            .retain(|_, result| packed_node_is_live(result.packed, columns));
+        self.result_caches
+            .overlap
+            .retain(|_, nodes| nodes.into_iter().all(|node| node_is_live(node, columns)));
+        self.result_caches.oriented.retain(|key, value| {
+            packed_node_is_live(key.packed, columns) && packed_node_is_live(value, columns)
+        });
+        self.result_caches
+            .materialized_packed
+            .retain(|key, node| packed_node_is_live(key, columns) && node_is_live(node, columns));
+        self.result_caches
+            .structural_fast_path
+            .retain(|node, identity| {
+                node_is_live(node, columns) && packed_node_is_live(identity.packed, columns)
+            });
+        self.result_caches
+            .packed_structural_fast_path
+            .retain(|key, identity| {
+                packed_node_is_live(key, columns) && packed_node_is_live(identity.packed, columns)
+            });
+        self.result_caches
+            .shells
+            .retain(|key, shell| node_is_live(key.node, columns) && node_is_live(shell, columns));
+        self.result_caches
+            .bounds
+            .retain(|node, _| node_is_live(node, columns));
+
+        self.canonical_caches.node.retain(|node, identity| {
+            node_is_live(node, columns) && packed_node_is_live(identity.packed, columns)
+        });
+        self.canonical_caches.packed.retain(|key, identity| {
+            packed_node_is_live(key, columns) && packed_node_is_live(identity.packed, columns)
+        });
+        self.canonical_caches.hot_packed.retain(|key, identity| {
+            packed_node_is_live(key, columns) && packed_node_is_live(identity.packed, columns)
+        });
+        self.canonical_caches.oriented.retain(|key, identity| {
+            packed_node_is_live(key.packed, columns)
+                && packed_node_is_live(identity.packed, columns)
+        });
+        self.canonical_caches.hot_oriented.retain(|key, identity| {
+            packed_node_is_live(key.packed, columns)
+                && packed_node_is_live(identity.packed, columns)
+        });
+        self.canonical_caches
+            .direct_parent
+            .retain(|_, identity| packed_node_is_live(identity.packed, columns));
+        self.canonical_caches
+            .hot_direct_parent
+            .retain(|_, identity| packed_node_is_live(identity.packed, columns));
+        self.canonical_caches
+            .symmetry_refs
+            .retain(|key, _| node_is_live(key.node, columns));
+    }
+
+    pub(super) fn mark_live_nodes(&mut self) -> usize {
+        let node_count = self.node_count();
+        self.node_columns.clear_marks();
+        for root in self
+            .empty_by_level
+            .iter()
+            .chain(self.retained_roots.iter())
+            .copied()
+            .chain([self.dead_leaf, self.live_leaf])
+        {
+            self.node_columns.mark(root);
+        }
+
+        for index in (0..node_count).rev() {
+            if !self.node_columns.is_marked(index) {
+                continue;
             }
-            for &node_id in &batch[..batch_len] {
-                let idx = node_id as usize;
-                let word = idx / 64;
-                let bit = 1_u64 << (idx % 64);
-                if (marked[word] & bit) != 0 {
-                    continue;
-                }
-                marked[word] |= bit;
-
-                if self.node_columns.level(node_id) == 0 {
-                    continue;
-                }
-                let [nw, ne, sw, se] = self.node_columns.quadrants(node_id);
-                stack.push(nw);
-                stack.push(ne);
-                stack.push(sw);
-                stack.push(se);
+            self.stats.gc.gc_mark_batches += 1;
+            let node = NodeId::try_from(index)
+                .or_invariant("HashLife arena exceeded u32 capacity during marking");
+            if self.node_columns.level(node) == 0 {
+                continue;
+            }
+            for child in self.node_columns.quadrants(node) {
+                debug_assert!(child < node, "HashLife child must precede parent during GC");
+                self.node_columns.mark(child);
             }
         }
 
-        let live = marked.iter().map(|word| word.count_ones() as usize).sum();
-        (marked, live)
+        self.node_columns.marked_count()
     }
 
     pub(super) fn record_retained_root(&mut self, root: NodeId) {
@@ -130,502 +374,404 @@ impl HashLifeEngine {
         }
     }
 
-    pub(super) fn compact_marked_nodes(&mut self, marked: Vec<u64>) {
-        let old_len = self.node_count();
-        let old_levels = self.node_columns.levels.clone();
-        let old_populations = self.node_columns.populations.clone();
-        let old_nws = self.node_columns.nws.clone();
-        let old_nes = self.node_columns.nes.clone();
-        let old_sws = self.node_columns.sws.clone();
-        let old_ses = self.node_columns.ses.clone();
-
-        let mut remap = vec![NodeId::MAX; old_len];
-        let live = marked.iter().map(|word| word.count_ones() as usize).sum();
-        let mut compacted = NodeColumns::default();
-        compacted.reserve(live);
+    pub(super) fn compact_marked_nodes(&mut self) {
+        assert!(
+            self.at_gc_safepoint(),
+            "HashLife arena repacking requires an explicit quiescent safepoint"
+        );
+        let old_len = self.node_columns.len();
+        let live_nodes = self.node_columns.marked_count();
+        assert!(
+            self.can_repack_mandatory_indexes(live_nodes),
+            "mandatory HashLife indexes must be prevalidated before arena repacking"
+        );
+        self.node_columns.clear_remap();
+        let mut live = 0_usize;
         let mut old_idx = 0_usize;
         while old_idx < old_len {
-            self.stats.gc_remap_batches += 1;
+            self.stats.gc.gc_remap_batches += 1;
             let batch_end = (old_idx + 8).min(old_len);
             for current_idx in old_idx..batch_end {
-                let word = current_idx / 64;
-                let bit = 1_u64 << (current_idx % 64);
-                if (marked[word] & bit) == 0 {
+                if !self.node_columns.is_marked(current_idx) {
                     continue;
                 }
-                remap[current_idx] = compacted.len() as NodeId;
-                compacted.push(
-                    old_levels[current_idx],
-                    old_populations[current_idx],
-                    old_nws[current_idx],
-                    old_nes[current_idx],
-                    old_sws[current_idx],
-                    old_ses[current_idx],
-                );
+                let remapped_node = NodeId::try_from(live)
+                    .or_invariant("HashLife compacted arena exceeded u32 capacity");
+                self.node_columns.set_remap(current_idx, remapped_node);
+                self.node_columns.copy_node(current_idx, live);
+                if self.node_columns.level(remapped_node) == 0 {
+                    let population = self.node_columns.population_stat(remapped_node);
+                    self.node_columns.set_fingerprint(
+                        remapped_node,
+                        crate::hashing::hash_leaf_population(population.lo),
+                    );
+                } else {
+                    let remapped_children =
+                        self.node_columns.quadrants(remapped_node).map(|child| {
+                            self.node_columns
+                                .remap(child)
+                                .or_invariant("live child must have a compaction remap")
+                        });
+                    self.node_columns
+                        .set_quadrants(remapped_node, remapped_children);
+                    debug_assert!(
+                        self.node_columns
+                            .quadrants(remapped_node)
+                            .into_iter()
+                            .all(|child| child < remapped_node),
+                        "stable arena packing must preserve child-before-parent topology"
+                    );
+                    self.node_columns.set_fingerprint(
+                        remapped_node,
+                        crate::hashing::hash_u64_words_with_level(
+                            self.node_columns.level(remapped_node),
+                            self.node_columns.quadrants(remapped_node).map(u64::from),
+                        ),
+                    );
+                }
+                live += 1;
             }
             old_idx = batch_end;
         }
-
-        for node_idx in 0..compacted.len() {
-            if compacted.levels[node_idx] == 0 {
-                compacted.fingerprints[node_idx] =
-                    crate::hashing::hash_leaf_population(compacted.populations[node_idx]);
-                continue;
-            }
-            compacted.nws[node_idx] = remap[compacted.nws[node_idx] as usize];
-            compacted.nes[node_idx] = remap[compacted.nes[node_idx] as usize];
-            compacted.sws[node_idx] = remap[compacted.sws[node_idx] as usize];
-            compacted.ses[node_idx] = remap[compacted.ses[node_idx] as usize];
-            compacted.fingerprints[node_idx] = crate::hashing::hash_u64_words_with_level(
-                compacted.levels[node_idx],
-                [
-                    compacted.nws[node_idx],
-                    compacted.nes[node_idx],
-                    compacted.sws[node_idx],
-                    compacted.ses[node_idx],
-                ],
-            );
-        }
-
-        self.node_columns = compacted;
-        self.intern = FlatTable::with_capacity(self.node_count().saturating_mul(2));
+        self.node_columns.set_len_after_compaction(live);
+        self.arena_epoch = self
+            .arena_epoch
+            .checked_add(1)
+            .or_invariant("HashLife arena epoch overflow");
+        self.rebuild_canonical_shapes();
+        self.intern.clear();
         for node_id in 0..self.node_count() {
-            let node_id = node_id as NodeId;
+            let node_id = NodeId::try_from(node_id)
+                .or_invariant("HashLife rebuilt arena exceeded u32 capacity");
             let key = if self.node_columns.level(node_id) == 0 {
                 HashLifeEngine::packed_leaf_key(self.node_columns.population(node_id) == 1)
             } else {
                 self.node_columns.packed_key(node_id)
             };
-            self.intern
-                .insert_with_fingerprint(key, self.node_columns.fingerprint(node_id), node_id);
+            if self
+                .intern
+                .try_insert_with_fingerprint(key, self.node_columns.fingerprint(node_id), node_id)
+                .is_err()
+            {
+                crate::invariant_failure!(
+                    "prevalidated mandatory intern capacity changed during arena repacking"
+                );
+            }
         }
+        let columns = &self.node_columns;
+        self.retained_roots.retain_mut(|root| {
+            let Some(remapped) = columns.remap(*root) else {
+                return false;
+            };
+            *root = remapped;
+            true
+        });
+        self.empty_by_level.retain_mut(|empty| {
+            let Some(remapped) = columns.remap(*empty) else {
+                return false;
+            };
+            *empty = remapped;
+            true
+        });
+        self.dead_leaf = self
+            .node_columns
+            .remap(self.dead_leaf)
+            .or_invariant("dead leaf must survive compaction");
+        self.live_leaf = self
+            .node_columns
+            .remap(self.live_leaf)
+            .or_invariant("live leaf must survive compaction");
 
-        for root in &mut self.retained_roots {
-            *root = remap[*root as usize];
-        }
-        for empty in &mut self.empty_by_level {
-            *empty = remap[*empty as usize];
-        }
-        self.dead_leaf = remap[self.dead_leaf as usize];
-        self.live_leaf = remap[self.live_leaf as usize];
+        self.node_columns.release_tail_segments();
+        self.node_columns.clear_marks();
+        self.node_columns.clear_remap();
+
+        self.discard_epoch_bound_state();
+    }
+
+    /// No cache containing an arena-local node reference may survive an epoch change.
+    /// Mandatory structural indexes are rebuilt above from compacted node semantics;
+    /// all acceleration state is complete-or-discarded.
+    fn discard_epoch_bound_state(&mut self) {
+        self.result_caches.jump.reset();
+        self.result_caches.root.reset();
+        self.result_caches.overlap.reset();
+        self.result_caches.oriented.reset();
+        self.result_caches.materialized_packed.reset();
+        self.result_caches.structural_fast_path.reset();
+        self.result_caches.packed_structural_fast_path.reset();
+        self.result_caches.shells.reset();
+        self.result_caches.bounds.reset();
+
+        self.canonical_caches.node.reset();
+        self.canonical_caches.packed.reset();
+        self.canonical_caches.hot_packed.reset();
+        self.canonical_caches.oriented.reset();
+        self.canonical_caches.hot_oriented.reset();
+        self.canonical_caches.direct_parent.reset();
+        self.canonical_caches.hot_direct_parent.reset();
+        self.canonical_caches.symmetry_refs.reset();
+        self.embed_layout_cache.clear();
+        self.reset_packed_transform_state();
     }
 }
 
+fn node_is_live(node: NodeId, columns: &NodeColumns) -> bool {
+    columns.is_marked(node as usize)
+}
+
+fn packed_node_is_live(node: super::PackedNodeKey, columns: &NodeColumns) -> bool {
+    node.level == 0
+        || node
+            .children
+            .into_iter()
+            .all(|child| node_is_live(child, columns))
+}
+
 #[cfg(test)]
-impl HashLifeEngine {
-    pub(crate) fn verify_overlap_batch_parity(&mut self, grid: &BitGrid) -> bool {
-        let (root, _, _) = self.embed_grid_state(grid);
-        let mut nodes = [0; crate::simd_layout::SIMD_BATCH_LANES];
-        let mut active = 0;
-        let mut stack = vec![root];
+mod tests {
+    use super::*;
+    use crate::hashlife::PopulationStat;
 
-        while let Some(node) = stack.pop() {
-            if self.node_columns.level(node) < 2 {
-                continue;
-            }
-            nodes[active] = node;
-            active += 1;
-            if active == crate::simd_layout::SIMD_BATCH_LANES {
-                break;
-            }
-            let [nw, ne, sw, se] = self.node_columns.quadrants(node);
-            stack.push(se);
-            stack.push(sw);
-            stack.push(ne);
-            stack.push(nw);
-        }
-
-        if active == 0 {
-            return true;
-        }
-
-        let batched = self.probe_and_build_overlaps_staged(&nodes, active);
-        for lane in 0..active {
-            if batched[lane] != self.overlapping_subnodes(nodes[lane]) {
-                return false;
-            }
-        }
-        true
-    }
-
-    pub(crate) fn verify_canonical_overlap_batch_parity(&mut self, grid: &BitGrid) -> bool {
-        let (root, _, _) = self.embed_grid_state(grid);
-        let mut nodes = [0; crate::simd_layout::SIMD_BATCH_LANES];
-        let mut canonical_keys =
-            [super::CanonicalJumpKey {
-                packed: super::PackedNodeKey::new(0, [0; 4]),
-                step_exp: 1,
-            }; crate::simd_layout::SIMD_BATCH_LANES];
-        let mut active = 0;
-        let mut stack = vec![root];
-
-        while let Some(node) = stack.pop() {
-            if self.node_columns.level(node) < 2 {
-                continue;
-            }
-            nodes[active] = node;
-            canonical_keys[active] = self.canonical_jump_key_packed((node, 1)).0;
-            active += 1;
-            if active == crate::simd_layout::SIMD_BATCH_LANES {
-                break;
-            }
-            let [nw, ne, sw, se] = self.node_columns.quadrants(node);
-            stack.push(se);
-            stack.push(sw);
-            stack.push(ne);
-            stack.push(nw);
-        }
-
-        if active == 0 {
-            return true;
-        }
-
-        let raw = self.probe_and_build_overlaps_staged(&nodes, active);
-        let canonical = self.probe_and_build_overlaps_from_canonical_keys_staged(&canonical_keys, active);
-        for lane in 0..active {
-            if raw[lane] != canonical[lane] {
-                return false;
-            }
-        }
-        true
-    }
-
-    pub(crate) fn verify_canonical_child_key_batch_parity(&mut self, grid: &crate::bitgrid::BitGrid) -> bool {
-        let (root, _, _) = self.embed_grid_state(grid);
-        let overlaps = self.overlapping_subnodes(root);
-        let nodes = [
-            overlaps[8],
-            overlaps[7],
-            overlaps[6],
-            overlaps[5],
-            overlaps[4],
-            overlaps[3],
-            overlaps[2],
-            overlaps[1],
-            overlaps[0],
-        ];
-        let batched = self.discovered_jump_tasks_from_nodes(nodes, 2);
-        for lane in 0..9 {
-            if batched[lane].key != self.canonical_jump_key_packed((nodes[lane], 2)).0 {
-                return false;
-            }
-        }
-        true
-    }
-
-    pub(crate) fn duplicate_overlap_batch_dedupe_stats(
-        &mut self,
-        grid: &crate::bitgrid::BitGrid,
-    ) -> (usize, usize) {
-        let (root, _, _) = self.embed_grid_state(grid);
-        let before = (self.stats.overlap_cache_misses, self.stats.overlap_local_reuse_lanes);
-        let mut nodes = [0; crate::simd_layout::SIMD_BATCH_LANES];
-        nodes[0] = root;
-        nodes[1] = root;
-        let overlaps = self.probe_and_build_overlaps_staged(&nodes, 2);
-        assert_eq!(overlaps[0], overlaps[1]);
-        (
-            self.stats.overlap_cache_misses - before.0,
-            self.stats.overlap_local_reuse_lanes - before.1,
-        )
-    }
-
-    pub(crate) fn duplicate_jump_batch_query_stats(
-        &mut self,
-        grid: &crate::bitgrid::BitGrid,
-    ) -> (usize, usize) {
-        let (root, _, _) = self.embed_grid_state(grid);
-        self.insert_jump_result((root, 0), root);
-        let before = (
-            self.stats.jump_batch_unique_queries,
-            self.stats.jump_batch_reused_queries,
+    #[test]
+    fn shell_and_bounds_entries_contribute_to_gc_pressure() {
+        let mut engine = HashLifeEngine::default();
+        let baseline = engine.transient_cache_pressure_entries();
+        let shell_key = super::super::ShellKey {
+            node: engine.dead_leaf,
+            target_level: 1,
+        };
+        engine
+            .result_caches
+            .shells
+            .insert(shell_key, engine.dead_leaf);
+        engine.result_caches.bounds.insert(
+            engine.live_leaf,
+            super::super::RelativeBounds {
+                min_x: 0,
+                min_y: 0,
+                max_x: 0,
+                max_y: 0,
+            },
         );
-        let results = self.jump_result_batch([root, root, root, root], 0);
-        assert_eq!(results[0], results[1]);
-        assert_eq!(results[1], results[2]);
-        assert_eq!(results[2], results[3]);
-        (
-            self.stats.jump_batch_unique_queries - before.0,
-            self.stats.jump_batch_reused_queries - before.1,
-        )
+
+        assert_eq!(
+            engine.transient_cache_pressure_entries(),
+            baseline + 2,
+            "shell and bounds allocations must both increase GC pressure accounting"
+        );
     }
 
-    pub(crate) fn verify_packed_jump_cache_roundtrip(
-        &mut self,
-        grid: &crate::bitgrid::BitGrid,
-        step_exp: u32,
-    ) -> bool {
-        let embedded = self.embed_for_jump(grid, step_exp);
-        let root = embedded.root;
-        let before_hits = self.stats.packed_cache_result_hits;
-        let result = self.advance_pow2(root, step_exp);
-        let cached = self.cached_jump_result((root, step_exp));
-        cached == Some(result) && self.stats.packed_cache_result_hits > before_hits
+    #[test]
+    fn garbage_collection_skips_non_safepoint_scheduler_state() {
+        let mut engine = HashLifeEngine::default();
+        let node_count = engine.node_count();
+        engine.scheduler_active = true;
+
+        engine.maybe_garbage_collect_with_budget("active", u128::MAX);
+
+        assert_eq!(engine.node_count(), node_count);
+        assert_eq!(engine.stats.gc.gc_runs, 0);
+        assert_eq!(engine.stats.gc.gc_skips, 1);
+        assert_eq!(engine.stats.gc.gc_reason, "scheduler_active");
     }
 
-    pub(crate) fn duplicate_oriented_result_cache_stats(
-        &mut self,
-        grid: &crate::bitgrid::BitGrid,
-    ) -> ((usize, usize), (usize, usize)) {
-        let (root, _, _) = self.embed_grid_state(grid);
-        let packed = self.node_columns.packed_key(root);
-        let before_first = (
-            self.stats.packed_cache_result_materializations,
-            self.stats.packed_inverse_transform_hits,
-        );
-        let first = self.materialize_oriented_packed_result(
-            packed,
-            Symmetry::Identity,
-            Symmetry::Rotate90,
-        );
-        let first_delta = (
-            self.stats.packed_cache_result_materializations - before_first.0,
-            self.stats.packed_inverse_transform_hits - before_first.1,
-        );
-        let before_second = (
-            self.stats.packed_cache_result_materializations,
-            self.stats.packed_inverse_transform_hits,
-        );
-        let second = self.materialize_oriented_packed_result(
-            packed,
-            Symmetry::Identity,
-            Symmetry::Rotate90,
-        );
-        let second_delta = (
-            self.stats.packed_cache_result_materializations - before_second.0,
-            self.stats.packed_inverse_transform_hits - before_second.1,
-        );
-        assert_eq!(first, second);
-        (first_delta, second_delta)
+    #[test]
+    fn garbage_collection_skips_active_allocation_transaction() {
+        let mut engine = HashLifeEngine::default();
+        let node_count = engine.node_count();
+        engine.begin_allocation_transaction(u128::MAX);
+
+        engine.maybe_garbage_collect_with_budget("active", u128::MAX);
+
+        assert_eq!(engine.node_count(), node_count);
+        assert_eq!(engine.stats.gc.gc_runs, 0);
+        assert_eq!(engine.stats.gc.gc_skips, 1);
+        assert_eq!(engine.stats.gc.gc_reason, "transaction_active");
+        assert!(engine.take_allocation_failure().is_none());
     }
 
-    pub(crate) fn verify_packed_transform_parity(&mut self, grid: &crate::bitgrid::BitGrid) -> bool {
-        let (root, _, _) = self.embed_grid_state(grid);
-        let mut stack = vec![root];
-        let mut checked = 0;
-        while let Some(node) = stack.pop() {
-            if self.node_columns.level(node) == 0 {
-                continue;
-            }
-            let packed = self.node_columns.packed_key(node);
-            for symmetry in crate::symmetry::D4Symmetry::ALL {
-                let expected = self.transform_node(node, symmetry);
-                let transformed = self.transform_packed_node_key(packed, symmetry);
-                let actual = self.materialize_packed_transform_root(transformed);
-                if expected != actual {
-                    return false;
-                }
-            }
-            checked += 1;
-            if checked == crate::simd_layout::SIMD_BATCH_LANES {
-                break;
-            }
-            let [nw, ne, sw, se] = self.node_columns.quadrants(node);
-            stack.push(se);
-            stack.push(sw);
-            stack.push(ne);
-            stack.push(nw);
+    #[test]
+    fn repack_does_not_start_without_mandatory_index_capacity() {
+        let mut engine = HashLifeEngine::default();
+        for _ in 0..super::super::arena::NODE_SEGMENT_LEN {
+            engine
+                .node_columns
+                .try_reserve_node()
+                .or_invariant("test arena segment allocation failed");
+            engine.push_node(0, PopulationStat::exact(0), 0, 0, 0, 0);
         }
-        true
+        engine.record_retained_root(engine.dead_leaf);
+        engine.canonical_caches.shape_intern.release_storage();
+        let nodes_before = engine.node_count();
+        let epoch_before = engine.arena_epoch;
+
+        engine.maybe_garbage_collect_with_budget("root_changed", u128::MAX);
+
+        assert_eq!(engine.node_count(), nodes_before);
+        assert_eq!(engine.arena_epoch, epoch_before);
+        assert_eq!(engine.stats.gc.nodes_after_compact, nodes_before);
     }
 
-    pub(crate) fn verify_packed_canonicalization_symmetry_parity(
-        &mut self,
-        grid: &crate::bitgrid::BitGrid,
-    ) -> bool {
-        let (root, _, _) = self.embed_grid_state(grid);
-        let mut stack = vec![root];
-        let mut checked = 0;
-        while let Some(node) = stack.pop() {
-            if self.node_columns.level(node) == 0 {
-                continue;
-            }
-            let canonical = self.canonicalize_packed_node(node).packed;
-            for symmetry in crate::symmetry::D4Symmetry::ALL {
-                let transformed = self.transform_node(node, symmetry);
-                let transformed_canonical = self.canonicalize_packed_node(transformed).packed;
-                if transformed_canonical != canonical {
-                    return false;
-                }
-            }
-            checked += 1;
-            if checked == crate::simd_layout::SIMD_BATCH_LANES {
-                break;
-            }
-            let [nw, ne, sw, se] = self.node_columns.quadrants(node);
-            stack.push(se);
-            stack.push(sw);
-            stack.push(ne);
-            stack.push(nw);
+    #[test]
+    fn quiescent_repack_reuses_arena_capacity_without_second_arena() {
+        let mut engine = HashLifeEngine::default();
+        for _ in 0..super::super::arena::NODE_SEGMENT_LEN * 4 {
+            engine
+                .node_columns
+                .try_reserve_node()
+                .or_invariant("test arena segment allocation failed");
+            engine.push_node(0, PopulationStat::exact(0), 0, 0, 0, 0);
         }
-        true
-    }
+        let capacity_before = engine.node_columns.capacity();
+        let segments_before = engine.node_columns.segment_count();
+        let bytes_before = engine.allocated_bytes();
+        let epoch_before = engine.arena_epoch;
 
-    pub(crate) fn runtime_stats(&self) -> super::HashLifeRuntimeStats {
-        super::HashLifeRuntimeStats {
-            nodes: self.node_count(),
-            intern: self.intern.len(),
-            empty_levels: self.empty_by_level.len(),
-            jump_cache: self.jump_cache.len(),
-            retained_roots: self.retained_roots.len(),
-            overlap_cache: self.overlap_cache.len(),
-            jump_cache_hits: self.stats.jump_cache_hits,
-            symmetric_jump_cache_hits: self.stats.symmetric_jump_cache_hits,
-            jump_cache_misses: self.stats.jump_cache_misses,
-            root_result_cache_hits: self.stats.root_result_cache_hits,
-            root_result_cache_misses: self.stats.root_result_cache_misses,
-            overlap_cache_hits: self.stats.overlap_cache_hits,
-            overlap_cache_misses: self.stats.overlap_cache_misses,
-            gc_runs: self.stats.gc_runs,
-            gc_skips: self.stats.gc_skips,
-            nodes_before_mark: self.stats.nodes_before_mark,
-            nodes_after_mark: self.stats.nodes_after_mark,
-            nodes_before_compact: self.stats.nodes_before_compact,
-            nodes_after_compact: self.stats.nodes_after_compact,
-            jump_cache_before_clear: self.stats.jump_cache_before_clear,
-            gc_reason: self.stats.gc_reason,
-            builder_frames: self.stats.builder_frames,
-            builder_partitions: self.stats.builder_partitions,
-            builder_max_stack: self.stats.builder_max_stack,
-            scheduler_tasks: self.stats.scheduler_tasks,
-            scheduler_ready_max: self.stats.scheduler_ready_max,
-            simd_disabled_fast_exits: self.stats.simd_disabled_fast_exits,
-            step0_simd_lanes: self.stats.step0_simd_lanes,
-            phase1_simd_lanes: self.stats.phase1_simd_lanes,
-            phase2_simd_lanes: self.stats.phase2_simd_lanes,
-            step0_simd_batches: self.stats.step0_simd_batches,
-            phase1_simd_batches: self.stats.phase1_simd_batches,
-            phase2_simd_batches: self.stats.phase2_simd_batches,
-            step0_provisional_records: self.stats.step0_provisional_records,
-            phase1_provisional_records: self.stats.phase1_provisional_records,
-            phase2_provisional_records: self.stats.phase2_provisional_records,
-            scalar_commit_lanes: self.stats.scalar_commit_lanes,
-            join_shortcut_avoided: self.stats.join_shortcut_avoided,
-            dependency_stalls: self.stats.dependency_stalls,
-            step0_ready_max: self.stats.step0_ready_max,
-            phase1_ready_max: self.stats.phase1_ready_max,
-            phase2_ready_max: self.stats.phase2_ready_max,
-            canonical_batch_lanes: self.stats.canonical_batch_lanes,
-            canonical_batch_batches: self.stats.canonical_batch_batches,
-            overlap_prep_lanes: self.stats.overlap_prep_lanes,
-            overlap_prep_batches: self.stats.overlap_prep_batches,
-            recursive_overlap_batch_lanes: self.stats.recursive_overlap_batch_lanes,
-            recursive_overlap_batch_batches: self.stats.recursive_overlap_batch_batches,
-            overlap_local_reuse_lanes: self.stats.overlap_local_reuse_lanes,
-            cache_probe_batches: self.stats.cache_probe_batches,
-            scheduler_probe_batches: self.stats.scheduler_probe_batches,
-            symmetry_gate_allowed: self.stats.symmetry_gate_allowed,
-            symmetry_gate_blocked: self.stats.symmetry_gate_blocked,
-            canonical_node_cache_hits: self.stats.canonical_node_cache_hits,
-            canonical_node_cache_misses: self.stats.canonical_node_cache_misses,
-            jump_presence_probe_batches: self.stats.jump_presence_probe_batches,
-            jump_presence_probe_lanes: self.stats.jump_presence_probe_lanes,
-            jump_presence_probe_hits: self.stats.jump_presence_probe_hits,
-            jump_batch_unique_queries: self.stats.jump_batch_unique_queries,
-            jump_batch_reused_queries: self.stats.jump_batch_reused_queries,
-            cached_fingerprint_probes: self.stats.cached_fingerprint_probes,
-            recomputed_fingerprint_probes: self.stats.recomputed_fingerprint_probes,
-            gc_mark_batches: self.stats.gc_mark_batches,
-            gc_remap_batches: self.stats.gc_remap_batches,
-            packed_d4_canonicalization_misses: self.stats.packed_d4_canonicalization_misses,
-            packed_inverse_transform_hits: self.stats.packed_inverse_transform_hits,
-            packed_recursive_transform_hits: self.stats.packed_recursive_transform_hits,
-            packed_recursive_transform_misses: self.stats.packed_recursive_transform_misses,
-            packed_overlap_outputs_produced: self.stats.packed_overlap_outputs_produced,
-            packed_cache_result_lookups: self.stats.packed_cache_result_lookups,
-            packed_cache_result_hits: self.stats.packed_cache_result_hits,
-            packed_cache_result_materializations: self.stats.packed_cache_result_materializations,
-            #[cfg(test)]
-            transformed_node_materializations: self.stats.transformed_node_materializations,
+        let live = engine.mark_live_nodes();
+        engine.compact_marked_nodes();
+
+        assert_eq!(
+            live, 2,
+            "only canonical dead/live leaves should remain reachable"
+        );
+        assert_eq!(engine.node_count(), 2);
+        assert!(segments_before >= 4, "fixture did not span enough segments");
+        assert_eq!(
+            engine.node_columns.segment_count(),
+            1,
+            "dead tail segments were not physically released"
+        );
+        assert!(
+            engine.node_columns.capacity() <= capacity_before,
+            "quiescent compaction must not grow segmented arena capacity"
+        );
+        assert!(
+            engine.allocated_bytes() <= bytes_before,
+            "in-place repacking unexpectedly grew retained storage: before={bytes_before} after={}",
+            engine.allocated_bytes()
+        );
+        assert_eq!(engine.arena_epoch, epoch_before + 1);
+        let resumed = engine.join(
+            engine.dead_leaf,
+            engine.live_leaf,
+            engine.live_leaf,
+            engine.dead_leaf,
+        );
+        assert!(
+            resumed > engine.live_leaf,
+            "mandatory interning did not resume from reclaimed segment capacity"
+        );
+        for parent in 0..engine.node_count() {
+            let parent = NodeId::try_from(parent).or_invariant("test node id");
+            if engine.node_columns.level(parent) != 0 {
+                assert!(
+                    engine
+                        .node_columns
+                        .quadrants(parent)
+                        .into_iter()
+                        .all(|child| child < parent),
+                    "repacked parent {parent} violates child-before-parent topology"
+                );
+            }
         }
     }
 
-    pub(crate) fn diagnostic_summary(&self) -> super::HashLifeDiagnosticSummary {
-        let stats = self.runtime_stats();
-        let jump_full_total = stats.jump_cache_hits + stats.jump_cache_misses;
-        let jump_presence_total = stats.jump_presence_probe_hits
-            + stats
-                .jump_presence_probe_lanes
-                .saturating_sub(stats.jump_presence_probe_hits);
-        let overlap_total = stats.overlap_cache_hits + stats.overlap_cache_misses;
-        let symmetry_gate_total = stats.symmetry_gate_allowed + stats.symmetry_gate_blocked;
-        let canonical_cache_total = stats.canonical_node_cache_hits + stats.canonical_node_cache_misses;
-        let packed_cache_total = stats.packed_cache_result_lookups;
-        let total_simd_lanes =
-            stats.step0_simd_lanes + stats.phase1_simd_lanes + stats.phase2_simd_lanes;
-        let total_provisionals = stats.step0_provisional_records
-            + stats.phase1_provisional_records
-            + stats.phase2_provisional_records;
-        let recursive_overlap_total = stats.overlap_prep_batches.max(1);
-        let gc_mark_total = stats.nodes_before_mark.max(1);
-        let gc_compact_total = stats.nodes_before_compact.max(1);
+    #[test]
+    fn active_mark_and_filter_preserve_all_owned_capacities() {
+        let mut engine = HashLifeEngine::default();
+        engine.record_retained_root(engine.dead_leaf);
+        let bytes_before = engine.allocated_bytes();
 
-        super::HashLifeDiagnosticSummary {
-            total_nodes: stats.nodes,
-            retained_roots: stats.retained_roots,
-            nodes_match_intern: stats.nodes == stats.intern,
-            dependency_stalls: stats.dependency_stalls,
-            jump_full_hit_rate: stats.jump_cache_hits as f64 / jump_full_total.max(1) as f64,
-            jump_presence_hit_rate: stats.jump_presence_probe_hits as f64
-                / jump_presence_total.max(1) as f64,
-            overlap_hit_rate: stats.overlap_cache_hits as f64 / overlap_total.max(1) as f64,
-            overlap_local_reuse_rate: stats.overlap_local_reuse_lanes as f64
-                / stats.overlap_prep_lanes.max(1) as f64,
-            symmetry_gate_allow_rate: stats.symmetry_gate_allowed as f64
-                / symmetry_gate_total.max(1) as f64,
-            canonical_cache_hit_rate: stats.canonical_node_cache_hits as f64
-                / canonical_cache_total.max(1) as f64,
-            packed_cache_hit_rate: stats.packed_cache_result_hits as f64
-                / packed_cache_total.max(1) as f64,
-            symmetry_jump_hits: stats.symmetric_jump_cache_hits,
-            simd_lane_coverage: total_simd_lanes as f64 / total_provisionals.max(1) as f64,
-            scalar_commit_ratio: stats.scalar_commit_lanes as f64
-                / total_provisionals.max(1) as f64,
-            probes_per_scheduler_task: stats.scheduler_probe_batches as f64
-                / stats.scheduler_tasks.max(1) as f64,
-            recursive_overlap_batch_rate: stats.recursive_overlap_batch_batches as f64
-                / recursive_overlap_total as f64,
-            gc_reclaim_ratio: (stats.nodes_before_mark.saturating_sub(stats.nodes_after_mark))
-                as f64
-                / gc_mark_total as f64,
-            gc_compact_ratio: (stats.nodes_before_compact.saturating_sub(stats.nodes_after_compact))
-                as f64
-                / gc_compact_total as f64,
-            gc_reason: stats.gc_reason,
-            gc_runs: stats.gc_runs,
-            gc_skips: stats.gc_skips,
-            packed_d4_canonicalization_misses: stats.packed_d4_canonicalization_misses,
-            packed_inverse_transform_hits: stats.packed_inverse_transform_hits,
-            packed_recursive_transform_hits: stats.packed_recursive_transform_hits,
-            packed_recursive_transform_misses: stats.packed_recursive_transform_misses,
-            packed_overlap_outputs_produced: stats.packed_overlap_outputs_produced,
-            packed_cache_result_materializations: stats.packed_cache_result_materializations,
-            #[cfg(test)]
-            transformed_node_materializations: stats.transformed_node_materializations,
-        }
+        engine.mark_live_nodes();
+        engine.filter_caches_to_live_nodes();
+        engine.reset_packed_transform_state();
+
+        assert_eq!(
+            engine.allocated_bytes(),
+            bytes_before,
+            "active mark/filter changed owned capacity"
+        );
     }
 
-    pub(crate) fn verify_node_fingerprint_invariants(&self) -> bool {
-        for node_id in 0..self.node_count() {
-            let node_id = node_id as NodeId;
-            let packed = self.node_columns.packed_key(node_id);
-            if self.node_columns.fingerprint(node_id) != super::FlatKey::fingerprint(&packed) {
-                return false;
-            }
+    #[test]
+    fn mandatory_node_growth_is_rejected_before_publication_at_hard_limit() {
+        let mut engine = HashLifeEngine::default();
+        while engine.node_count() < engine.node_columns.capacity() {
+            let id = NodeId::try_from(engine.node_count()).or_invariant("test node id");
+            engine.push_node(0, PopulationStat::exact(0), id, id, id, id);
         }
-        true
+        let nodes_before = engine.node_count();
+        engine.begin_allocation_transaction(super::super::memory::wide_allocated_bytes(
+            engine.allocated_bytes(),
+        ));
+
+        let result = engine.join(
+            engine.dead_leaf,
+            engine.live_leaf,
+            engine.live_leaf,
+            engine.dead_leaf,
+        );
+
+        assert_eq!(
+            result, engine.dead_leaf,
+            "failed join must remain unpublished"
+        );
+        assert_eq!(engine.node_count(), nodes_before);
+        assert!(
+            engine.take_allocation_failure().is_some(),
+            "mandatory growth rejection was not propagated to the transaction"
+        );
     }
 
-    pub(crate) fn verify_intern_fingerprint_fast_path_parity(&self) -> bool {
-        for node_id in 0..self.node_count() {
-            let node_id = node_id as NodeId;
-            let key = self.node_columns.packed_key(node_id);
-            let fingerprint = self.node_columns.fingerprint(node_id);
-            if self.intern.get(&key) != self.intern.get_with_fingerprint(&key, fingerprint) {
-                return false;
-            }
-        }
-        true
+    #[test]
+    fn scheduler_workspace_is_rejected_before_allocation_at_hard_limit() {
+        let mut engine = HashLifeEngine::default();
+        let quadrant = engine.join(
+            engine.live_leaf,
+            engine.dead_leaf,
+            engine.dead_leaf,
+            engine.dead_leaf,
+        );
+        let root = engine.join(quadrant, quadrant, quadrant, quadrant);
+        let retained = super::super::memory::wide_allocated_bytes(engine.allocated_bytes());
+        engine.begin_allocation_transaction(retained);
+
+        let result = engine.advance_pow2(root, 0);
+
+        assert_eq!(result, engine.dead_leaf);
+        assert_eq!(
+            super::super::memory::wide_allocated_bytes(engine.allocated_bytes()),
+            retained,
+            "scheduler failure allocated outside the preflighted transaction"
+        );
+        assert!(
+            engine.take_allocation_failure().is_some(),
+            "scheduler workspace growth bypassed the active hard limit"
+        );
+        assert!(!engine.scheduler_active);
     }
 
+    #[test]
+    fn hard_pressure_releases_transform_backing_storage_and_reinitializes_lazily() {
+        let mut engine = HashLifeEngine::default();
+        engine.transform_state.nodes.reserve(16_384);
+        engine.transform_state.materialized.reserve(16_384);
+        engine.transform_state.packed_roots.reserve(16_384);
+        let bytes_before = engine.allocated_bytes();
+
+        engine.release_optional_cache_storage();
+
+        let bytes_after = engine.allocated_bytes();
+        assert!(
+            bytes_after < bytes_before,
+            "hard-pressure release retained transform capacity: before={bytes_before} after={bytes_after}"
+        );
+        let leaf = super::super::PackedNodeKey::new(0, [0; 4]);
+        assert_eq!(
+            engine.transform_packed_node_key(leaf, crate::symmetry::D4Symmetry::Identity),
+            0,
+            "released transform state did not reinitialize its canonical leaves"
+        );
+    }
 }

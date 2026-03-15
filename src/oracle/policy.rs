@@ -1,8 +1,9 @@
 use super::*;
+use crate::RequiredExt;
 
 pub(super) fn confirmation_full_grid_policy() -> GridExtractionPolicy {
     GridExtractionPolicy::FullGridIfUnder {
-        max_population: HASHLIFE_FULL_GRID_MAX_POPULATION,
+        max_population: u128::from(HASHLIFE_FULL_GRID_MAX_POPULATION),
         max_chunks: HASHLIFE_FULL_GRID_MAX_CHUNKS,
         max_bounds_span: Coord::MAX,
     }
@@ -85,12 +86,14 @@ pub(super) fn target_exact_suffix_window(population: usize, span: Coord) -> u64 
 }
 
 pub(super) fn cycle_probe_prefix_window(population: usize, span: Coord) -> u64 {
-    if population <= 64 && span <= 32 {
+    if population <= 8 && span <= 8 {
+        ORACLE_METHUSELAH_EXACT_WINDOW
+    } else if population <= 64 && span <= 32 {
         64
     } else if population <= 256 && span <= 64 {
         16
     } else {
-        0
+        8
     }
 }
 
@@ -103,25 +106,61 @@ pub(super) fn max_hashlife_safe_jump_from_span(span: Coord) -> u64 {
     if span <= 0 {
         return 1;
     }
-    let raw_max_jump = (((Coord::MAX as i128) - (2 * span as i128) - 8) / 4).max(1) as u64;
+    let raw_max_jump =
+        u64::try_from(((i128::from(Coord::MAX) - 2 * i128::from(span) - 8) / 4).max(1))
+            .or_invariant("safe HashLife jump bound should fit u64");
     let mut jump = 1_u64 << (63 - raw_max_jump.leading_zeros());
-    while jump > 1 && required_root_size_for_jump(span as u64, jump) > Coord::MAX as u64 {
+    while jump > 1
+        && required_root_size_for_jump(
+            u128::try_from(span).or_invariant("positive span should fit u128"),
+            u128::from(jump),
+        ) > Coord::MAX as u128
+    {
         jump >>= 1;
     }
-    jump
+    if required_root_size_for_jump(
+        u128::try_from(span).or_invariant("positive span should fit u128"),
+        u128::from(jump),
+    ) <= Coord::MAX as u128
+    {
+        jump
+    } else {
+        0
+    }
 }
 
 pub(super) fn hybrid_target_prefix_generations(population: usize, generations: u64) -> u64 {
-    let prefix = (population as u64)
+    let prefix = (population as u128)
         .saturating_div(32)
         .clamp(16, 64)
-        .min(generations);
+        .min(u128::from(generations));
+    let prefix = u64::try_from(prefix).or_invariant("hybrid prefix is clamped to u64");
     prefix.max(1).min(generations)
 }
 
-pub(super) fn required_root_size_for_jump(span: u64, jump: u64) -> u64 {
-    (2 * span + 4 * (jump + 2))
-        .max((4 * jump) + 4)
+pub(super) fn required_root_size_for_jump(span: u128, jump: u128) -> u128 {
+    span.saturating_mul(2)
+        .saturating_add(jump.saturating_add(2).saturating_mul(4))
+        .max(jump.saturating_mul(4).saturating_add(4))
         .max(4)
-        .next_power_of_two()
+        .checked_next_power_of_two()
+        .unwrap_or(u128::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_size_planning_keeps_wide_intermediates_exact() {
+        assert_eq!(
+            required_root_size_for_jump(u128::from(u64::MAX), u128::from(u64::MAX)),
+            1_u128 << 67
+        );
+    }
+
+    #[test]
+    fn unrepresentable_coordinate_span_has_no_safe_hashlife_jump() {
+        assert_eq!(max_hashlife_safe_jump_from_span(Coord::MAX), 0);
+    }
 }

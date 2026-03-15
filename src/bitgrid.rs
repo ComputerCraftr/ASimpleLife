@@ -1,11 +1,12 @@
+use crate::RequiredExt;
 use bytemuck::{must_cast, must_cast_ref};
 use wide::{u16x8, u64x8};
 
-use crate::flat_table::{FlatKey, FlatTable};
+use crate::flat_table::FlatKey;
 use crate::hashing::hash_chunk_coord_key;
+use crate::probe_table::{ProbeMode, ProbeReserveError, ProbeTable};
 use crate::simd_layout::{
-    AlignedU64Value, SIMD_BATCH_LANES, compact_nonzero_u8_lanes,
-    widen_u64_pair_to_aligned_u16_rows,
+    AlignedU64Value, SIMD_BATCH_LANES, compact_nonzero_u8_lanes, widen_u64_pair_to_aligned_u16_rows,
 };
 
 pub type Coord = i64;
@@ -41,14 +42,14 @@ impl FlatKey for ChunkCoordKey {
 
 #[derive(Clone, Debug)]
 pub struct BitGrid {
-    chunks: FlatTable<ChunkCoordKey, Chunk>,
+    chunks: ProbeTable<ChunkCoordKey, Chunk>,
     population: usize,
 }
 
 impl BitGrid {
     pub fn empty() -> Self {
         Self {
-            chunks: FlatTable::new(),
+            chunks: ProbeTable::new(ProbeMode::Mutable),
             population: 0,
         }
     }
@@ -59,9 +60,18 @@ impl BitGrid {
 
     pub fn with_chunk_capacity(chunk_capacity: usize) -> Self {
         Self {
-            chunks: FlatTable::with_capacity(chunk_capacity),
+            chunks: ProbeTable::with_capacity(ProbeMode::Mutable, chunk_capacity),
             population: 0,
         }
+    }
+
+    pub(crate) fn try_with_chunk_capacity(
+        chunk_capacity: usize,
+    ) -> Result<Self, ProbeReserveError> {
+        Ok(Self {
+            chunks: ProbeTable::try_with_capacity(ProbeMode::Mutable, chunk_capacity)?,
+            population: 0,
+        })
     }
 
     pub fn from_cells(cells: &[Cell]) -> Self {
@@ -79,6 +89,16 @@ impl BitGrid {
 
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
+    }
+
+    pub(crate) fn occupied_chunks(&self) -> impl Iterator<Item = ((Coord, Coord), u64)> + '_ {
+        self.chunks
+            .iter()
+            .map(|(coord, chunk)| ((coord.cx, coord.cy), chunk.bits.0))
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.chunks.allocated_bytes()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -110,7 +130,12 @@ impl BitGrid {
 
         if alive {
             let bits = self.chunk_bits(chunk.0, chunk.1) | mask;
-            self.chunks.insert(chunk_key, Chunk { bits: AlignedU64Value(bits) });
+            self.chunks.insert(
+                chunk_key,
+                Chunk {
+                    bits: AlignedU64Value(bits),
+                },
+            );
             self.population += 1;
         } else if let Some(chunk) = self.chunks.get(&chunk_key) {
             let next_bits = chunk.bits.0 & !mask;
@@ -118,7 +143,12 @@ impl BitGrid {
             if next_bits == 0 {
                 self.chunks.remove(&chunk_key);
             } else {
-                self.chunks.insert(chunk_key, Chunk { bits: AlignedU64Value(next_bits) });
+                self.chunks.insert(
+                    chunk_key,
+                    Chunk {
+                        bits: AlignedU64Value(next_bits),
+                    },
+                );
             }
         }
     }
@@ -127,8 +157,8 @@ impl BitGrid {
         let mut cells = Vec::with_capacity(self.population);
         let mut chunk_batch = [((0, 0), 0_u64); SIMD_BATCH_LANES];
         let mut batch_len = 0;
-        for (coord, chunk) in self.chunks.iter() {
-            chunk_batch[batch_len] = ((coord.cx, coord.cy), chunk.bits.0);
+        for chunk in self.occupied_chunks() {
+            chunk_batch[batch_len] = chunk;
             batch_len += 1;
             if batch_len == SIMD_BATCH_LANES {
                 append_chunk_batch_live_cells(&chunk_batch, batch_len, &mut cells);
@@ -149,9 +179,9 @@ impl BitGrid {
         let chunk_dx = dx.div_euclid(CHUNK_SIZE);
         let chunk_dy = dy.div_euclid(CHUNK_SIZE);
         let local_dx =
-            u32::try_from(dx.rem_euclid(CHUNK_SIZE)).expect("grid translation x remainder");
+            u32::try_from(dx.rem_euclid(CHUNK_SIZE)).or_invariant("grid translation x remainder");
         let local_dy =
-            usize::try_from(dy.rem_euclid(CHUNK_SIZE)).expect("grid translation y remainder");
+            usize::try_from(dy.rem_euclid(CHUNK_SIZE)).or_invariant("grid translation y remainder");
         let mut translated = Self::with_chunk_capacity(self.chunks.len().saturating_mul(4));
 
         for (coord, chunk) in self.chunks.iter() {
@@ -159,10 +189,10 @@ impl BitGrid {
             let cy = coord.cy;
             let base_cx = cx
                 .checked_add(chunk_dx)
-                .expect("grid translation chunk x overflow");
+                .or_invariant("grid translation chunk x overflow");
             let base_cy = cy
                 .checked_add(chunk_dy)
-                .expect("grid translation chunk y overflow");
+                .or_invariant("grid translation chunk y overflow");
             let [left_top, right_top, left_bottom, right_bottom] =
                 translated_chunk_parts(chunk.bits.0, local_dx, local_dy);
             if left_top != 0 {
@@ -171,22 +201,22 @@ impl BitGrid {
             if right_top != 0 {
                 let target_cx = base_cx
                     .checked_add(1)
-                    .expect("grid translation chunk x overflow");
+                    .or_invariant("grid translation chunk x overflow");
                 translated.accumulate_chunk_bits(target_cx, base_cy, right_top);
             }
             if left_bottom != 0 {
                 let target_cy = base_cy
                     .checked_add(1)
-                    .expect("grid translation chunk y overflow");
+                    .or_invariant("grid translation chunk y overflow");
                 translated.accumulate_chunk_bits(base_cx, target_cy, left_bottom);
             }
             if right_bottom != 0 {
                 let target_cx = base_cx
                     .checked_add(1)
-                    .expect("grid translation chunk x overflow");
+                    .or_invariant("grid translation chunk x overflow");
                 let target_cy = base_cy
                     .checked_add(1)
-                    .expect("grid translation chunk y overflow");
+                    .or_invariant("grid translation chunk y overflow");
                 translated.accumulate_chunk_bits(target_cx, target_cy, right_bottom);
             }
         }
@@ -195,11 +225,7 @@ impl BitGrid {
     }
 
     pub fn bounds(&self) -> Option<Bounds> {
-        let mut found = false;
-        let mut min_x = 0;
-        let mut min_y = 0;
-        let mut max_x = 0;
-        let mut max_y = 0;
+        let mut bounds = None;
 
         let mut chunk_batch = [((0, 0), 0_u64); SIMD_BATCH_LANES];
         let mut batch_len = 0;
@@ -207,31 +233,14 @@ impl BitGrid {
             chunk_batch[batch_len] = ((coord.cx, coord.cy), chunk.bits.0);
             batch_len += 1;
             if batch_len == SIMD_BATCH_LANES {
-                update_bounds_from_chunk_batch(
-                    &chunk_batch,
-                    batch_len,
-                    &mut found,
-                    &mut min_x,
-                    &mut min_y,
-                    &mut max_x,
-                    &mut max_y,
-                );
+                update_bounds_from_chunk_batch(&chunk_batch, batch_len, &mut bounds);
                 batch_len = 0;
             }
         }
         if batch_len != 0 {
-            update_bounds_from_chunk_batch(
-                &chunk_batch,
-                batch_len,
-                &mut found,
-                &mut min_x,
-                &mut min_y,
-                &mut max_x,
-                &mut max_y,
-            );
+            update_bounds_from_chunk_batch(&chunk_batch, batch_len, &mut bounds);
         }
-
-        found.then_some((min_x, min_y, max_x, max_y))
+        bounds
     }
 
     pub(crate) fn chunk_bits(&self, cx: Coord, cy: Coord) -> u64 {
@@ -242,8 +251,10 @@ impl BitGrid {
         }
     }
 
-    pub(crate) fn chunk_coords(&self) -> Vec<Cell> {
-        self.chunks.iter().map(|(coord, _)| (coord.cx, coord.cy)).collect()
+    pub(crate) fn for_each_chunk_coord(&self, mut visit: impl FnMut(Coord, Coord)) {
+        for (coord, _) in self.chunks.iter() {
+            visit(coord.cx, coord.cy);
+        }
     }
 
     pub(crate) fn set_chunk_bits(&mut self, cx: Coord, cy: Coord, bits: u64) {
@@ -252,29 +263,48 @@ impl BitGrid {
             return;
         }
 
-        self.population -= previous.count_ones() as usize;
+        self.population -=
+            usize::try_from(previous.count_ones()).or_invariant("chunk population exceeded usize");
         if bits == 0 {
             self.chunks.remove(&ChunkCoordKey::new(cx, cy));
             return;
         }
 
-        self.population += bits.count_ones() as usize;
-        self.chunks.insert(ChunkCoordKey::new(cx, cy), Chunk { bits: AlignedU64Value(bits) });
+        self.population +=
+            usize::try_from(bits.count_ones()).or_invariant("chunk population exceeded usize");
+        self.chunks.insert(
+            ChunkCoordKey::new(cx, cy),
+            Chunk {
+                bits: AlignedU64Value(bits),
+            },
+        );
     }
 
-    pub(crate) fn from_chunk_bits_map(
-        chunks: impl IntoIterator<Item = (Cell, u64)>,
-    ) -> Self {
-        let collected = chunks.into_iter().collect::<Vec<_>>();
-        let mut grid = Self::with_chunk_capacity(collected.len());
-        for ((cx, cy), bits) in collected {
-            if bits != 0 {
-                grid.population += bits.count_ones() as usize;
-                grid.chunks
-                    .insert(ChunkCoordKey::new(cx, cy), Chunk { bits: AlignedU64Value(bits) });
-            }
+    pub(crate) fn try_set_chunk_bits(
+        &mut self,
+        cx: Coord,
+        cy: Coord,
+        bits: u64,
+    ) -> Result<(), ProbeReserveError> {
+        let previous = self.chunk_bits(cx, cy);
+        if previous == bits {
+            return Ok(());
         }
-        grid
+        self.population -=
+            usize::try_from(previous.count_ones()).or_invariant("chunk population exceeded usize");
+        if bits == 0 {
+            self.chunks.remove(&ChunkCoordKey::new(cx, cy));
+        } else {
+            self.population +=
+                usize::try_from(bits.count_ones()).or_invariant("chunk population exceeded usize");
+            self.chunks.try_insert(
+                ChunkCoordKey::new(cx, cy),
+                Chunk {
+                    bits: AlignedU64Value(bits),
+                },
+            )?;
+        }
+        Ok(())
     }
 
     fn accumulate_chunk_bits(&mut self, cx: Coord, cy: Coord, bits: u64) {
@@ -309,16 +339,11 @@ fn chunk_and_bit(x: Coord, y: Coord) -> (Cell, u32) {
     let ly = y.rem_euclid(CHUNK_SIZE);
     (
         (cx, cy),
-        u32::try_from(ly * CHUNK_SIZE + lx).expect("chunk bit index exceeded u32"),
+        u32::try_from(ly * CHUNK_SIZE + lx).or_invariant("chunk bit index exceeded u32"),
     )
 }
 
-pub(crate) fn append_live_bits_as_cells(
-    cells: &mut Vec<Cell>,
-    cx: Coord,
-    cy: Coord,
-    bits: u64,
-) {
+pub(crate) fn append_live_bits_as_cells(cells: &mut Vec<Cell>, cx: Coord, cy: Coord, bits: u64) {
     let mut remaining = bits;
     while remaining != 0 {
         let bit = remaining.trailing_zeros() as Coord;
@@ -347,7 +372,7 @@ fn append_chunk_batch_live_cells(
 ) {
     let packed_bits = pack_chunk_bits_for_batch(chunks, active_lanes);
 
-    for row in 0..CHUNK_SIZE as u32 {
+    for row in 0..u32::try_from(CHUNK_SIZE).or_invariant("chunk size exceeded u32") {
         let row_bytes: [u64; SIMD_BATCH_LANES] =
             must_cast((packed_bits >> (row * 8)) & ROW_BYTE_MASK_VEC);
         let (active_indices, active_rows, active_count) =
@@ -364,15 +389,11 @@ fn append_chunk_batch_live_cells(
 fn update_bounds_from_chunk_batch(
     chunks: &[((Coord, Coord), u64); SIMD_BATCH_LANES],
     active_lanes: usize,
-    found: &mut bool,
-    min_x: &mut Coord,
-    min_y: &mut Coord,
-    max_x: &mut Coord,
-    max_y: &mut Coord,
+    bounds: &mut Option<Bounds>,
 ) {
     let packed_bits = pack_chunk_bits_for_batch(chunks, active_lanes);
 
-    for row in 0..CHUNK_SIZE as u32 {
+    for row in 0..u32::try_from(CHUNK_SIZE).or_invariant("chunk size exceeded u32") {
         let row_bytes: [u64; SIMD_BATCH_LANES] =
             must_cast((packed_bits >> (row * 8)) & ROW_BYTE_MASK_VEC);
         let (active_indices, active_rows, active_count) =
@@ -381,17 +402,7 @@ fn update_bounds_from_chunk_batch(
             let lane = active_indices.0[index];
             let row_bits = active_rows.0[index];
             let (cx, cy) = chunks[lane].0;
-            update_bounds_from_live_row_bits(
-                found,
-                min_x,
-                min_y,
-                max_x,
-                max_y,
-                cx,
-                cy,
-                row as Coord,
-                row_bits,
-            );
+            update_bounds_from_live_row_bits(bounds, cx, cy, row as Coord, row_bits);
         }
     }
 }
@@ -412,11 +423,7 @@ fn append_live_row_bits_as_cells(
 }
 
 fn update_bounds_from_live_row_bits(
-    found: &mut bool,
-    min_x: &mut Coord,
-    min_y: &mut Coord,
-    max_x: &mut Coord,
-    max_y: &mut Coord,
+    bounds: &mut Option<Bounds>,
     cx: Coord,
     cy: Coord,
     row: Coord,
@@ -425,18 +432,14 @@ fn update_bounds_from_live_row_bits(
     let y = cy * CHUNK_SIZE + row;
     let x0 = cx * CHUNK_SIZE + row_bits.trailing_zeros() as Coord;
     let x1 = cx * CHUNK_SIZE + (7 - row_bits.leading_zeros() as Coord);
-    if !*found {
-        *min_x = x0;
-        *min_y = y;
-        *max_x = x1;
-        *max_y = y;
-        *found = true;
-        return;
+    if let Some((min_x, min_y, max_x, max_y)) = bounds {
+        *min_x = (*min_x).min(x0);
+        *min_y = (*min_y).min(y);
+        *max_x = (*max_x).max(x1);
+        *max_y = (*max_y).max(y);
+    } else {
+        *bounds = Some((x0, y, x1, y));
     }
-    *min_x = (*min_x).min(x0);
-    *min_y = (*min_y).min(y);
-    *max_x = (*max_x).max(x1);
-    *max_y = (*max_y).max(y);
 }
 
 fn translated_chunk_parts(bits: u64, local_dx: u32, local_dy: usize) -> [u64; 4] {
@@ -455,12 +458,13 @@ fn translated_chunk_parts(bits: u64, local_dx: u32, local_dy: usize) -> [u64; 4]
             let low_bits = u64::from(shifted_rows[$row] & 0x00FF);
             let high_bits = u64::from(shifted_rows[$row] >> 8);
             if target_row < 8 {
-                let shift = u32::try_from(target_row * 8).expect("grid row shift exceeded u32");
+                let shift =
+                    u32::try_from(target_row * 8).or_invariant("grid row shift exceeded u32");
                 left_top |= low_bits << shift;
                 right_top |= high_bits << shift;
             } else {
-                let shift = u32::try_from((target_row - 8) * 8)
-                    .expect("grid row shift exceeded u32");
+                let shift =
+                    u32::try_from((target_row - 8) * 8).or_invariant("grid row shift exceeded u32");
                 left_bottom |= low_bits << shift;
                 right_bottom |= high_bits << shift;
             }
@@ -482,10 +486,11 @@ fn translated_chunk_parts(bits: u64, local_dx: u32, local_dy: usize) -> [u64; 4]
 #[cfg(test)]
 mod tests {
     use super::{BitGrid, Cell};
+    use crate::RequiredExt;
     use std::collections::HashMap;
 
     #[test]
-    fn from_chunk_bits_map_matches_cell_construction() {
+    fn fallible_chunk_construction_matches_cell_construction() {
         let cells: Vec<Cell> = vec![
             (-9, -1),
             (-8, -1),
@@ -504,21 +509,28 @@ mod tests {
             let cy = y.div_euclid(super::CHUNK_SIZE);
             let lx = x.rem_euclid(super::CHUNK_SIZE);
             let ly = y.rem_euclid(super::CHUNK_SIZE);
-            let bit = u32::try_from(ly * super::CHUNK_SIZE + lx).unwrap();
+            let bit = u32::try_from(ly * super::CHUNK_SIZE + lx).or_invariant("required value");
             *chunks.entry((cx, cy)).or_insert(0_u64) |= 1_u64 << bit;
         }
 
-        let actual = BitGrid::from_chunk_bits_map(chunks);
+        let mut actual = BitGrid::try_with_chunk_capacity(chunks.len())
+            .or_invariant("test chunk table should allocate");
+        for ((cx, cy), bits) in chunks {
+            actual
+                .try_set_chunk_bits(cx, cy, bits)
+                .or_invariant("test chunk insertion should allocate");
+        }
         assert_eq!(actual, expected);
     }
 
     #[test]
-    fn from_chunk_bits_map_drops_zero_chunks() {
-        let mut chunks = HashMap::new();
-        chunks.insert((0, 0), 0_u64);
-        chunks.insert((1, 1), 1_u64);
-
-        let grid = BitGrid::from_chunk_bits_map(chunks);
+    fn fallible_chunk_construction_drops_zero_chunks() {
+        let mut grid =
+            BitGrid::try_with_chunk_capacity(2).or_invariant("test chunk table should allocate");
+        grid.try_set_chunk_bits(0, 0, 0)
+            .or_invariant("zero chunk should not allocate");
+        grid.try_set_chunk_bits(1, 1, 1)
+            .or_invariant("test chunk insertion should allocate");
         assert_eq!(grid.chunk_count(), 1);
         assert_eq!(grid.population(), 1);
         assert!(grid.get(8, 8));
@@ -544,7 +556,10 @@ mod tests {
                 .iter()
                 .map(|&(x, y)| (x + dx, y + dy))
                 .collect::<Vec<_>>();
-            assert_eq!(BitGrid::from_cells(&expected_cells), grid.translated(dx, dy));
+            assert_eq!(
+                BitGrid::from_cells(&expected_cells),
+                grid.translated(dx, dy)
+            );
         }
     }
 

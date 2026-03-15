@@ -1,0 +1,36 @@
+name: Set up Rust
+description: Install the requested Rust toolchain and restore Cargo build state.
+inputs:
+  toolchain:
+    description: Rust toolchain channel.
+    default: stable
+  targets:
+    description: Additional rustup targets.
+    default: ""
+  components:
+    description: Additional rustup components.
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Install stable Rust
+      if: ${{ inputs.toolchain == 'stable' }}
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ inputs.targets }}
+        components: ${{ inputs.components }}
+    - name: Install nightly Rust
+      if: ${{ inputs.toolchain == 'nightly' }}
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        targets: ${{ inputs.targets }}
+        components: ${{ inputs.components }}
+    - name: Reject unsupported Rust channel
+      if: ${{ inputs.toolchain != 'stable' && inputs.toolchain != 'nightly' }}
+      shell: bash
+      env:
+        REQUESTED_TOOLCHAIN: ${{ inputs.toolchain }}
+      run: |
+        echo "unsupported Rust toolchain: $REQUESTED_TOOLCHAIN" >&2
+        exit 1
+    - uses: Swatinem/rust-cache@v2.9.2

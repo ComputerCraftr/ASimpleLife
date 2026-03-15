@@ -1,6 +1,7 @@
 use super::*;
 
 pub(super) fn notify_dependents(
+    engine: &mut HashLifeEngine,
     key: &CanonicalJumpKey,
     tasks: &mut [Option<TaskRecord>],
     dependents: &mut FlatTable<CanonicalJumpKey, usize>,
@@ -11,11 +12,13 @@ pub(super) fn notify_dependents(
         while head != NO_DEPENDENT {
             let waiter_id = dependent_edges[head].task_id;
             let Some(task) = tasks[waiter_id].as_mut() else {
-                panic!("dependent edge referenced missing recursive task waiter_id={waiter_id}");
+                crate::invariant_failure!(
+                    "dependent edge referenced missing recursive task waiter_id={waiter_id}"
+                );
             };
             task.remaining -= 1;
-            if task.remaining == 0 {
-                ready.push(waiter_id);
+            if task.remaining == 0 && !engine.try_push_transient(ready, waiter_id) {
+                return;
             }
             head = dependent_edges[head].next;
         }
@@ -23,6 +26,7 @@ pub(super) fn notify_dependents(
 }
 
 pub(super) fn notify_step0_dependents(
+    engine: &mut HashLifeEngine,
     key: CanonicalJumpKey,
     tasks: &mut [Option<Step0TaskRecord>],
     dependents: &mut FlatTable<CanonicalJumpKey, usize>,
@@ -33,11 +37,13 @@ pub(super) fn notify_step0_dependents(
         while head != NO_DEPENDENT {
             let waiter_id = dependent_edges[head].task_id;
             let Some(task) = tasks[waiter_id].as_mut() else {
-                panic!("dependent edge referenced missing step0 task waiter_id={waiter_id}");
+                crate::invariant_failure!(
+                    "dependent edge referenced missing step0 task waiter_id={waiter_id}"
+                );
             };
             task.remaining -= 1;
-            if task.remaining == 0 {
-                ready.push(waiter_id);
+            if task.remaining == 0 && !engine.try_push_transient(ready, waiter_id) {
+                return;
             }
             head = dependent_edges[head].next;
         }
@@ -45,13 +51,16 @@ pub(super) fn notify_step0_dependents(
 }
 
 pub(super) fn push_dependent(
+    engine: &mut HashLifeEngine,
     dependents: &mut FlatTable<CanonicalJumpKey, usize>,
     dependent_edges: &mut Vec<DependentEdge>,
     key: CanonicalJumpKey,
     task_id: usize,
-) {
+) -> bool {
     let next = dependents.get(&key).unwrap_or(NO_DEPENDENT);
     let head = dependent_edges.len();
-    dependent_edges.push(DependentEdge { task_id, next });
-    dependents.insert(key, head);
+    if !engine.try_push_transient(dependent_edges, DependentEdge { task_id, next }) {
+        return false;
+    }
+    engine.try_insert_transient_table(dependents, key, head)
 }

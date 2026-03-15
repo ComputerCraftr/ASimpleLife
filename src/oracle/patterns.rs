@@ -1,4 +1,5 @@
 use super::*;
+use crate::RequiredExt;
 
 pub(super) fn build_emitter_macro_model(
     seed: Option<&BitGrid>,
@@ -44,7 +45,7 @@ pub(super) fn build_emitter_macro_model(
     Some(EmitterMacroModel {
         baseline_generation: BASELINE_GENERATION,
         baseline_glider_count: u64::try_from(baseline_state.gliders.len())
-            .expect("gosper glider count exceeded u64"),
+            .or_invariant("gosper glider count exceeded u64"),
         core_population_by_phase,
         core_bounds_by_phase,
         oldest_glider_origin: oldest_glider.origin,
@@ -58,10 +59,10 @@ pub(super) fn emitter_runtime_population(
 ) -> usize {
     let delta = target_generation.saturating_sub(model.baseline_generation);
     let emitted = delta / 30;
-    let residual = usize::try_from(delta % 30).expect("gosper residual exceeded usize");
+    let residual = usize::try_from(delta % 30).or_invariant("gosper residual exceeded usize");
     model.core_population_by_phase[residual]
         + usize::try_from((model.baseline_glider_count + emitted) * 5)
-            .expect("gosper runtime population exceeded usize")
+            .or_invariant("gosper runtime population exceeded usize")
 }
 
 pub(super) fn emitter_runtime_bounds_span(
@@ -74,35 +75,35 @@ pub(super) fn emitter_runtime_bounds_span(
     let phase = usize::from(model.oldest_glider_phase);
     let table = glider_runtime_table();
     let glider_bounds =
-        table[phase][usize::try_from(residual).expect("glider residual exceeded usize")];
+        table[phase][usize::try_from(residual).or_invariant("glider residual exceeded usize")];
     let cycle_shift = Coord::try_from(cycles)
-        .expect("gosper cycle count exceeded Coord")
+        .or_invariant("gosper cycle count exceeded Coord")
         .checked_mul(30)
-        .expect("gosper cycle shift overflow");
+        .or_invariant("gosper cycle shift overflow");
     let glider_max_x = model
         .oldest_glider_origin
         .0
         .checked_add(cycle_shift)
         .and_then(|origin_x| origin_x.checked_add(glider_bounds.2))
-        .expect("gosper glider max x overflow");
+        .or_invariant("gosper glider max x overflow");
     let glider_max_y = model
         .oldest_glider_origin
         .1
         .checked_add(cycle_shift)
         .and_then(|origin_y| origin_y.checked_add(glider_bounds.3))
-        .expect("gosper glider max y overflow");
-    let residual_index = usize::try_from(delta % 30).expect("gosper residual exceeded usize");
+        .or_invariant("gosper glider max y overflow");
+    let residual_index = usize::try_from(delta % 30).or_invariant("gosper residual exceeded usize");
     let core_bounds = model.core_bounds_by_phase[residual_index];
     let width = glider_max_x
         .max(core_bounds.2)
         .checked_sub(core_bounds.0)
         .and_then(|span| span.checked_add(1))
-        .expect("gosper runtime width overflow");
+        .or_invariant("gosper runtime width overflow");
     let height = glider_max_y
         .max(core_bounds.3)
         .checked_sub(core_bounds.1)
         .and_then(|span| span.checked_add(1))
-        .expect("gosper runtime height overflow");
+        .or_invariant("gosper runtime height overflow");
     width.max(height)
 }
 
@@ -190,7 +191,10 @@ fn exclude_rect(
 
 fn connected_components(grid: &BitGrid) -> Vec<Vec<Cell>> {
     let live = grid.live_cells();
-    let mut remaining = live.iter().copied().collect::<std::collections::HashSet<_>>();
+    let mut remaining = live
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
     let mut components = Vec::new();
     while let Some(&start) = remaining.iter().next() {
         let mut queue = std::collections::VecDeque::from([start]);
@@ -218,7 +222,7 @@ fn canonical_glider_variants() -> &'static [NormalizedGridSignature; 4] {
     static VARIANTS: OnceLock<[NormalizedGridSignature; 4]> = OnceLock::new();
     VARIANTS.get_or_init(|| {
         let mut variants = Vec::with_capacity(4);
-        let mut grid = pattern_by_name("glider").expect("glider pattern should exist");
+        let mut grid = pattern_by_name("glider").or_invariant("glider pattern should exist");
         let mut memo = Memo::default();
         for _ in 0..4 {
             variants.push(normalize(&grid).0);
@@ -239,19 +243,23 @@ fn glider_runtime_table() -> &'static GliderBoundsTable {
     static TABLE: OnceLock<GliderBoundsTable> = OnceLock::new();
     TABLE.get_or_init(|| {
         let mut table = [[(0, 0, 0, 0); 120]; 4];
-        let mut phase_grid = pattern_by_name("glider").expect("glider pattern should exist");
+        let mut phase_grid = pattern_by_name("glider").or_invariant("glider pattern should exist");
         let variants = canonical_glider_variants();
-        for phase in 0..4 {
+        for (phase, phase_table) in table.iter_mut().enumerate() {
             let phase_signature = &variants[phase];
             let mut memo = Memo::default();
-            for residual in 0..120 {
+            for (residual, bounds_slot) in phase_table.iter_mut().enumerate() {
                 if residual == 0 {
-                    let bounds = phase_grid.bounds().expect("glider should be non-empty");
-                    table[phase][residual] = bounds;
+                    let bounds = phase_grid
+                        .bounds()
+                        .or_invariant("glider should be non-empty");
+                    *bounds_slot = bounds;
                 } else {
                     phase_grid = step_grid_with_changes_and_memo(&phase_grid, &mut memo).0;
-                    let bounds = phase_grid.bounds().expect("glider should be non-empty");
-                    table[phase][residual] = bounds;
+                    let bounds = phase_grid
+                        .bounds()
+                        .or_invariant("glider should be non-empty");
+                    *bounds_slot = bounds;
                 }
             }
             phase_grid = BitGrid::from_cells(&phase_signature.cells);

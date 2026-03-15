@@ -1,5 +1,5 @@
 use bytemuck::{Pod, Zeroable, must_cast};
-use wide::{u8x16, u16x16};
+use wide::{u8x16, u16x16, u16x32};
 
 pub(crate) const SIMD_BATCH_LANES: usize = 8;
 
@@ -68,21 +68,18 @@ impl Default for AlignedU64WordBatch9 {
 }
 
 #[repr(align(64))]
-#[derive(Clone, Copy)]
-pub(crate) struct AlignedU16LaneChunkRows9(pub [[[u16; 8]; 9]; SIMD_BATCH_LANES]);
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AlignedU16ChunkRowBatches9(pub [[u16x32; 2]; 9]);
 
-impl Default for AlignedU16LaneChunkRows9 {
+impl Default for AlignedU16ChunkRowBatches9 {
     fn default() -> Self {
-        Self([[[0; 8]; 9]; SIMD_BATCH_LANES])
+        Self([[u16x32::ZERO; 2]; 9])
     }
 }
 
 #[repr(C, align(32))]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub(crate) struct AlignedU16Rows2(pub [[u16; 8]; 2]);
-
-unsafe impl Zeroable for AlignedU16Rows2 {}
-unsafe impl Pod for AlignedU16Rows2 {}
 
 #[repr(align(64))]
 #[derive(Clone, Copy, Debug)]
@@ -121,69 +118,6 @@ pub(crate) fn widen_u64_quad_to_u16_rows(chunks: [u64; 4]) -> [[u16; 8]; 4] {
     ])
 }
 
-#[cfg(test)]
-pub(crate) fn transpose_u64_words_9xn<const N: usize>(
-    active_lanes: usize,
-    word_lanes: &[[u64; N]; 9],
-) -> [[u64; 9]; N] {
-    let mut lane_words = [[0; 9]; N];
-    for lane in 0..active_lanes {
-        lane_words[lane] = [
-            word_lanes[0][lane],
-            word_lanes[1][lane],
-            word_lanes[2][lane],
-            word_lanes[3][lane],
-            word_lanes[4][lane],
-            word_lanes[5][lane],
-            word_lanes[6][lane],
-            word_lanes[7][lane],
-            word_lanes[8][lane],
-        ];
-    }
-    lane_words
-}
-
-pub(crate) fn transpose_u64_lanes_9xn<const N: usize>(
-    lane_words: &[[u64; 9]; N],
-    active_lanes: usize,
-) -> [[u64; N]; 9] {
-    let mut word_lanes = [[0; N]; 9];
-    for lane in 0..active_lanes {
-        let words = lane_words[lane];
-        word_lanes[0][lane] = words[0];
-        word_lanes[1][lane] = words[1];
-        word_lanes[2][lane] = words[2];
-        word_lanes[3][lane] = words[3];
-        word_lanes[4][lane] = words[4];
-        word_lanes[5][lane] = words[5];
-        word_lanes[6][lane] = words[6];
-        word_lanes[7][lane] = words[7];
-        word_lanes[8][lane] = words[8];
-    }
-    word_lanes
-}
-
-pub(crate) fn transpose_chunk_row_staging9(
-    staging: &AlignedU16LaneChunkRows9,
-    active_lanes: usize,
-) -> [[[u16; SIMD_BATCH_LANES]; 8]; 9] {
-    let mut chunks = [[[0; SIMD_BATCH_LANES]; 8]; 9];
-    for lane in 0..active_lanes {
-        for chunk_index in 0..9 {
-            let rows = staging.0[lane][chunk_index];
-            chunks[chunk_index][0][lane] = rows[0];
-            chunks[chunk_index][1][lane] = rows[1];
-            chunks[chunk_index][2][lane] = rows[2];
-            chunks[chunk_index][3][lane] = rows[3];
-            chunks[chunk_index][4][lane] = rows[4];
-            chunks[chunk_index][5][lane] = rows[5];
-            chunks[chunk_index][6][lane] = rows[6];
-            chunks[chunk_index][7][lane] = rows[7];
-        }
-    }
-    chunks
-}
-
 pub(crate) fn compact_nonzero_u8_lanes(
     row_bytes: [u64; SIMD_BATCH_LANES],
     active_lanes: usize,
@@ -191,8 +125,8 @@ pub(crate) fn compact_nonzero_u8_lanes(
     let mut indices = AlignedLaneIndexBatch::default();
     let mut values = AlignedU8LaneBatch::default();
     let mut count = 0;
-    for lane in 0..active_lanes {
-        let row_bits = row_bytes[lane] as u8;
+    for (lane, &row) in row_bytes[..active_lanes].iter().enumerate() {
+        let row_bits = row.to_le_bytes()[0];
         if row_bits == 0 {
             continue;
         }

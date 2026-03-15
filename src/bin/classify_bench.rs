@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use a_simple_life::benchmark::{BenchmarkOptions, run_benchmark_report};
+use a_simple_life::benchmark::{BenchmarkOptions, BenchmarkRunStatus, run_benchmark_report};
 use a_simple_life::cli;
 
 fn main() -> ExitCode {
@@ -30,7 +30,10 @@ fn main() -> ExitCode {
         oracle_representative_case: parsed.oracle_representative_case,
         oracle_runtime_target_generation: parsed.oracle_runtime_target_generation,
         progress: parsed.progress,
+        diagnostic: parsed.diagnostic,
     };
-    run_benchmark_report(parsed.format, &options);
-    ExitCode::SUCCESS
+    match run_benchmark_report(parsed.format, &options) {
+        BenchmarkRunStatus::Clean | BenchmarkRunStatus::Diagnostic => ExitCode::SUCCESS,
+        BenchmarkRunStatus::Failed => ExitCode::FAILURE,
+    }
 }

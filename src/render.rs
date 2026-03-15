@@ -1,3 +1,4 @@
+use crate::RequiredExt;
 use crate::bitgrid::{BitGrid, Cell, Coord};
 use crate::life::ChunkDiff;
 use std::collections::{HashSet, VecDeque};
@@ -9,6 +10,8 @@ pub struct TerminalBackbuffer {
     height: usize,
     row_offset: usize,
     origin: Option<Cell>,
+    preserve_origin_once: bool,
+    needs_rebuild: bool,
     cells: Vec<u8>,
     dirty_rows: Vec<Option<(usize, usize)>>,
 }
@@ -20,6 +23,8 @@ impl TerminalBackbuffer {
             height,
             row_offset: 1,
             origin: None,
+            preserve_origin_once: false,
+            needs_rebuild: true,
             cells: vec![0; width * height],
             dirty_rows: vec![None; height],
         }
@@ -31,11 +36,19 @@ impl TerminalBackbuffer {
         changed_cells: Option<&[Cell]>,
         out: &mut W,
     ) -> io::Result<()> {
-        let next_origin = compute_origin_for_cells(self.width, self.height, &grid.live_cells());
+        let next_origin = stable_origin_for_cells(
+            self.width,
+            self.height,
+            &grid.live_cells(),
+            self.origin,
+            self.preserve_origin_once,
+        );
+        self.preserve_origin_once = false;
 
-        if self.origin != Some(next_origin) || changed_cells.is_none() {
+        if self.needs_rebuild || self.origin != Some(next_origin) || changed_cells.is_none() {
             self.origin = Some(next_origin);
             self.rebuild_all(grid);
+            self.needs_rebuild = false;
         } else if let Some(changed_cells) = changed_cells {
             for &(x, y) in changed_cells {
                 self.update_terminal_cell_for_world(grid, x, y);
@@ -51,11 +64,19 @@ impl TerminalBackbuffer {
         changed_chunks: Option<&[ChunkDiff]>,
         out: &mut W,
     ) -> io::Result<()> {
-        let next_origin = compute_origin_for_cells(self.width, self.height, &grid.live_cells());
+        let next_origin = stable_origin_for_cells(
+            self.width,
+            self.height,
+            &grid.live_cells(),
+            self.origin,
+            self.preserve_origin_once,
+        );
+        self.preserve_origin_once = false;
 
-        if self.origin != Some(next_origin) || changed_chunks.is_none() {
+        if self.needs_rebuild || self.origin != Some(next_origin) || changed_chunks.is_none() {
             self.origin = Some(next_origin);
             self.rebuild_all(grid);
+            self.needs_rebuild = false;
         } else if let Some(changed_chunks) = changed_chunks {
             for &diff in changed_chunks {
                 self.update_terminal_cells_for_chunk(grid, diff);
@@ -74,7 +95,9 @@ impl TerminalBackbuffer {
         if self.origin != Some(origin) {
             self.origin = Some(origin);
         }
+        self.preserve_origin_once = false;
         self.rebuild_all(grid);
+        self.needs_rebuild = false;
         self.flush_dirty(out)
     }
 
@@ -83,9 +106,11 @@ impl TerminalBackbuffer {
             return;
         }
 
+        self.origin = resized_viewport_origin(self.origin, self.width, self.height, width, height);
+        self.preserve_origin_once = self.origin.is_some();
+        self.needs_rebuild = true;
         self.width = width;
         self.height = height;
-        self.origin = None;
         self.cells = vec![0; width * height];
         self.dirty_rows = vec![None; height];
     }
@@ -109,20 +134,20 @@ impl TerminalBackbuffer {
         };
 
         let col = x - origin_x;
-        if !(0..self.width as Coord).contains(&col) {
+        if !(0..viewport_dimension(self.width)).contains(&col) {
             return;
         }
 
         let relative_y = y - origin_y;
         let row = relative_y.div_euclid(2);
-        if !(0..self.height as Coord).contains(&row) {
+        if !(0..viewport_dimension(self.height)).contains(&row) {
             return;
         }
 
         self.write_cell(
             grid,
-            usize::try_from(row).expect("row exceeded usize"),
-            usize::try_from(col).expect("column exceeded usize"),
+            usize::try_from(row).or_invariant("row exceeded usize"),
+            usize::try_from(col).or_invariant("column exceeded usize"),
         );
     }
 
@@ -141,7 +166,7 @@ impl TerminalBackbuffer {
         let mut max_local_y = Coord::MIN;
 
         while remaining != 0 {
-            let bit = remaining.trailing_zeros() as Coord;
+            let bit = Coord::from(remaining.trailing_zeros());
             min_local_x = min_local_x.min(bit % 8);
             max_local_x = max_local_x.max(bit % 8);
             min_local_y = min_local_y.min(bit / 8);
@@ -155,7 +180,7 @@ impl TerminalBackbuffer {
         let max_world_y = diff.cy * 8 + max_local_y;
 
         let min_col = (min_world_x - origin_x).max(0);
-        let max_col = (max_world_x - origin_x).min(self.width as Coord - 1);
+        let max_col = (max_world_x - origin_x).min(viewport_dimension(self.width) - 1);
         if min_col > max_col {
             return;
         }
@@ -163,16 +188,16 @@ impl TerminalBackbuffer {
         let min_row = (min_world_y - origin_y).div_euclid(2).max(0);
         let max_row = (max_world_y - origin_y)
             .div_euclid(2)
-            .min(self.height as Coord - 1);
+            .min(viewport_dimension(self.height) - 1);
         if min_row > max_row {
             return;
         }
 
-        for row in usize::try_from(min_row).expect("row range start exceeded usize")
-            ..=usize::try_from(max_row).expect("row range end exceeded usize")
+        for row in usize::try_from(min_row).or_invariant("row range start exceeded usize")
+            ..=usize::try_from(max_row).or_invariant("row range end exceeded usize")
         {
-            for col in usize::try_from(min_col).expect("column range start exceeded usize")
-                ..=usize::try_from(max_col).expect("column range end exceeded usize")
+            for col in usize::try_from(min_col).or_invariant("column range start exceeded usize")
+                ..=usize::try_from(max_col).or_invariant("column range end exceeded usize")
             {
                 self.write_cell(grid, row, col);
             }
@@ -181,8 +206,8 @@ impl TerminalBackbuffer {
 
     fn write_cell(&mut self, grid: &BitGrid, row: usize, col: usize) {
         let (origin_x, origin_y) = self.origin.unwrap_or((0, 0));
-        let x = origin_x + col as Coord;
-        let y = origin_y + (row as Coord * 2);
+        let x = origin_x + viewport_dimension(col);
+        let y = origin_y + (viewport_dimension(row) * 2);
         let encoded = encode_cell(grid.get(x, y), grid.get(x, y + 1));
         let idx = row * self.width + col;
 
@@ -234,6 +259,102 @@ pub(crate) fn compute_origin_for_cells(width: usize, height: usize, cells: &[Cel
     let focus_cells = dominant_component_cells(cells);
 
     compute_origin_for_bounds(width, height, component_bounds(&focus_cells))
+}
+
+pub fn stable_viewport_origin(
+    current: Option<Cell>,
+    proposed: Cell,
+    current_population: usize,
+    proposed_population: usize,
+    width: usize,
+    height: usize,
+) -> Cell {
+    let Some(current) = current else {
+        return proposed;
+    };
+    let nearby_x = u128::from(current.0.abs_diff(proposed.0))
+        <= u128::try_from((width / 2).max(1)).or_invariant("viewport width should fit u128");
+    let nearby_y = u128::from(current.1.abs_diff(proposed.1))
+        <= u128::try_from(height.max(1)).or_invariant("viewport height should fit u128");
+    if current_population != 0 && current_population == proposed_population {
+        return current;
+    }
+    if nearby_x && nearby_y {
+        return proposed;
+    }
+
+    let current_score = current_population as u128;
+    let proposed_score = proposed_population as u128;
+    if current_score != 0 && current_score * 5 >= proposed_score * 4 {
+        current
+    } else {
+        proposed
+    }
+}
+
+pub fn resized_viewport_origin(
+    origin: Option<Cell>,
+    old_width: usize,
+    old_height: usize,
+    new_width: usize,
+    new_height: usize,
+) -> Option<Cell> {
+    origin.map(|(x, y)| {
+        let old_width = i128::try_from(old_width).or_invariant("terminal width should fit i128");
+        let old_height = i128::try_from(old_height).or_invariant("terminal height should fit i128");
+        let new_width = i128::try_from(new_width).or_invariant("terminal width should fit i128");
+        let new_height = i128::try_from(new_height).or_invariant("terminal height should fit i128");
+        let center_x = i128::from(x) + old_width / 2;
+        let center_y = i128::from(y) + old_height;
+        (
+            Coord::try_from(center_x - new_width / 2)
+                .or_invariant("resized viewport x origin exceeded Coord"),
+            Coord::try_from(center_y - new_height)
+                .or_invariant("resized viewport y origin exceeded Coord"),
+        )
+    })
+}
+
+fn stable_origin_for_cells(
+    width: usize,
+    height: usize,
+    cells: &[Cell],
+    current: Option<Cell>,
+    preserve_current: bool,
+) -> Cell {
+    let proposed = compute_origin_for_cells(width, height, cells);
+    let current_population = current.map_or(0, |origin| {
+        viewport_population(cells, origin, width, height)
+    });
+    let proposed_population = viewport_population(cells, proposed, width, height);
+    if preserve_current && current_population != 0 {
+        return current.or_invariant("a preserved viewport population requires an origin");
+    }
+    stable_viewport_origin(
+        current,
+        proposed,
+        current_population,
+        proposed_population,
+        width,
+        height,
+    )
+}
+
+fn viewport_population(cells: &[Cell], origin: Cell, width: usize, height: usize) -> usize {
+    let width = viewport_dimension(width);
+    let height = viewport_dimension(height);
+    let max_x = origin.0.saturating_add(width - 1);
+    let max_y = origin
+        .1
+        .saturating_add(height.saturating_mul(2).saturating_sub(1));
+    cells
+        .iter()
+        .filter(|&&(x, y)| x >= origin.0 && x <= max_x && y >= origin.1 && y <= max_y)
+        .count()
+}
+
+fn viewport_dimension(value: usize) -> Coord {
+    Coord::try_from(value).or_invariant("terminal dimension exceeded Coord")
 }
 
 fn dominant_component_cells(cells: &[Cell]) -> Vec<Cell> {
@@ -334,39 +455,47 @@ fn component_bounds(cells: &[Cell]) -> (Coord, Coord, Coord, Coord) {
     (min_x, min_y, max_x, max_y)
 }
 
-fn bounds_area(bounds: (Coord, Coord, Coord, Coord)) -> i128 {
+fn bounds_area(bounds: (Coord, Coord, Coord, Coord)) -> u128 {
     let (min_x, min_y, max_x, max_y) = bounds;
-    let width = i128::from(max_x - min_x + 1);
-    let height = i128::from(max_y - min_y + 1);
-    width * height
+    let width = u128::try_from(i128::from(max_x) - i128::from(min_x) + 1)
+        .or_invariant("component width should be positive");
+    let height = u128::try_from(i128::from(max_y) - i128::from(min_y) + 1)
+        .or_invariant("component height should be positive");
+    width.saturating_mul(height)
 }
 
 fn bounds_fit_viewport(width: usize, height: usize, bounds: (Coord, Coord, Coord, Coord)) -> bool {
     let (min_x, min_y, max_x, max_y) = bounds;
-    let viewport_width = width as Coord;
-    let viewport_height = (height as Coord) * 2;
-    let bounds_width = max_x - min_x + 1;
-    let bounds_height = max_y - min_y + 1;
+    let viewport_width = u128::try_from(width).or_invariant("viewport width should fit u128");
+    let viewport_height = u128::try_from(height)
+        .or_invariant("viewport height should fit u128")
+        .saturating_mul(2);
+    let bounds_width = u128::try_from(i128::from(max_x) - i128::from(min_x) + 1)
+        .or_invariant("component width should be positive");
+    let bounds_height = u128::try_from(i128::from(max_y) - i128::from(min_y) + 1)
+        .or_invariant("component height should be positive");
 
     bounds_width <= viewport_width && bounds_height <= viewport_height
 }
 
 fn centroid(cells: &[Cell]) -> (i64, i64) {
-    let mut sum_x: i64 = 0;
-    let mut sum_y: i64 = 0;
+    let mut sum_x = 0_i128;
+    let mut sum_y = 0_i128;
 
     for &(x, y) in cells {
-        sum_x += x;
-        sum_y += y;
+        sum_x += i128::from(x);
+        sum_y += i128::from(y);
     }
 
-    (sum_x / cells.len() as i64, sum_y / cells.len() as i64)
+    let count = i128::try_from(cells.len()).or_invariant("cell count should fit i128");
+    (
+        i64::try_from(sum_x / count).or_invariant("centroid x should remain in coordinate range"),
+        i64::try_from(sum_y / count).or_invariant("centroid y should remain in coordinate range"),
+    )
 }
 
-fn centroid_distance_sq(center: (i64, i64), global_centroid: (i64, i64)) -> i128 {
-    let dx = i128::from(center.0 - global_centroid.0);
-    let dy = i128::from(center.1 - global_centroid.1);
-    dx * dx + dy * dy
+fn centroid_distance_sq(center: (i64, i64), global_centroid: (i64, i64)) -> crate::wide_math::U129 {
+    crate::wide_math::squared_i64_distance(center, global_centroid)
 }
 
 pub fn compute_origin_for_bounds(
@@ -375,27 +504,22 @@ pub fn compute_origin_for_bounds(
     bounds: (Coord, Coord, Coord, Coord),
 ) -> Cell {
     let (min_x, min_y, max_x, max_y) = bounds;
-    let viewport_width = width as Coord;
-    let viewport_height = (height as Coord) * 2;
-    let center_x = (min_x + max_x) / 2;
-    let center_y = (min_y + max_y) / 2;
-    let ideal_x = center_x - viewport_width / 2;
-    let ideal_y = center_y - viewport_height / 2;
-    let min_origin_x = max_x - viewport_width + 1;
-    let min_origin_y = max_y - viewport_height + 1;
-    let max_origin_x = min_x;
-    let max_origin_y = min_y;
+    let viewport_width = i128::try_from(width).or_invariant("viewport width should fit i128");
+    let viewport_height = i128::try_from(height)
+        .or_invariant("viewport height should fit i128")
+        .saturating_mul(2);
+    let min_x = i128::from(min_x);
+    let min_y = i128::from(min_y);
+    let max_x = i128::from(max_x);
+    let max_y = i128::from(max_y);
+    // Center the inclusive pattern and viewport intervals. Computing their
+    // midpoints separately biases even-sized intervals by one cell per side.
+    let ideal_x = (min_x + max_x - viewport_width + 1).div_euclid(2);
+    let ideal_y = (min_y + max_y - viewport_height + 1).div_euclid(2);
     (
-        clamp_coord(ideal_x, min_origin_x, max_origin_x),
-        clamp_coord(ideal_y, min_origin_y, max_origin_y),
+        Coord::try_from(ideal_x).or_invariant("viewport x origin exceeded Coord"),
+        Coord::try_from(ideal_y).or_invariant("viewport y origin exceeded Coord"),
     )
-}
-
-fn clamp_coord(value: Coord, low: Coord, high: Coord) -> Coord {
-    if low > high {
-        return high;
-    }
-    value.clamp(low, high)
 }
 
 fn encode_cell(top: bool, bottom: bool) -> u8 {
@@ -419,4 +543,16 @@ fn decode_cell(encoded: u8) -> char {
 
 fn write_cursor_move<W: Write>(out: &mut W, row: usize, col: usize) -> io::Result<()> {
     write!(out, "\x1b[{row};{col}H")
+}
+
+#[cfg(test)]
+mod wide_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn centroid_handles_opposite_coordinate_extremes_without_narrowing() {
+        let cells = [(i64::MIN, i64::MIN), (i64::MAX, i64::MAX)];
+        assert_eq!(centroid(&cells), (0, 0));
+        assert!(centroid_distance_sq(cells[0], cells[1]) > crate::wide_math::U129::default());
+    }
 }

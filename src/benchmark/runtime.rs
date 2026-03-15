@@ -1,8 +1,6 @@
+use super::suite::{canonical_small_box_mask, estimate_density_percent, seeded_case};
 use super::*;
-use super::suite::{
-    canonical_small_box_mask, estimate_density_percent, reference_is_decisive_runtime,
-    seeded_case,
-};
+use crate::RequiredExt;
 
 pub(super) fn run_exhaustive_5x5(
     report: &mut BenchmarkReport,
@@ -10,13 +8,9 @@ pub(super) fn run_exhaustive_5x5(
 ) {
     let prediction_limits = ClassificationLimits {
         max_generations: 128,
-        max_population: 10_000,
-        max_bounding_box: Coord::MAX,
     };
     let oracle_limits = ClassificationLimits {
         max_generations: DEFAULT_BENCHMARK_ORACLE_MAX_GENERATIONS,
-        max_population: 5_000_000,
-        max_bounding_box: Coord::MAX,
     };
 
     for mask in 0_u32..(1_u32 << 25) {
@@ -29,14 +23,10 @@ pub(super) fn run_exhaustive_5x5(
             predict_seed_with_checkpoint(&grid, &prediction_limits, &mut Memo::default());
         let expected = reference_classify_from_checkpoint(
             checkpoint,
-            &actual,
             &prediction_limits,
             &oracle_limits,
             oracle_simulation,
         );
-        if !reference_is_decisive_runtime(&expected) {
-            continue;
-        }
         let case = seeded_case(
             format!("5x5_{mask}"),
             BenchmarkFamily::ExhaustiveFiveByFive,
@@ -61,11 +51,8 @@ pub(super) fn run_oracle_runtime_case(
     oracle_simulation: &mut crate::engine::SimulationSession,
 ) -> OracleRuntimeCaseReport {
     let pattern = "gosper_glider_gun";
-    let backend = select_backend(
-        &pattern_by_name(pattern).expect("known pattern must exist"),
-        target_generation,
-    );
-    let grid = pattern_by_name(pattern).expect("known pattern must exist");
+    let grid = pattern_by_name(pattern).or_invariant("known pattern must exist");
+    let backend = select_backend(&grid, target_generation);
     let started = Instant::now();
     let mut progress_logger = OracleProgressLogger::new(progress, pattern, target_generation);
     let outcome = reference_classify_to_generation_target(
@@ -325,7 +312,9 @@ fn format_eta_seconds(eta_seconds: f64) -> String {
     if !eta_seconds.is_finite() {
         return "unknown".to_string();
     }
-    let total_seconds = eta_seconds.max(0.0).round() as u64;
+    let duration = Duration::try_from_secs_f64(eta_seconds.max(0.0)).unwrap_or(Duration::MAX);
+    let round_up = u128::from(duration.subsec_nanos() >= 500_000_000);
+    let total_seconds = u128::from(duration.as_secs()).saturating_add(round_up);
     let hours = total_seconds / 3_600;
     let minutes = (total_seconds % 3_600) / 60;
     let seconds = total_seconds % 60;

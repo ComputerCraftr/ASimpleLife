@@ -1,0 +1,845 @@
+#include <inttypes.h>
+#include <stdatomic.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#endif
+
+#if (defined(__x86_64__) || defined(_M_X64)) &&                         \
+    (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#define BF_HAS_AVX2_KERNEL 1
+#else
+#define BF_HAS_AVX2_KERNEL 0
+#endif
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#define BF_HAS_NEON_KERNEL 1
+#else
+#define BF_HAS_NEON_KERNEL 0
+#endif
+
+static void bf_configure_binary_stdio(void) {
+#if defined(_WIN32)
+    (void)_setmode(_fileno(stdin), _O_BINARY);
+    (void)_setmode(_fileno(stdout), _O_BINARY);
+#endif
+}
+
+/* @BF_CONFIG */
+
+#ifndef BF_TEMPLATE_TAPE_LEN
+#define BF_TEMPLATE_TAPE_LEN 30000
+#endif
+
+#ifndef BF_TEMPLATE_CELL_BITS
+#define BF_TEMPLATE_CELL_BITS 8
+#endif
+
+#ifndef BF_TEMPLATE_SIGNED_CELLS
+#define BF_TEMPLATE_SIGNED_CELLS 1
+#endif
+
+#ifndef BF_TEMPLATE_CELL_MASK
+#define BF_TEMPLATE_CELL_MASK UINT64_C(255)
+#endif
+
+#ifndef BF_TEMPLATE_INPUT_MASK
+#define BF_TEMPLATE_INPUT_MASK UINT64_C(255)
+#endif
+
+#ifndef BF_TEMPLATE_OUTPUT_MASK
+#define BF_TEMPLATE_OUTPUT_MASK UINT64_C(255)
+#endif
+
+#define BF_MAX_CELL_BITS 63U
+
+uint64_t bf_bits_mask(unsigned bits) {
+    if (bits == 0U) {
+        return UINT64_C(0);
+    }
+    if (bits >= BF_MAX_CELL_BITS) {
+        return (UINT64_C(1) << BF_MAX_CELL_BITS) - 1U;
+    }
+    return (UINT64_C(1) << bits) - 1U;
+}
+
+int64_t bf_wrap_from_u64_signed(uint64_t raw, unsigned bits) {
+    if (bits == 0U) {
+        return 0;
+    }
+    raw &= bf_bits_mask(bits);
+    if (bits >= BF_MAX_CELL_BITS) {
+        uint64_t sign = UINT64_C(1) << 62U;
+        if ((raw & sign) == 0) {
+            return (int64_t)raw;
+        }
+        uint64_t mag = raw - sign;
+        return (int64_t)mag - (int64_t)sign;
+    }
+    uint64_t sign = UINT64_C(1) << (bits - 1);
+    if ((raw & sign) == 0) {
+        return (int64_t)raw;
+    }
+    return (int64_t)raw - (int64_t)(UINT64_C(1) << bits);
+}
+
+int64_t bf_wrap_from_u64_unsigned(uint64_t raw, unsigned bits) {
+    if (bits == 0U) {
+        return 0;
+    }
+    return (int64_t)(raw & bf_bits_mask(bits));
+}
+
+uint64_t bf_wrap_to_u64(int64_t value, unsigned bits) {
+    if (bits == 0U) {
+        return UINT64_C(0);
+    }
+    return ((uint64_t)value) & bf_bits_mask(bits);
+}
+
+int64_t bf_wrap_add_i64_signed(int64_t lhs, int64_t rhs, unsigned bits) {
+    uint64_t lhs_u64 = bf_wrap_to_u64(lhs, bits);
+    uint64_t rhs_u64 = bf_wrap_to_u64(rhs, bits);
+    uint64_t out = lhs_u64 + rhs_u64;
+    return bf_wrap_from_u64_signed(out, bits);
+}
+
+int64_t bf_wrap_sub_i64_signed(int64_t lhs, int64_t rhs, unsigned bits) {
+    uint64_t lhs_u64 = bf_wrap_to_u64(lhs, bits);
+    uint64_t rhs_u64 = bf_wrap_to_u64(rhs, bits);
+    uint64_t out = lhs_u64 - rhs_u64;
+    return bf_wrap_from_u64_signed(out, bits);
+}
+
+int64_t bf_wrap_mul_i64_signed(int64_t lhs, int64_t rhs, unsigned bits) {
+    uint64_t lhs_u64 = bf_wrap_to_u64(lhs, bits);
+    uint64_t rhs_u64 = bf_wrap_to_u64(rhs, bits);
+    uint64_t out = lhs_u64 * rhs_u64;
+    return bf_wrap_from_u64_signed(out, bits);
+}
+
+int64_t bf_wrap_add_i64_unsigned(int64_t lhs, int64_t rhs, unsigned bits) {
+    uint64_t lhs_u64 = bf_wrap_to_u64(lhs, bits);
+    uint64_t rhs_u64 = bf_wrap_to_u64(rhs, bits);
+    uint64_t out = lhs_u64 + rhs_u64;
+    return bf_wrap_from_u64_unsigned(out, bits);
+}
+
+int64_t bf_wrap_sub_i64_unsigned(int64_t lhs, int64_t rhs, unsigned bits) {
+    uint64_t lhs_u64 = bf_wrap_to_u64(lhs, bits);
+    uint64_t rhs_u64 = bf_wrap_to_u64(rhs, bits);
+    uint64_t out = lhs_u64 - rhs_u64;
+    return bf_wrap_from_u64_unsigned(out, bits);
+}
+
+int64_t bf_wrap_mul_i64_unsigned(int64_t lhs, int64_t rhs, unsigned bits) {
+    uint64_t lhs_u64 = bf_wrap_to_u64(lhs, bits);
+    uint64_t rhs_u64 = bf_wrap_to_u64(rhs, bits);
+    uint64_t out = lhs_u64 * rhs_u64;
+    return bf_wrap_from_u64_unsigned(out, bits);
+}
+
+int64_t bf_wrap_shift_left_i64(int64_t value, unsigned amount, unsigned bits,
+                               int signed_cells) {
+    if (amount >= 64U) {
+        return 0;
+    }
+    return signed_cells
+               ? bf_wrap_from_u64_signed(bf_wrap_to_u64(value, bits) << amount,
+                                         bits)
+               : bf_wrap_from_u64_unsigned(bf_wrap_to_u64(value, bits) << amount,
+                                           bits);
+}
+
+int64_t bf_wrap_shift_right_i64(int64_t value, unsigned amount, unsigned bits,
+                                int signed_cells) {
+    if (amount >= 64U) {
+        return 0;
+    }
+    return signed_cells
+               ? bf_wrap_from_u64_signed(bf_wrap_to_u64(value, bits) >> amount,
+                                         bits)
+               : bf_wrap_from_u64_unsigned(bf_wrap_to_u64(value, bits) >> amount,
+                                           bits);
+}
+
+_Noreturn void bf_diverge_forever(void) {
+    for (;;) {
+        atomic_signal_fence(memory_order_seq_cst);
+    }
+}
+
+static uint64_t bf_work_dispatches = 0;
+static uint64_t bf_work_loop_iterations = 0;
+static uint64_t bf_work_ops = 0;
+static uint64_t bf_semantic_steps = 0;
+static uint64_t bf_native_avx2_lanes = 0;
+static uint64_t bf_native_neon_lanes = 0;
+static uint64_t bf_scalar_kernel_lanes = 0;
+static uint64_t bf_kernel_batches = 0;
+static uint64_t bf_scan_kernel_lanes = 0;
+static uint64_t bf_scan_kernel_batches = 0;
+static uint64_t bf_add_kernel_lanes = 0;
+static uint64_t bf_add_kernel_batches = 0;
+static uint64_t bf_clear_set_kernel_lanes = 0;
+static uint64_t bf_clear_set_kernel_batches = 0;
+static uint64_t bf_transfer_kernel_lanes = 0;
+static uint64_t bf_transfer_kernel_batches = 0;
+static uint64_t bf_summary_kernel_lanes = 0;
+static uint64_t bf_summary_kernel_batches = 0;
+static uint64_t bf_native_scan_kernel_lanes = 0;
+static uint64_t bf_native_add_kernel_lanes = 0;
+static uint64_t bf_native_clear_set_kernel_lanes = 0;
+static uint64_t bf_native_transfer_kernel_lanes = 0;
+static uint64_t bf_native_summary_kernel_lanes = 0;
+static uint64_t bf_scalar_scan_kernel_lanes = 0;
+static uint64_t bf_scalar_add_kernel_lanes = 0;
+static uint64_t bf_scalar_clear_set_kernel_lanes = 0;
+static uint64_t bf_scalar_transfer_kernel_lanes = 0;
+static uint64_t bf_scalar_summary_kernel_lanes = 0;
+
+#ifndef BF_TEST_WORK_LIMIT
+#define BF_TEST_WORK_LIMIT UINT64_C(0)
+#endif
+#ifndef BF_TEST_SEMANTIC_FUEL_LIMIT
+#define BF_TEST_SEMANTIC_FUEL_LIMIT UINT64_C(0)
+#endif
+
+int bf_semantic_fuel_enabled(void) {
+    return BF_TEST_SEMANTIC_FUEL_LIMIT != 0;
+}
+
+void bf_semantic_step(uint64_t represented_steps) {
+    if (BF_TEST_SEMANTIC_FUEL_LIMIT != 0 &&
+        (represented_steps > BF_TEST_SEMANTIC_FUEL_LIMIT ||
+         bf_semantic_steps > BF_TEST_SEMANTIC_FUEL_LIMIT - represented_steps)) {
+        fputs("BF_TEST_SEMANTIC_FUEL_REACHED\n", stderr);
+        exit(124);
+    }
+    bf_semantic_steps += represented_steps;
+}
+
+void bf_semantic_summary_unsupported(void) {
+    if (BF_TEST_SEMANTIC_FUEL_LIMIT != 0) {
+        fputs("BF_TEST_SEMANTIC_FUEL_UNSUPPORTED_SUMMARY\n", stderr);
+        exit(125);
+    }
+}
+
+static void bf_test_check_work_limit(void) {
+    const uint64_t work_limit = BF_TEST_WORK_LIMIT;
+    if (work_limit != 0 &&
+        bf_work_dispatches + bf_work_loop_iterations + bf_work_ops >=
+            work_limit) {
+        fputs("BF_TEST_WORK_LIMIT_REACHED\n", stderr);
+        exit(124);
+    }
+}
+
+void bf_work_dispatch(void) {
+    bf_work_dispatches++;
+    bf_test_check_work_limit();
+}
+void bf_work_loop_iter(void) {
+    bf_work_loop_iterations++;
+    bf_test_check_work_limit();
+}
+void bf_work_op(void) {
+    bf_work_ops++;
+    bf_test_check_work_limit();
+}
+
+void bf_work_scan_steps(uint64_t steps) {
+    bf_work_loop_iterations += steps;
+    bf_work_ops += steps;
+    bf_test_check_work_limit();
+}
+
+static void print_work_stats(void) {
+    printf("=== BF PLAIN RUNTIME STATS ===\n");
+    printf("work dispatches: %llu\n", (unsigned long long)bf_work_dispatches);
+    printf("work loop iterations: %llu\n",
+           (unsigned long long)bf_work_loop_iterations);
+    printf("work ops: %llu\n", (unsigned long long)bf_work_ops);
+    printf("semantic steps: %llu\n", (unsigned long long)bf_semantic_steps);
+    printf("bf native avx2 lanes: %llu\n",
+           (unsigned long long)bf_native_avx2_lanes);
+    printf("bf native neon lanes: %llu\n",
+           (unsigned long long)bf_native_neon_lanes);
+    printf("bf scalar kernel lanes: %llu\n",
+           (unsigned long long)bf_scalar_kernel_lanes);
+    printf("bf kernel batches: %llu\n", (unsigned long long)bf_kernel_batches);
+    printf("bf scan kernel lanes: %llu\n", (unsigned long long)bf_scan_kernel_lanes);
+    printf("bf scan kernel batches: %llu\n",
+           (unsigned long long)bf_scan_kernel_batches);
+    printf("bf add kernel lanes: %llu\n", (unsigned long long)bf_add_kernel_lanes);
+    printf("bf add kernel batches: %llu\n", (unsigned long long)bf_add_kernel_batches);
+    printf("bf clear/set kernel lanes: %llu\n",
+           (unsigned long long)bf_clear_set_kernel_lanes);
+    printf("bf clear/set kernel batches: %llu\n",
+           (unsigned long long)bf_clear_set_kernel_batches);
+    printf("bf transfer kernel lanes: %llu\n",
+           (unsigned long long)bf_transfer_kernel_lanes);
+    printf("bf transfer kernel batches: %llu\n",
+           (unsigned long long)bf_transfer_kernel_batches);
+    printf("bf summary kernel lanes: %llu\n",
+           (unsigned long long)bf_summary_kernel_lanes);
+    printf("bf summary kernel batches: %llu\n",
+           (unsigned long long)bf_summary_kernel_batches);
+    printf("bf native scan kernel lanes: %llu\n",
+           (unsigned long long)bf_native_scan_kernel_lanes);
+    printf("bf native add kernel lanes: %llu\n",
+           (unsigned long long)bf_native_add_kernel_lanes);
+    printf("bf native clear/set kernel lanes: %llu\n",
+           (unsigned long long)bf_native_clear_set_kernel_lanes);
+    printf("bf native transfer kernel lanes: %llu\n",
+           (unsigned long long)bf_native_transfer_kernel_lanes);
+    printf("bf native summary kernel lanes: %llu\n",
+           (unsigned long long)bf_native_summary_kernel_lanes);
+    printf("bf scalar scan kernel lanes: %llu\n",
+           (unsigned long long)bf_scalar_scan_kernel_lanes);
+    printf("bf scalar add kernel lanes: %llu\n",
+           (unsigned long long)bf_scalar_add_kernel_lanes);
+    printf("bf scalar clear/set kernel lanes: %llu\n",
+           (unsigned long long)bf_scalar_clear_set_kernel_lanes);
+    printf("bf scalar transfer kernel lanes: %llu\n",
+           (unsigned long long)bf_scalar_transfer_kernel_lanes);
+    printf("bf scalar summary kernel lanes: %llu\n",
+           (unsigned long long)bf_scalar_summary_kernel_lanes);
+}
+
+/* @BF_WRAP_PTR_BEGIN */
+ptrdiff_t bf_wrap_ptr(ptrdiff_t ptr, ptrdiff_t delta, ptrdiff_t len) {
+    if (len <= 0) {
+        return 0;
+    }
+    ptr %= len;
+    if (ptr < 0) {
+        ptr += len;
+    }
+    delta %= len;
+    if (delta < 0) {
+        delta += len;
+    }
+    return (ptr + delta) % len;
+}
+/* @BF_WRAP_PTR_END */
+
+typedef ptrdiff_t (*BfScanKernel)(const int64_t *, ptrdiff_t, ptrdiff_t,
+                                  ptrdiff_t, uint64_t *);
+typedef void (*BfDeltaKernel)(int64_t *, ptrdiff_t, const ptrdiff_t *,
+                              const int64_t *, size_t, ptrdiff_t, unsigned, int,
+                              unsigned);
+typedef void (*BfSetKernel)(int64_t *, ptrdiff_t, const ptrdiff_t *,
+                            const int64_t *, size_t, ptrdiff_t);
+typedef void (*BfTransferKernel)(int64_t *, ptrdiff_t, int64_t,
+                                 const ptrdiff_t *, const int64_t *, size_t,
+                                 ptrdiff_t, unsigned, int);
+
+enum {
+    BF_KERNEL_FAMILY_ADD = 0U,
+    BF_KERNEL_FAMILY_TRANSFER = 1U,
+    BF_KERNEL_FAMILY_SUMMARY = 2U
+};
+
+typedef struct {
+    BfScanKernel scan_zero;
+    BfDeltaKernel apply_deltas;
+    BfSetKernel set_cells;
+    BfTransferKernel transfer;
+} BfKernelSet;
+
+static void bf_count_family(unsigned family, uint64_t lanes, uint64_t batches) {
+    if (family == BF_KERNEL_FAMILY_ADD) {
+        bf_add_kernel_lanes += lanes;
+        bf_add_kernel_batches += batches;
+    } else if (family == BF_KERNEL_FAMILY_TRANSFER) {
+        bf_transfer_kernel_lanes += lanes;
+        bf_transfer_kernel_batches += batches;
+    } else {
+        bf_summary_kernel_lanes += lanes;
+        bf_summary_kernel_batches += batches;
+    }
+}
+
+#if (BF_HAS_AVX2_KERNEL || BF_HAS_NEON_KERNEL) && !defined(BF_FORCE_SCALAR_KERNEL)
+static void bf_count_native_family(unsigned family, uint64_t lanes) {
+    if (family == BF_KERNEL_FAMILY_ADD)
+        bf_native_add_kernel_lanes += lanes;
+    else if (family == BF_KERNEL_FAMILY_TRANSFER)
+        bf_native_transfer_kernel_lanes += lanes;
+    else
+        bf_native_summary_kernel_lanes += lanes;
+}
+#endif
+
+static void bf_count_scalar_family(unsigned family, uint64_t lanes) {
+    if (family == BF_KERNEL_FAMILY_ADD)
+        bf_scalar_add_kernel_lanes += lanes;
+    else if (family == BF_KERNEL_FAMILY_TRANSFER)
+        bf_scalar_transfer_kernel_lanes += lanes;
+    else
+        bf_scalar_summary_kernel_lanes += lanes;
+}
+
+static int64_t bf_kernel_wrap_add(int64_t lhs, int64_t rhs, unsigned bits,
+                                  int signed_cells) {
+    return signed_cells ? bf_wrap_add_i64_signed(lhs, rhs, bits)
+                        : bf_wrap_add_i64_unsigned(lhs, rhs, bits);
+}
+
+static int bf_offsets_are_disjoint(ptrdiff_t ptr, const ptrdiff_t *offsets,
+                                   size_t count, ptrdiff_t len,
+                                   ptrdiff_t forbidden) {
+    for (size_t i = 0; i < count; ++i) {
+        ptrdiff_t lhs = bf_wrap_ptr(ptr, offsets[i], len);
+        if (forbidden >= 0 && lhs == forbidden)
+            return 0;
+        for (size_t j = 0; j < i; ++j) {
+            if (lhs == bf_wrap_ptr(ptr, offsets[j], len))
+                return 0;
+        }
+    }
+    return 1;
+}
+
+static int bf_offsets_are_contiguous(ptrdiff_t ptr, const ptrdiff_t *offsets,
+                                     size_t count, ptrdiff_t len) {
+    if (count == 0)
+        return 1;
+    ptrdiff_t start = bf_wrap_ptr(ptr, offsets[0], len);
+    if (start > len - (ptrdiff_t)count)
+        return 0;
+    for (size_t i = 1; i < count; ++i) {
+        if (bf_wrap_ptr(ptr, offsets[i], len) != start + (ptrdiff_t)i)
+            return 0;
+    }
+    return 1;
+}
+
+static void bf_apply_deltas_scalar(int64_t *tape, ptrdiff_t ptr,
+                                   const ptrdiff_t *offsets,
+                                   const int64_t *deltas, size_t count,
+                                   ptrdiff_t len, unsigned bits,
+                                   int signed_cells, unsigned family) {
+    bf_count_family(family, (uint64_t)count, count == 0 ? 0 : 1);
+    bf_count_scalar_family(family, (uint64_t)count);
+    bf_scalar_kernel_lanes += (uint64_t)count;
+    for (size_t i = 0; i < count; ++i) {
+        ptrdiff_t dst = bf_wrap_ptr(ptr, offsets[i], len);
+        tape[dst] = bf_kernel_wrap_add(tape[dst], deltas[i], bits, signed_cells);
+    }
+}
+
+static void bf_set_cells_scalar(int64_t *tape, ptrdiff_t ptr,
+                                const ptrdiff_t *offsets,
+                                const int64_t *values, size_t count,
+                                ptrdiff_t len) {
+    bf_clear_set_kernel_lanes += (uint64_t)count;
+    bf_clear_set_kernel_batches += count == 0 ? 0 : 1;
+    bf_scalar_clear_set_kernel_lanes += (uint64_t)count;
+    bf_scalar_kernel_lanes += (uint64_t)count;
+    for (size_t i = 0; i < count; ++i)
+        tape[bf_wrap_ptr(ptr, offsets[i], len)] = values[i];
+}
+
+static void bf_transfer_scalar(int64_t *tape, ptrdiff_t ptr, int64_t source,
+                               const ptrdiff_t *offsets,
+                               const int64_t *coefficients, size_t count,
+                               ptrdiff_t len, unsigned bits,
+                               int signed_cells) {
+    bf_count_family(BF_KERNEL_FAMILY_TRANSFER, (uint64_t)count,
+                    count == 0 ? 0 : 1);
+    bf_count_scalar_family(BF_KERNEL_FAMILY_TRANSFER, (uint64_t)count);
+    bf_scalar_kernel_lanes += (uint64_t)count;
+    for (size_t i = 0; i < count; ++i) {
+        ptrdiff_t dst = bf_wrap_ptr(ptr, offsets[i], len);
+        int64_t delta = signed_cells
+                            ? bf_wrap_mul_i64_signed(source, coefficients[i], bits)
+                            : bf_wrap_mul_i64_unsigned(source, coefficients[i], bits);
+        tape[dst] = bf_kernel_wrap_add(tape[dst], delta, bits, signed_cells);
+    }
+}
+
+#if BF_HAS_AVX2_KERNEL && !defined(BF_FORCE_SCALAR_KERNEL)
+__attribute__((target("avx2")))
+static void bf_apply_deltas_avx2(int64_t *tape, ptrdiff_t ptr,
+                                 const ptrdiff_t *offsets,
+                                 const int64_t *deltas, size_t count,
+                                 ptrdiff_t len, unsigned bits,
+                                 int signed_cells, unsigned family) {
+    size_t i = 0;
+    const __m256i mask = _mm256_set1_epi64x((int64_t)bf_bits_mask(bits));
+    const __m256i sign = _mm256_set1_epi64x(bits == 0 ? 0 :
+                                           (int64_t)(UINT64_C(1) << (bits - 1U)));
+    for (; i + 4 <= count; i += 4) {
+        int64_t old[4];
+        for (size_t lane = 0; lane < 4; ++lane)
+            old[lane] = tape[bf_wrap_ptr(ptr, offsets[i + lane], len)];
+        __m256i raw = _mm256_add_epi64(
+            _mm256_loadu_si256((const __m256i *)old),
+            _mm256_loadu_si256((const __m256i *)&deltas[i]));
+        raw = _mm256_and_si256(raw, mask);
+        if (signed_cells && bits != 0U)
+            raw = _mm256_sub_epi64(_mm256_xor_si256(raw, sign), sign);
+        _mm256_storeu_si256((__m256i *)old, raw);
+        for (size_t lane = 0; lane < 4; ++lane)
+            tape[bf_wrap_ptr(ptr, offsets[i + lane], len)] = old[lane];
+        bf_native_avx2_lanes += 4;
+        bf_kernel_batches++;
+        bf_count_family(family, 4, 1);
+        bf_count_native_family(family, 4);
+    }
+    if (i != count)
+        bf_apply_deltas_scalar(tape, ptr, &offsets[i], &deltas[i], count - i,
+                               len, bits, signed_cells, family);
+}
+
+__attribute__((target("avx2")))
+static void bf_set_cells_avx2(int64_t *tape, ptrdiff_t ptr,
+                              const ptrdiff_t *offsets,
+                              const int64_t *values, size_t count,
+                              ptrdiff_t len) {
+    size_t i = 0;
+    for (; i + 4 <= count; i += 4) {
+        ptrdiff_t dst = bf_wrap_ptr(ptr, offsets[i], len);
+        _mm256_storeu_si256((__m256i *)&tape[dst],
+                            _mm256_loadu_si256((const __m256i *)&values[i]));
+        bf_native_avx2_lanes += 4;
+        bf_kernel_batches++;
+        bf_clear_set_kernel_lanes += 4;
+        bf_clear_set_kernel_batches++;
+        bf_native_clear_set_kernel_lanes += 4;
+    }
+    if (i != count)
+        bf_set_cells_scalar(tape, ptr, &offsets[i], &values[i], count - i, len);
+}
+
+__attribute__((target("avx2")))
+static void bf_transfer_avx2(int64_t *tape, ptrdiff_t ptr, int64_t source,
+                             const ptrdiff_t *offsets,
+                             const int64_t *coefficients, size_t count,
+                             ptrdiff_t len, unsigned bits,
+                             int signed_cells) {
+    if (bits > 32U) {
+        bf_transfer_scalar(tape, ptr, source, offsets, coefficients, count, len,
+                           bits, signed_cells);
+        return;
+    }
+    size_t i = 0;
+    const __m256i source_lanes =
+        _mm256_set1_epi64x((int64_t)bf_wrap_to_u64(source, bits));
+    const __m256i mask = _mm256_set1_epi64x((int64_t)bf_bits_mask(bits));
+    const __m256i sign = _mm256_set1_epi64x(
+        bits == 0 ? 0 : (int64_t)(UINT64_C(1) << (bits - 1U)));
+    for (; i + 4 <= count; i += 4) {
+        int64_t old[4];
+        uint64_t raw_coefficients[4];
+        for (size_t lane = 0; lane < 4; ++lane) {
+            old[lane] = tape[bf_wrap_ptr(ptr, offsets[i + lane], len)];
+            raw_coefficients[lane] = bf_wrap_to_u64(coefficients[i + lane], bits);
+        }
+        __m256i product = _mm256_mul_epu32(
+            source_lanes,
+            _mm256_loadu_si256((const __m256i *)raw_coefficients));
+        __m256i raw = _mm256_and_si256(
+            _mm256_add_epi64(_mm256_loadu_si256((const __m256i *)old), product),
+            mask);
+        if (signed_cells && bits != 0U)
+            raw = _mm256_sub_epi64(_mm256_xor_si256(raw, sign), sign);
+        _mm256_storeu_si256((__m256i *)old, raw);
+        for (size_t lane = 0; lane < 4; ++lane)
+            tape[bf_wrap_ptr(ptr, offsets[i + lane], len)] = old[lane];
+        bf_native_avx2_lanes += 4;
+        bf_kernel_batches++;
+        bf_count_family(BF_KERNEL_FAMILY_TRANSFER, 4, 1);
+        bf_count_native_family(BF_KERNEL_FAMILY_TRANSFER, 4);
+    }
+    if (i != count)
+        bf_transfer_scalar(tape, ptr, source, &offsets[i], &coefficients[i],
+                           count - i, len, bits, signed_cells);
+}
+#endif
+
+#if BF_HAS_NEON_KERNEL && !defined(BF_FORCE_SCALAR_KERNEL)
+static void bf_apply_deltas_neon(int64_t *tape, ptrdiff_t ptr,
+                                 const ptrdiff_t *offsets,
+                                 const int64_t *deltas, size_t count,
+                                 ptrdiff_t len, unsigned bits,
+                                 int signed_cells, unsigned family) {
+    size_t i = 0;
+    const uint64x2_t mask = vdupq_n_u64(bf_bits_mask(bits));
+    const uint64x2_t sign = vdupq_n_u64(bits == 0 ? 0 :
+                                       UINT64_C(1) << (bits - 1U));
+    for (; i + 2 <= count; i += 2) {
+        int64_t old[2] = {
+            tape[bf_wrap_ptr(ptr, offsets[i], len)],
+            tape[bf_wrap_ptr(ptr, offsets[i + 1], len)]};
+        uint64x2_t raw = vandq_u64(
+            vreinterpretq_u64_s64(vaddq_s64(vld1q_s64(old), vld1q_s64(&deltas[i]))),
+            mask);
+        if (signed_cells && bits != 0U)
+            raw = vsubq_u64(veorq_u64(raw, sign), sign);
+        vst1q_s64(old, vreinterpretq_s64_u64(raw));
+        tape[bf_wrap_ptr(ptr, offsets[i], len)] = old[0];
+        tape[bf_wrap_ptr(ptr, offsets[i + 1], len)] = old[1];
+        bf_native_neon_lanes += 2;
+        bf_kernel_batches++;
+        bf_count_family(family, 2, 1);
+        bf_count_native_family(family, 2);
+    }
+    if (i != count)
+        bf_apply_deltas_scalar(tape, ptr, &offsets[i], &deltas[i], count - i,
+                               len, bits, signed_cells, family);
+}
+
+static void bf_set_cells_neon(int64_t *tape, ptrdiff_t ptr,
+                              const ptrdiff_t *offsets,
+                              const int64_t *values, size_t count,
+                              ptrdiff_t len) {
+    size_t i = 0;
+    for (; i + 2 <= count; i += 2) {
+        ptrdiff_t dst = bf_wrap_ptr(ptr, offsets[i], len);
+        vst1q_s64(&tape[dst], vld1q_s64(&values[i]));
+        bf_native_neon_lanes += 2;
+        bf_kernel_batches++;
+        bf_clear_set_kernel_lanes += 2;
+        bf_clear_set_kernel_batches++;
+        bf_native_clear_set_kernel_lanes += 2;
+    }
+    if (i != count)
+        bf_set_cells_scalar(tape, ptr, &offsets[i], &values[i], count - i, len);
+}
+
+static void bf_transfer_neon(int64_t *tape, ptrdiff_t ptr, int64_t source,
+                             const ptrdiff_t *offsets,
+                             const int64_t *coefficients, size_t count,
+                             ptrdiff_t len, unsigned bits,
+                             int signed_cells) {
+    if (bits > 32U) {
+        bf_transfer_scalar(tape, ptr, source, offsets, coefficients, count, len,
+                           bits, signed_cells);
+        return;
+    }
+    size_t i = 0;
+    const uint32x2_t source_lanes =
+        vdup_n_u32((uint32_t)bf_wrap_to_u64(source, bits));
+    const uint64x2_t mask = vdupq_n_u64(bf_bits_mask(bits));
+    const uint64x2_t sign =
+        vdupq_n_u64(bits == 0 ? 0 : UINT64_C(1) << (bits - 1U));
+    for (; i + 2 <= count; i += 2) {
+        int64_t old[2] = {tape[bf_wrap_ptr(ptr, offsets[i], len)],
+                          tape[bf_wrap_ptr(ptr, offsets[i + 1], len)]};
+        uint32_t raw_coefficients[2] = {
+            (uint32_t)bf_wrap_to_u64(coefficients[i], bits),
+            (uint32_t)bf_wrap_to_u64(coefficients[i + 1], bits)};
+        uint64x2_t raw = vandq_u64(
+            vaddq_u64(vreinterpretq_u64_s64(vld1q_s64(old)),
+                      vmull_u32(source_lanes, vld1_u32(raw_coefficients))),
+            mask);
+        if (signed_cells && bits != 0U)
+            raw = vsubq_u64(veorq_u64(raw, sign), sign);
+        vst1q_s64(old, vreinterpretq_s64_u64(raw));
+        tape[bf_wrap_ptr(ptr, offsets[i], len)] = old[0];
+        tape[bf_wrap_ptr(ptr, offsets[i + 1], len)] = old[1];
+        bf_native_neon_lanes += 2;
+        bf_kernel_batches++;
+        bf_count_family(BF_KERNEL_FAMILY_TRANSFER, 2, 1);
+        bf_count_native_family(BF_KERNEL_FAMILY_TRANSFER, 2);
+    }
+    if (i != count)
+        bf_transfer_scalar(tape, ptr, source, &offsets[i], &coefficients[i],
+                           count - i, len, bits, signed_cells);
+}
+#endif
+
+static ptrdiff_t bf_scan_zero_scalar(const int64_t *tape, ptrdiff_t ptr,
+                                     ptrdiff_t stride, ptrdiff_t len,
+                                     uint64_t *steps) {
+    bf_scan_kernel_batches++;
+    while (1) {
+        bf_scan_kernel_lanes++;
+        bf_scalar_kernel_lanes++;
+        bf_scalar_scan_kernel_lanes++;
+        if (tape[ptr] == 0)
+            return ptr;
+        (*steps)++;
+        bf_work_scan_steps(UINT64_C(1));
+        ptr = bf_wrap_ptr(ptr, stride, len);
+    }
+}
+
+#if BF_HAS_AVX2_KERNEL && !defined(BF_FORCE_SCALAR_KERNEL)
+__attribute__((target("avx2")))
+static ptrdiff_t bf_scan_zero_avx2(const int64_t *tape, ptrdiff_t ptr,
+                                  ptrdiff_t stride, ptrdiff_t len,
+                                  uint64_t *steps) {
+    const __m256i zero = _mm256_setzero_si256();
+    while ((stride == 1 && ptr <= len - 4) || (stride == -1 && ptr >= 3)) {
+        ptrdiff_t start = stride == 1 ? ptr : ptr - 3;
+        __m256i cells = _mm256_loadu_si256((const __m256i *)&tape[start]);
+        unsigned mask = (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi64(cells, zero));
+        bf_native_avx2_lanes += 4;
+        bf_native_scan_kernel_lanes += 4;
+        bf_scan_kernel_lanes += 4;
+        bf_scan_kernel_batches++;
+        bf_kernel_batches++;
+        if (mask != 0U) {
+            if (stride == 1) {
+                for (ptrdiff_t lane = 0; lane < 4; ++lane) {
+                    if ((mask & (UINT32_C(255) << (unsigned)(lane * 8))) != 0U) {
+                        *steps += (uint64_t)lane;
+                        bf_work_scan_steps((uint64_t)lane);
+                        return ptr + lane;
+                    }
+                }
+            } else {
+                for (ptrdiff_t lane = 3; lane >= 0; --lane) {
+                    if ((mask & (UINT32_C(255) << (unsigned)(lane * 8))) != 0U) {
+                        *steps += (uint64_t)(3 - lane);
+                        bf_work_scan_steps((uint64_t)(3 - lane));
+                        return start + lane;
+                    }
+                }
+            }
+        }
+        *steps += 4;
+        bf_work_scan_steps(UINT64_C(4));
+        ptr += stride * 4;
+    }
+    return bf_scan_zero_scalar(tape, bf_wrap_ptr(ptr, 0, len), stride, len, steps);
+}
+#endif
+
+#if BF_HAS_NEON_KERNEL && !defined(BF_FORCE_SCALAR_KERNEL)
+static ptrdiff_t bf_scan_zero_neon(const int64_t *tape, ptrdiff_t ptr,
+                                  ptrdiff_t stride, ptrdiff_t len,
+                                  uint64_t *steps) {
+    const int64x2_t zero = vdupq_n_s64(0);
+    while ((stride == 1 && ptr <= len - 2) || (stride == -1 && ptr >= 1)) {
+        ptrdiff_t start = stride == 1 ? ptr : ptr - 1;
+        uint64_t matches[2];
+        vst1q_u64(matches, vceqq_s64(vld1q_s64(&tape[start]), zero));
+        bf_native_neon_lanes += 2;
+        bf_native_scan_kernel_lanes += 2;
+        bf_scan_kernel_lanes += 2;
+        bf_scan_kernel_batches++;
+        bf_kernel_batches++;
+        if (stride == 1) {
+            if (matches[0] != 0) return ptr;
+            if (matches[1] != 0) { (*steps)++; bf_work_scan_steps(UINT64_C(1)); return ptr + 1; }
+        } else {
+            if (matches[1] != 0) return ptr;
+            if (matches[0] != 0) { (*steps)++; bf_work_scan_steps(UINT64_C(1)); return ptr - 1; }
+        }
+        *steps += 2;
+        bf_work_scan_steps(UINT64_C(2));
+        ptr += stride * 2;
+    }
+    return bf_scan_zero_scalar(tape, bf_wrap_ptr(ptr, 0, len), stride, len, steps);
+}
+#endif
+
+static BfKernelSet bf_kernels = {bf_scan_zero_scalar, bf_apply_deltas_scalar,
+                                 bf_set_cells_scalar, bf_transfer_scalar};
+
+static void bf_kernel_init(void) {
+#if defined(BF_FORCE_SCALAR_KERNEL)
+    return;
+#else
+#if BF_HAS_AVX2_KERNEL
+    __builtin_cpu_init();
+    if (__builtin_cpu_supports("avx2")) {
+        bf_kernels.scan_zero = bf_scan_zero_avx2;
+        bf_kernels.apply_deltas = bf_apply_deltas_avx2;
+        bf_kernels.set_cells = bf_set_cells_avx2;
+        bf_kernels.transfer = bf_transfer_avx2;
+        return;
+    }
+#endif
+#if BF_HAS_NEON_KERNEL
+    bf_kernels.scan_zero = bf_scan_zero_neon;
+    bf_kernels.apply_deltas = bf_apply_deltas_neon;
+    bf_kernels.set_cells = bf_set_cells_neon;
+    bf_kernels.transfer = bf_transfer_neon;
+#endif
+#endif
+}
+
+ptrdiff_t bf_scan_zero(const int64_t *tape, ptrdiff_t ptr,
+                       ptrdiff_t stride, ptrdiff_t len, uint64_t *steps) {
+    return bf_kernels.scan_zero(tape, ptr, stride, len, steps);
+}
+
+void bf_add_at_batch(int64_t *tape, ptrdiff_t ptr,
+                     const ptrdiff_t *offsets, const int64_t *deltas,
+                     size_t count, ptrdiff_t len, unsigned bits,
+                     int signed_cells) {
+    if (!bf_offsets_are_disjoint(ptr, offsets, count, len, -1)) {
+        bf_apply_deltas_scalar(tape, ptr, offsets, deltas, count, len, bits,
+                               signed_cells, BF_KERNEL_FAMILY_ADD);
+        return;
+    }
+    bf_kernels.apply_deltas(tape, ptr, offsets, deltas, count, len, bits,
+                            signed_cells, BF_KERNEL_FAMILY_ADD);
+}
+
+void bf_clear_set_batch(int64_t *tape, ptrdiff_t ptr,
+                        const ptrdiff_t *offsets, const int64_t *values,
+                        size_t count, ptrdiff_t len) {
+    if (!bf_offsets_are_disjoint(ptr, offsets, count, len, -1) ||
+        !bf_offsets_are_contiguous(ptr, offsets, count, len)) {
+        bf_set_cells_scalar(tape, ptr, offsets, values, count, len);
+        return;
+    }
+    bf_kernels.set_cells(tape, ptr, offsets, values, count, len);
+}
+
+void bf_transfer_batch(int64_t *tape, ptrdiff_t ptr, ptrdiff_t source_offset,
+                       const ptrdiff_t *offsets, const int64_t *coefficients,
+                       size_t count, int preserve_source, ptrdiff_t len,
+                       unsigned bits, int signed_cells) {
+    ptrdiff_t source_ptr = bf_wrap_ptr(ptr, source_offset, len);
+    int64_t source = tape[source_ptr];
+    if (!bf_offsets_are_disjoint(ptr, offsets, count, len, source_ptr)) {
+        bf_transfer_scalar(tape, ptr, source, offsets, coefficients, count, len,
+                           bits, signed_cells);
+    } else {
+        bf_kernels.transfer(tape, ptr, source, offsets, coefficients, count, len,
+                            bits, signed_cells);
+    }
+    if (!preserve_source)
+        tape[source_ptr] = 0;
+}
+
+int main(void) {
+    enum {
+        BF_TAPE_LEN = BF_TEMPLATE_TAPE_LEN,
+        BF_CELL_BITS = BF_TEMPLATE_CELL_BITS,
+        BF_SIGNED_CELLS = BF_TEMPLATE_SIGNED_CELLS
+    };
+/* @BF_CELL_MASK_BEGIN */
+#define BF_CELL_MASK BF_TEMPLATE_CELL_MASK
+/* @BF_CELL_MASK_END */
+/* @BF_INPUT_MASK_BEGIN */
+#define BF_INPUT_MASK BF_TEMPLATE_INPUT_MASK
+/* @BF_INPUT_MASK_END */
+#define BF_OUTPUT_MASK BF_TEMPLATE_OUTPUT_MASK
+    int64_t tape[BF_TAPE_LEN] = {0};
+    ptrdiff_t ptr = 0;
+    bf_configure_binary_stdio();
+    bf_kernel_init();
+    (void)tape;
+    (void)ptr;
+
+    /* @BF_PROGRAM */
+    print_work_stats();
+    return 0;
+}

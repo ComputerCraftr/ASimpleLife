@@ -1,95 +1,161 @@
 use super::{
-    GridExtractionError, GridExtractionPolicy, HashLifeCheckpoint, HashLifeCheckpointSignature,
-    HASHLIFE_CHECKPOINT_MAX_BOUNDS_SPAN, HASHLIFE_CHECKPOINT_MAX_POPULATION, HashLifeEngine,
-    NodeId, PackedNodeKey, base_transitions,
+    GridExtractionError, GridExtractionPolicy, HashLifeEngine, NodeId, PackedNodeKey,
+    RelativeBounds,
 };
+use crate::RequiredExt;
 use crate::bitgrid::{BitGrid, CHUNK_SIZE, Cell, Coord};
-use crate::life::step_grid_with_changes_and_memo;
-use crate::memo::Memo;
-use std::collections::HashMap;
+
+#[derive(Clone, Copy)]
+struct BoundsFrame {
+    node: NodeId,
+    next_child: usize,
+    bounds: RelativeBounds,
+}
 
 impl HashLifeEngine {
-    pub(super) fn dense_advance_centered(&mut self, node: NodeId, step_exp: u32) -> NodeId {
-        let level = self.node_columns.level(node);
-        debug_assert!(level >= 2);
-        let size = 1_i64 << level;
-        let result_size = size / 2;
-        let center_origin = size / 4;
-        let generations = 1_u64 << step_exp;
-        let mut grid = self
-            .node_to_grid(
-                node,
-                0,
-                0,
-                GridExtractionPolicy::FullGridIfUnder {
-                    max_population: u64::MAX,
-                    max_chunks: usize::MAX,
-                    max_bounds_span: Coord::MAX,
-                },
-            )
-            .expect("dense HashLife shortcut extraction should be unrestricted");
-        let mut memo = Memo::default();
-        for _ in 0..generations {
-            grid = step_grid_with_changes_and_memo(&grid, &mut memo).0;
+    pub(super) fn node_cell_alive(
+        &self,
+        mut node: NodeId,
+        origin_x: Coord,
+        origin_y: Coord,
+        x: Coord,
+        y: Coord,
+    ) -> bool {
+        let mut level = self.node_columns.level(node);
+        let mut relative_x = i128::from(x) - i128::from(origin_x);
+        let mut relative_y = i128::from(y) - i128::from(origin_y);
+        let size = 1_i128 << level;
+        if relative_x < 0 || relative_y < 0 || relative_x >= size || relative_y >= size {
+            return false;
         }
 
-        let mut centered = BitGrid::empty();
-        let max_x = center_origin + result_size;
-        let max_y = center_origin + result_size;
-        for (x, y) in grid.live_cells() {
-            if x >= center_origin && x < max_x && y >= center_origin && y < max_y {
-                centered.set(x - center_origin, y - center_origin, true);
+        while level != 0 {
+            if self.node_columns.population(node) == 0 {
+                return false;
             }
+            let half = 1_i128 << (level - 1);
+            let east = relative_x >= half;
+            let south = relative_y >= half;
+            if east {
+                relative_x -= half;
+            }
+            if south {
+                relative_y -= half;
+            }
+            let quadrants = self.node_columns.quadrants(node);
+            node = quadrants[usize::from(south) * 2 + usize::from(east)];
+            level -= 1;
         }
-        self.embed_grid_at_level(&centered, level - 1)
+        self.node_columns.population(node) != 0
     }
 
-    pub(super) fn base_transition(&mut self, node: NodeId) -> NodeId {
+    pub(super) fn centered_shell(&mut self, node: NodeId) -> NodeId {
+        let level = self.node_columns.level(node);
+        let key = super::ShellKey {
+            node,
+            target_level: u8::try_from(level + if level == 0 { 2 } else { 1 })
+                .or_invariant("HashLife shell level exceeded u8 capacity"),
+        };
+        if let Some(shell) = self.result_caches.shells.get(&key) {
+            return shell;
+        }
+        let shell = if level == 0 {
+            let empty = self.dead_leaf;
+            let nw = self.join(empty, empty, empty, node);
+            let other = self.join(empty, empty, empty, empty);
+            self.join(nw, other, other, other)
+        } else {
+            let empty = self.empty(level - 1);
+            let [nw, ne, sw, se] = self.node_columns.quadrants(node);
+            let upper_left = self.join(empty, empty, empty, nw);
+            let upper_right = self.join(empty, empty, ne, empty);
+            let lower_left = self.join(empty, sw, empty, empty);
+            let lower_right = self.join(se, empty, empty, empty);
+            self.join(upper_left, upper_right, lower_left, lower_right)
+        };
+        self.publish_optional_cache(
+            |engine| &engine.result_caches.shells,
+            |engine| &mut engine.result_caches.shells,
+            key,
+            crate::flat_table::FlatKey::fingerprint(&key),
+            shell,
+        );
+        shell
+    }
+
+    pub(super) fn base_transition_batch(
+        &mut self,
+        nodes: [NodeId; super::SIMD_BATCH_LANES],
+        active_lanes: usize,
+    ) -> [NodeId; super::SIMD_BATCH_LANES] {
+        let mut masks = [0_u16; super::SIMD_BATCH_LANES];
+        for lane in 0..active_lanes {
+            masks[lane] = self.level2_to_4x4_mask(nodes[lane]);
+        }
+        let (centered, accounting) =
+            super::kernels::KernelSet::selected().base_transition(&masks, active_lanes);
+        self.record_kernel_accounting(accounting);
+
+        let mut results = [self.dead_leaf; super::SIMD_BATCH_LANES];
+        let leaves = [self.dead_leaf, self.live_leaf];
+        for lane in 0..active_lanes {
+            let output = centered[lane];
+            results[lane] = self.join(
+                leaves[(output & 0b0001 != 0) as usize],
+                leaves[((output >> 1) & 0b0001 != 0) as usize],
+                leaves[((output >> 2) & 0b0001 != 0) as usize],
+                leaves[((output >> 3) & 0b0001 != 0) as usize],
+            );
+        }
+        results
+    }
+
+    fn level2_to_4x4_mask(&self, node: NodeId) -> u16 {
         let [nw_node, ne_node, sw_node, se_node] = self.node_columns.quadrants(node);
-        let mask = self.level1_to_4x4_mask(nw_node, 0, 0)
+        self.level1_to_4x4_mask(nw_node, 0, 0)
             | self.level1_to_4x4_mask(ne_node, 2, 0)
             | self.level1_to_4x4_mask(sw_node, 0, 2)
-            | self.level1_to_4x4_mask(se_node, 2, 2);
-        let centered = base_transitions()[mask as usize];
-        let leaves = [self.dead_leaf, self.live_leaf];
-        let nw = leaves[(centered & 0b0001 != 0) as usize];
-        let ne = leaves[((centered >> 1) & 0b0001) as usize];
-        let sw = leaves[((centered >> 2) & 0b0001) as usize];
-        let se = leaves[((centered >> 3) & 0b0001) as usize];
-        self.join(nw, ne, sw, se)
+            | self.level1_to_4x4_mask(se_node, 2, 2)
     }
 
     fn level1_to_4x4_mask(&self, node: NodeId, base_x: u16, base_y: u16) -> u16 {
         let [nw, ne, sw, se] = self.node_columns.quadrants(node);
         debug_assert_eq!(self.node_columns.level(node), 1);
         (u16::from(self.node_columns.population(nw) != 0) << (base_y * 4 + base_x))
-            | (u16::from(self.node_columns.population(ne) != 0)
-                << (base_y * 4 + base_x + 1))
-            | (u16::from(self.node_columns.population(sw) != 0)
-                << ((base_y + 1) * 4 + base_x))
-            | (u16::from(self.node_columns.population(se) != 0)
-                << ((base_y + 1) * 4 + base_x + 1))
+            | (u16::from(self.node_columns.population(ne) != 0) << (base_y * 4 + base_x + 1))
+            | (u16::from(self.node_columns.population(sw) != 0) << ((base_y + 1) * 4 + base_x))
+            | (u16::from(self.node_columns.population(se) != 0) << ((base_y + 1) * 4 + base_x + 1))
     }
 
     pub(super) fn node_to_grid(
-        &self,
+        &mut self,
         node: NodeId,
         offset_x: Coord,
         offset_y: Coord,
         policy: GridExtractionPolicy,
     ) -> Result<BitGrid, GridExtractionError> {
-        let size = 1_i64 << self.node_columns.level(node);
+        let size = 1_i64
+            .checked_shl(self.node_columns.level(node))
+            .or_invariant("validated HashLife level must fit coordinate geometry");
         let limits = extraction_limits(self, node, offset_x, offset_y, policy)?;
-        let mut chunks = HashMap::new();
+        let estimated_chunks = usize::try_from(
+            self.node_columns
+                .population(node)
+                .div_ceil(64)
+                .min(limits.max_chunks.unwrap_or(usize::MAX) as u128),
+        )
+        .unwrap_or(usize::MAX);
+        let mut grid = BitGrid::try_with_chunk_capacity(estimated_chunks.max(1))
+            .map_err(|_| GridExtractionError::AllocationFailed)?;
         self.collect_chunks_iterative(
             node,
             (offset_x, offset_y),
             size,
             limits.clip_bounds,
             limits.max_chunks,
-            &mut chunks,
+            &mut grid,
         )?;
-        Ok(BitGrid::from_chunk_bits_map(chunks))
+        Ok(grid)
     }
 
     pub(super) fn node_to_grid_clipped(
@@ -99,102 +165,148 @@ impl HashLifeEngine {
         offset_y: Coord,
         clip_bounds: (Coord, Coord, Coord, Coord),
     ) -> BitGrid {
-        let size = 1_i64 << self.node_columns.level(node);
-        let mut chunks = HashMap::new();
+        let size = 1_i64
+            .checked_shl(self.node_columns.level(node))
+            .or_invariant("validated HashLife level must fit coordinate geometry");
+        let estimated_chunks =
+            usize::try_from(self.node_columns.population(node).div_ceil(64)).unwrap_or(usize::MAX);
+        let mut grid = BitGrid::try_with_chunk_capacity(estimated_chunks.max(1))
+            .or_invariant("bounded clipped extraction allocation failed");
         self.collect_chunks_iterative(
             node,
             (offset_x, offset_y),
             size,
             clip_bounds,
             None,
-            &mut chunks,
+            &mut grid,
         )
-        .expect("clipped extraction should not enforce chunk limits");
-        BitGrid::from_chunk_bits_map(chunks)
+        .or_invariant("clipped extraction should not enforce chunk limits");
+        grid
+    }
+
+    #[cfg(test)]
+    pub(super) fn node_to_grid_all(
+        &self,
+        node: NodeId,
+        offset_x: Coord,
+        offset_y: Coord,
+    ) -> BitGrid {
+        if self.node_columns.population(node) == 0 {
+            return BitGrid::empty();
+        }
+        let size = 1_i64 << self.node_columns.level(node);
+        let estimated_chunks =
+            usize::try_from(self.node_columns.population(node).div_ceil(64)).unwrap_or(usize::MAX);
+        let mut grid = BitGrid::try_with_chunk_capacity(estimated_chunks.max(1))
+            .or_invariant("test extraction allocation failed");
+        self.collect_all_chunks_iterative(node, offset_x, offset_y, size, &mut grid);
+        grid
     }
 
     pub(super) fn node_bounds(
-        &self,
+        &mut self,
         node: NodeId,
         origin_x: Coord,
         origin_y: Coord,
     ) -> Option<(Coord, Coord, Coord, Coord)> {
+        let bounds = self.node_relative_bounds(node)?;
+        Some((
+            origin_x
+                .checked_add(bounds.min_x)
+                .or_invariant("HashLife bounds min x overflow"),
+            origin_y
+                .checked_add(bounds.min_y)
+                .or_invariant("HashLife bounds min y overflow"),
+            origin_x
+                .checked_add(bounds.max_x)
+                .or_invariant("HashLife bounds max x overflow"),
+            origin_y
+                .checked_add(bounds.max_y)
+                .or_invariant("HashLife bounds max y overflow"),
+        ))
+    }
+
+    fn node_relative_bounds(&mut self, node: NodeId) -> Option<RelativeBounds> {
         if self.node_columns.population(node) == 0 {
             return None;
         }
+        if let Some(bounds) = self.result_caches.bounds.get(&node) {
+            return Some(bounds);
+        }
 
-        let mut stack = Vec::with_capacity(self.node_columns.level(node) as usize + 1);
-        let size = 1_i64 << self.node_columns.level(node);
-        stack.push((node, origin_x, origin_y, size));
-        let mut min_x = Coord::MAX;
-        let mut min_y = Coord::MAX;
-        let mut max_x = Coord::MIN;
-        let mut max_y = Coord::MIN;
-
-        while let Some((node, origin_x, origin_y, size)) = stack.pop() {
-            let level = self.node_columns.level(node);
-            if self.node_columns.population(node) == 0 {
+        let empty_bounds = RelativeBounds {
+            min_x: Coord::MAX,
+            min_y: Coord::MAX,
+            max_x: Coord::MIN,
+            max_y: Coord::MIN,
+        };
+        let mut stack = [BoundsFrame {
+            node,
+            next_child: 0,
+            bounds: empty_bounds,
+        }; 64];
+        let mut stack_len = 1;
+        let mut completed = None;
+        while stack_len != 0 {
+            if let Some(child_bounds) = completed.take() {
+                let parent = &mut stack[stack_len - 1];
+                merge_child_bounds(
+                    &mut parent.bounds,
+                    child_bounds,
+                    parent.next_child - 1,
+                    self.node_columns.level(parent.node),
+                );
+            }
+            let frame = &mut stack[stack_len - 1];
+            let level = self.node_columns.level(frame.node);
+            if level == 0 || frame.next_child == 4 {
+                let bounds = if level == 0 {
+                    RelativeBounds {
+                        min_x: 0,
+                        min_y: 0,
+                        max_x: 0,
+                        max_y: 0,
+                    }
+                } else {
+                    frame.bounds
+                };
+                let current = frame.node;
+                self.publish_optional_cache(
+                    |engine| &engine.result_caches.bounds,
+                    |engine| &mut engine.result_caches.bounds,
+                    current,
+                    crate::flat_table::FlatKey::fingerprint(&current),
+                    bounds,
+                );
+                stack_len -= 1;
+                if stack_len == 0 {
+                    return Some(bounds);
+                }
+                completed = Some(bounds);
                 continue;
             }
-            if level == 0 {
-                min_x = min_x.min(origin_x);
-                min_y = min_y.min(origin_y);
-                max_x = max_x.max(origin_x);
-                max_y = max_y.max(origin_y);
+
+            let child_index = frame.next_child;
+            frame.next_child += 1;
+            let child = self.node_columns.quadrants(frame.node)[child_index];
+            if self.node_columns.population(child) == 0 {
                 continue;
             }
-
-            let half = size / 2;
-            let [nw, ne, sw, se] = self.node_columns.quadrants(node);
-            stack.push((se, origin_x + half, origin_y + half, half));
-            stack.push((sw, origin_x, origin_y + half, half));
-            stack.push((ne, origin_x + half, origin_y, half));
-            stack.push((nw, origin_x, origin_y, half));
+            if let Some(bounds) = self.result_caches.bounds.get(&child) {
+                merge_child_bounds(&mut frame.bounds, bounds, child_index, level);
+                continue;
+            }
+            if stack_len == stack.len() {
+                crate::invariant_failure!("validated bounds depth exceeded fixed workspace");
+            }
+            stack[stack_len] = BoundsFrame {
+                node: child,
+                next_child: 0,
+                bounds: empty_bounds,
+            };
+            stack_len += 1;
         }
-
-        (min_x != Coord::MAX).then_some((min_x, min_y, max_x, max_y))
-    }
-
-    pub(super) fn node_checkpoint(
-        &self,
-        node: NodeId,
-        origin_x: Coord,
-        origin_y: Coord,
-        generation: u64,
-    ) -> Option<HashLifeCheckpoint> {
-        let bounds = self.node_bounds(node, origin_x, origin_y)?;
-        let (min_x, min_y, max_x, max_y) = bounds;
-        let width = max_x - min_x + 1;
-        let height = max_y - min_y + 1;
-        let population = self.node_columns.population(node);
-        if population > HASHLIFE_CHECKPOINT_MAX_POPULATION
-            || width.max(height) > HASHLIFE_CHECKPOINT_MAX_BOUNDS_SPAN
-        {
-            return None;
-        }
-        let size = 1_i64 << self.node_columns.level(node);
-        let mut cells = Vec::with_capacity(
-            usize::try_from(population).expect("hashlife population exceeded usize"),
-        );
-        self.collect_cells_iterative(node, origin_x, origin_y, size, &mut cells);
-        for cell in &mut cells {
-            cell.0 -= min_x;
-            cell.1 -= min_y;
-        }
-        cells.sort_unstable();
-
-        Some(HashLifeCheckpoint {
-            generation,
-            origin: (min_x, min_y),
-            signature: HashLifeCheckpointSignature {
-                width,
-                height,
-                cells,
-            },
-            population,
-            bounds,
-            bounds_span: width.max(height),
-        })
+        crate::invariant_failure!("bounds traversal produced no result")
     }
 
     fn collect_chunks_iterative(
@@ -204,23 +316,27 @@ impl HashLifeEngine {
         size: Coord,
         clip_bounds: (Coord, Coord, Coord, Coord),
         max_chunks: Option<usize>,
-        out: &mut HashMap<Cell, u64>,
+        out: &mut BitGrid,
     ) -> Result<(), GridExtractionError> {
+        const MAX_EXTRACTION_STACK: usize = 256;
         let (clip_min_x, clip_min_y, clip_max_x, clip_max_y) = clip_bounds;
-        let mut stack = Vec::with_capacity(self.node_columns.level(node) as usize + 1);
-        stack.push((node, origin.0, origin.1, size));
-        while let Some((node, origin_x, origin_y, size)) = stack.pop() {
+        let mut stack = [(0, 0, 0, 0); MAX_EXTRACTION_STACK];
+        stack[0] = (node, origin.0, origin.1, size);
+        let mut stack_len = 1;
+        while stack_len != 0 {
+            stack_len -= 1;
+            let (node, origin_x, origin_y, size) = stack[stack_len];
             let level = self.node_columns.level(node);
             if self.node_columns.population(node) == 0 {
                 continue;
             }
 
-            let node_max_x = origin_x + size - 1;
-            let node_max_y = origin_y + size - 1;
-            if node_max_x < clip_min_x
-                || node_max_y < clip_min_y
-                || origin_x > clip_max_x
-                || origin_y > clip_max_y
+            let node_max_x = i128::from(origin_x) + i128::from(size) - 1;
+            let node_max_y = i128::from(origin_y) + i128::from(size) - 1;
+            if node_max_x < i128::from(clip_min_x)
+                || node_max_y < i128::from(clip_min_y)
+                || i128::from(origin_x) > i128::from(clip_max_x)
+                || i128::from(origin_y) > i128::from(clip_max_y)
             {
                 continue;
             }
@@ -230,65 +346,99 @@ impl HashLifeEngine {
                 let cy = origin_y.div_euclid(CHUNK_SIZE);
                 let lx = origin_x.rem_euclid(CHUNK_SIZE);
                 let ly = origin_y.rem_euclid(CHUNK_SIZE);
-                let bit =
-                    u32::try_from(ly * CHUNK_SIZE + lx).expect("chunk bit index exceeded u32");
-                let is_new_chunk = !out.contains_key(&(cx, cy));
+                let bit = u32::try_from(ly * CHUNK_SIZE + lx)
+                    .or_invariant("chunk bit index exceeded u32");
+                let is_new_chunk = out.chunk_bits(cx, cy) == 0;
                 if is_new_chunk
                     && let Some(limit) = max_chunks
-                    && out.len() >= limit
+                    && out.chunk_count() >= limit
                 {
                     return Err(GridExtractionError::ChunkLimitExceeded {
-                        chunks: out.len() + 1,
+                        chunks: out.chunk_count() + 1,
                         limit,
                     });
                 }
-                let entry = out.entry((cx, cy)).or_insert(0);
-                *entry |= 1_u64 << bit;
+                let bits = out.chunk_bits(cx, cy) | (1_u64 << bit);
+                out.try_set_chunk_bits(cx, cy, bits)
+                    .map_err(|_| GridExtractionError::AllocationFailed)?;
                 continue;
             }
 
             let half = size / 2;
             let [nw, ne, sw, se] = self.node_columns.quadrants(node);
-            stack.push((se, origin_x + half, origin_y + half, half));
-            stack.push((sw, origin_x, origin_y + half, half));
-            stack.push((ne, origin_x + half, origin_y, half));
-            stack.push((nw, origin_x, origin_y, half));
+            if stack_len + 4 > stack.len() {
+                crate::invariant_failure!(
+                    "validated extraction depth exceeded fixed traversal workspace"
+                );
+            }
+            for child in [
+                (se, origin_x + half, origin_y + half, half),
+                (sw, origin_x, origin_y + half, half),
+                (ne, origin_x + half, origin_y, half),
+                (nw, origin_x, origin_y, half),
+            ] {
+                stack[stack_len] = child;
+                stack_len += 1;
+            }
         }
         Ok(())
     }
 
-    pub(super) fn collect_cells_iterative(
+    #[cfg(test)]
+    fn collect_all_chunks_iterative(
         &self,
         node: NodeId,
         origin_x: Coord,
         origin_y: Coord,
         size: Coord,
-        out: &mut Vec<Cell>,
+        out: &mut BitGrid,
     ) {
-        let mut stack = Vec::with_capacity(self.node_columns.level(node) as usize + 1);
-        stack.push((node, origin_x, origin_y, size));
-        while let Some((node, origin_x, origin_y, size)) = stack.pop() {
+        const MAX_EXTRACTION_STACK: usize = 256;
+        let mut stack = [(0, 0, 0, 0); MAX_EXTRACTION_STACK];
+        stack[0] = (node, origin_x, origin_y, size);
+        let mut stack_len = 1;
+        while stack_len != 0 {
+            stack_len -= 1;
+            let (node, origin_x, origin_y, size) = stack[stack_len];
             let level = self.node_columns.level(node);
             if self.node_columns.population(node) == 0 {
                 continue;
             }
             if level == 0 {
-                out.push((origin_x, origin_y));
+                let cx = origin_x.div_euclid(CHUNK_SIZE);
+                let cy = origin_y.div_euclid(CHUNK_SIZE);
+                let lx = origin_x.rem_euclid(CHUNK_SIZE);
+                let ly = origin_y.rem_euclid(CHUNK_SIZE);
+                let bit = u32::try_from(ly * CHUNK_SIZE + lx)
+                    .or_invariant("chunk bit index exceeded u32");
+                let bits = out.chunk_bits(cx, cy) | (1_u64 << bit);
+                out.try_set_chunk_bits(cx, cy, bits)
+                    .or_invariant("test extraction allocation failed");
                 continue;
             }
 
             let half = size / 2;
             let [nw, ne, sw, se] = self.node_columns.quadrants(node);
-            stack.push((se, origin_x + half, origin_y + half, half));
-            stack.push((sw, origin_x, origin_y + half, half));
-            stack.push((ne, origin_x + half, origin_y, half));
-            stack.push((nw, origin_x, origin_y, half));
+            if stack_len + 4 > stack.len() {
+                crate::invariant_failure!(
+                    "validated extraction depth exceeded fixed traversal workspace"
+                );
+            }
+            for child in [
+                (se, origin_x + half, origin_y + half, half),
+                (sw, origin_x, origin_y + half, half),
+                (ne, origin_x + half, origin_y, half),
+                (nw, origin_x, origin_y, half),
+            ] {
+                stack[stack_len] = child;
+                stack_len += 1;
+            }
         }
     }
 
     pub(super) fn empty(&mut self, level: u32) -> NodeId {
         while self.empty_by_level.len() <= level as usize {
-            let child = *self.empty_by_level.last().unwrap();
+            let child = *self.empty_by_level.last().or_invariant("required value");
             let node = self.join(child, child, child, child);
             self.empty_by_level.push(node);
         }
@@ -302,13 +452,21 @@ impl HashLifeEngine {
             return existing;
         }
 
-        let population = self.node_columns.population(nw)
-            + self.node_columns.population(ne)
-            + self.node_columns.population(sw)
-            + self.node_columns.population(se);
+        let population = super::PopulationStat::sum([
+            self.node_columns.population_stat(nw),
+            self.node_columns.population_stat(ne),
+            self.node_columns.population_stat(sw),
+            self.node_columns.population_stat(se),
+        ]);
+
+        if !self.prepare_mandatory_node_growth() {
+            return self.dead_leaf;
+        }
 
         let node_id = self.push_node(level, population, nw, ne, sw, se);
-        self.intern.insert(key, node_id);
+        self.intern
+            .try_insert(key, node_id)
+            .or_invariant("reserved HashLife structural index insertion failed");
         node_id
     }
 
@@ -318,11 +476,43 @@ impl HashLifeEngine {
             return existing;
         }
 
-        let node_id = self.node_count() as NodeId;
-        let node_id = self.push_node(0, u64::from(alive), node_id, node_id, node_id, node_id);
-        self.intern.insert(key, node_id);
+        if !self.prepare_mandatory_node_growth() {
+            return self.dead_leaf;
+        }
+        let node_id = NodeId::try_from(self.node_count())
+            .or_invariant("HashLife node arena exceeded u32 capacity");
+        let node_id = self.push_node(
+            0,
+            super::PopulationStat::exact(u128::from(alive)),
+            node_id,
+            node_id,
+            node_id,
+            node_id,
+        );
+        self.intern
+            .try_insert(key, node_id)
+            .or_invariant("reserved HashLife leaf index insertion failed");
         node_id
     }
+}
+
+fn merge_child_bounds(
+    bounds: &mut RelativeBounds,
+    child: RelativeBounds,
+    child_index: usize,
+    parent_level: u32,
+) {
+    let half = 1_i64 << (parent_level - 1);
+    let offset_x = if child_index.is_multiple_of(2) {
+        0
+    } else {
+        half
+    };
+    let offset_y = if child_index < 2 { 0 } else { half };
+    bounds.min_x = bounds.min_x.min(child.min_x + offset_x);
+    bounds.min_y = bounds.min_y.min(child.min_y + offset_y);
+    bounds.max_x = bounds.max_x.max(child.max_x + offset_x);
+    bounds.max_y = bounds.max_y.max(child.max_y + offset_y);
 }
 
 struct ExtractionLimits {
@@ -331,7 +521,7 @@ struct ExtractionLimits {
 }
 
 fn extraction_limits(
-    engine: &HashLifeEngine,
+    engine: &mut HashLifeEngine,
     node: NodeId,
     offset_x: Coord,
     offset_y: Coord,
@@ -371,7 +561,7 @@ fn extraction_limits(
             }
             let bounds = engine
                 .node_bounds(node, offset_x, offset_y)
-                .expect("non-empty node should have bounds");
+                .or_invariant("non-empty node should have bounds");
             let (min_x, min_y, max_x, max_y) = bounds;
             let bounds_span = (max_x - min_x + 1).max(max_y - min_y + 1);
             if bounds_span > max_bounds_span {
@@ -385,5 +575,45 @@ fn extraction_limits(
                 max_chunks: Some(max_chunks),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pressured_shell_and_bounds_publication_preserve_exact_results() {
+        let mut engine = HashLifeEngine::default();
+        engine.begin_allocation_transaction(u128::MAX);
+        let source = engine.join(
+            engine.live_leaf,
+            engine.dead_leaf,
+            engine.dead_leaf,
+            engine.dead_leaf,
+        );
+        let expected_shell = engine.centered_shell(source);
+        assert_eq!(engine.take_allocation_failure(), None);
+
+        engine.result_caches.shells.release_storage();
+        engine.result_caches.bounds.release_storage();
+        let retained = crate::hashlife::memory::wide_allocated_bytes(engine.allocated_bytes());
+        engine.begin_allocation_transaction(retained);
+        let shell = engine.centered_shell(source);
+        let bounds = engine.node_relative_bounds(source);
+
+        assert_eq!(engine.take_allocation_failure(), None);
+        assert_eq!(shell, expected_shell);
+        assert_eq!(
+            bounds,
+            Some(RelativeBounds {
+                min_x: 0,
+                min_y: 0,
+                max_x: 0,
+                max_y: 0,
+            })
+        );
+        assert_eq!(engine.result_caches.shells.len(), 0);
+        assert_eq!(engine.result_caches.bounds.len(), 0);
     }
 }
