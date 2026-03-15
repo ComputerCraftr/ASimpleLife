@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
+use crate::RequiredExt;
 use crate::cache_policy::{SIMD_RETAINED_CACHE_CAPACITY, should_collect_simd_transition_caches};
 use crate::classify::Classification;
-use crate::flat_table::{FlatKey, FlatTable};
+use crate::flat_table::FlatKey;
 use crate::hashing::hash_chunk_neighborhood_words;
 use crate::normalize::NormalizedGridSignature;
+use crate::probe_table::{ProbeMode, ProbeTable};
 use crate::simd_layout::{AlignedLaneIndexBatch, SIMD_BATCH_LANES};
 use crate::symmetry::D4Symmetry as Symmetry;
 
@@ -93,8 +95,8 @@ pub(crate) struct MemoRuntimeStats {
 #[derive(Clone, Debug)]
 pub struct Memo {
     classification_cache: HashMap<NormalizedGridSignature, Classification>,
-    chunk_transition_cache: FlatTable<ChunkNeighborhood, u64>,
-    chunk_canonicalization_cache: FlatTable<ChunkNeighborhood, CanonicalChunkNeighborhoodEntry>,
+    chunk_transition_cache: ProbeTable<ChunkNeighborhood, u64>,
+    chunk_canonicalization_cache: ProbeTable<ChunkNeighborhood, CanonicalChunkNeighborhoodEntry>,
     stats: MemoStats,
 }
 
@@ -102,8 +104,8 @@ impl Default for Memo {
     fn default() -> Self {
         Self {
             classification_cache: HashMap::new(),
-            chunk_transition_cache: FlatTable::new(),
-            chunk_canonicalization_cache: FlatTable::new(),
+            chunk_transition_cache: ProbeTable::new(ProbeMode::Mutable),
+            chunk_canonicalization_cache: ProbeTable::new(ProbeMode::Mutable),
             stats: MemoStats::default(),
         }
     }
@@ -122,17 +124,28 @@ impl Memo {
         signature: NormalizedGridSignature,
         classification: Classification,
     ) {
-        self.classification_cache.insert(signature, classification);
+        if matches!(
+            classification,
+            Classification::DiesOut { .. }
+                | Classification::Repeats { .. }
+                | Classification::Spaceship { .. }
+        ) {
+            self.classification_cache.insert(signature, classification);
+        }
     }
+}
 
-    #[cfg(test)]
+#[cfg(test)]
+impl Memo {
     pub(crate) fn get_chunk_transition(&mut self, neighborhood: &ChunkNeighborhood) -> Option<u64> {
         let (canonical, symmetry) = self.canonicalize_chunk_neighborhood(neighborhood);
         self.chunk_transition_cache
             .get_with_fingerprint(&canonical, canonical.fingerprint())
             .map(|next| transform_chunk_bits(next, symmetry.inverse()))
     }
+}
 
+impl Memo {
     pub(crate) fn canonicalize_and_probe_chunk_transitions_staged(
         &mut self,
         neighborhoods: &[ChunkNeighborhood; SIMD_BATCH_LANES],
@@ -159,17 +172,20 @@ impl Memo {
             active_lanes,
         );
         for inverse in Symmetry::ALL {
-            let symmetry_index = inverse as usize;
+            let symmetry_index = symmetry_index(inverse);
             let transformed = transform_chunk_bits_grouped(
                 &grouped_hits.bits[symmetry_index],
                 &grouped_hits.lanes[symmetry_index],
                 grouped_hits.counts[symmetry_index],
                 inverse,
             );
-            for index in 0..grouped_hits.counts[symmetry_index] {
-                let lane = grouped_hits.lanes[symmetry_index].0[index];
+            for (&lane, &bits) in grouped_hits.lanes[symmetry_index].0
+                [..grouped_hits.counts[symmetry_index]]
+                .iter()
+                .zip(&transformed)
+            {
                 self.stats.probe_hit_lanes += 1;
-                hits[lane] = Some(transformed[index]);
+                hits[lane] = Some(bits);
             }
         }
         for lane in 0..active_lanes {
@@ -197,7 +213,7 @@ impl Memo {
         };
         for lane in 0..active_lanes {
             if let Some(next) = cached[lane] {
-                let symmetry_index = symmetries[lane].inverse() as usize;
+                let symmetry_index = symmetry_index(symmetries[lane].inverse());
                 let index = grouped_hits.counts[symmetry_index];
                 grouped_hits.lanes[symmetry_index].0[index] = lane;
                 grouped_hits.bits[symmetry_index][index] = next;
@@ -246,12 +262,11 @@ impl Memo {
                     miss_count,
                     symmetry,
                 );
-                for index in 0..miss_count {
-                    let lane = miss_lanes.0[index];
-                    if candidates[index].0 < canonical[lane].0 {
-                        canonical[lane] = candidates[index];
+                for (&lane, &candidate) in miss_lanes.0[..miss_count].iter().zip(&candidates) {
+                    if candidate.0 < canonical[lane].0 {
+                        canonical[lane] = candidate;
                         symmetries[lane] = symmetry;
-                        fingerprints[lane] = candidates[index].fingerprint();
+                        fingerprints[lane] = candidate.fingerprint();
                     }
                 }
             }
@@ -274,8 +289,10 @@ impl Memo {
             fingerprints,
         }
     }
+}
 
-    #[cfg(test)]
+#[cfg(test)]
+impl Memo {
     pub(crate) fn insert_chunk_transition(&mut self, neighborhood: ChunkNeighborhood, next: u64) {
         let (canonical, symmetry) = self.canonicalize_chunk_neighborhood(&neighborhood);
         self.insert_chunk_transition_from_intent(
@@ -286,7 +303,9 @@ impl Memo {
             next,
         );
     }
+}
 
+impl Memo {
     pub(crate) fn insert_chunk_transition_from_intent(
         &mut self,
         intent: ChunkTransitionMemoIntent,
@@ -308,11 +327,15 @@ impl Memo {
             return;
         }
 
-        self.chunk_transition_cache = FlatTable::with_capacity(SIMD_RETAINED_CACHE_CAPACITY);
-        self.chunk_canonicalization_cache = FlatTable::with_capacity(SIMD_RETAINED_CACHE_CAPACITY);
+        self.chunk_transition_cache =
+            ProbeTable::with_capacity(ProbeMode::Mutable, SIMD_RETAINED_CACHE_CAPACITY);
+        self.chunk_canonicalization_cache =
+            ProbeTable::with_capacity(ProbeMode::Mutable, SIMD_RETAINED_CACHE_CAPACITY);
     }
+}
 
-    #[cfg(test)]
+#[cfg(test)]
+impl Memo {
     fn canonicalize_chunk_neighborhood(
         &mut self,
         neighborhood: &ChunkNeighborhood,
@@ -337,7 +360,6 @@ impl Memo {
         canonical
     }
 
-    #[cfg(test)]
     pub(crate) fn canonicalize_chunk_neighborhood_for_tests(
         &mut self,
         neighborhood: &ChunkNeighborhood,
@@ -346,23 +368,19 @@ impl Memo {
         (canonical, symmetry, canonical.fingerprint())
     }
 
-    #[cfg(test)]
     pub(crate) fn chunk_transition_cache_len(&self) -> usize {
         self.chunk_transition_cache.len()
     }
 
-    #[cfg(test)]
     pub(crate) fn chunk_canonicalization_cache_len(&self) -> usize {
         self.chunk_canonicalization_cache.len()
     }
 
-    #[cfg(test)]
     pub(crate) fn force_collect_transition_caches(&mut self) {
         self.chunk_transition_cache.clear();
         self.chunk_canonicalization_cache.clear();
     }
 
-    #[cfg(test)]
     pub(crate) fn runtime_stats(&self) -> MemoRuntimeStats {
         MemoRuntimeStats {
             probe_batches: self.stats.probe_batches,
@@ -396,9 +414,8 @@ fn transform_neighborhoods_staged(
     symmetry: Symmetry,
 ) -> [ChunkNeighborhood; SIMD_BATCH_LANES] {
     let mut transformed = ChunkNeighborhoodBatch::default().0;
-    for index in 0..active_lanes {
-        let lane = lanes.0[index];
-        transformed[index] = transform_neighborhood(&neighborhoods[lane], symmetry);
+    for (output, &lane) in transformed.iter_mut().zip(&lanes.0).take(active_lanes) {
+        *output = transform_neighborhood(&neighborhoods[lane], symmetry);
     }
     transformed
 }
@@ -419,8 +436,8 @@ fn transform_neighborhood(
 
             while source_bits != 0 {
                 let bit = source_bits.trailing_zeros();
-                let local_x = (bit % 8) as usize;
-                let local_y = (bit / 8) as usize;
+                let local_x = usize::try_from(bit % 8).or_invariant("local x exceeded usize");
+                let local_y = usize::try_from(bit / 8).or_invariant("local y exceeded usize");
                 let x = chunk_x * 8 + local_x;
                 let y = chunk_y * 8 + local_y;
                 let (tx, ty) = symmetry.transform_coords(x, y, 23);
@@ -428,7 +445,8 @@ fn transform_neighborhood(
                 let target_chunk_y = ty / 8;
                 let target_local_x = tx % 8;
                 let target_local_y = ty % 8;
-                let target_bit = (target_local_y * 8 + target_local_x) as u32;
+                let target_bit = u32::try_from(target_local_y * 8 + target_local_x)
+                    .or_invariant("chunk target bit exceeded u32");
                 transformed[target_chunk_y * 3 + target_chunk_x] |= 1_u64 << target_bit;
                 source_bits &= source_bits - 1;
             }
@@ -443,10 +461,10 @@ fn transform_chunk_bits(bits: u64, symmetry: Symmetry) -> u64 {
     let mut remaining = bits;
     while remaining != 0 {
         let bit = remaining.trailing_zeros();
-        let x = (bit % 8) as usize;
-        let y = (bit / 8) as usize;
+        let x = usize::try_from(bit % 8).or_invariant("local x exceeded usize");
+        let y = usize::try_from(bit / 8).or_invariant("local y exceeded usize");
         let (tx, ty) = symmetry.transform_coords(x, y, 7);
-        let target_bit = (ty * 8 + tx) as u32;
+        let target_bit = u32::try_from(ty * 8 + tx).or_invariant("chunk target bit exceeded u32");
         transformed |= 1_u64 << target_bit;
         remaining &= remaining - 1;
     }
@@ -464,4 +482,17 @@ fn transform_chunk_bits_grouped(
         transformed[lane] = transform_chunk_bits(bits[lane], symmetry);
     }
     transformed
+}
+
+const fn symmetry_index(symmetry: Symmetry) -> usize {
+    match symmetry {
+        Symmetry::Identity => 0,
+        Symmetry::Rotate90 => 1,
+        Symmetry::Rotate180 => 2,
+        Symmetry::Rotate270 => 3,
+        Symmetry::MirrorX => 4,
+        Symmetry::MirrorXRotate90 => 5,
+        Symmetry::MirrorXRotate180 => 6,
+        Symmetry::MirrorXRotate270 => 7,
+    }
 }

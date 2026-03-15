@@ -1,17 +1,31 @@
+use crate::RequiredExt;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::bitgrid::{BitGrid, Cell, Coord};
 use crate::classify::{Classification, ClassificationLimits, classify_seed};
 use crate::generators::{pattern_by_name, random_soup};
-use crate::hashing::{SPLITMIX64_GAMMA, mix_seed};
+use crate::hashing::{derive_seed, hash_words};
 use crate::life::{ChunkDiff, GameOfLife, step_grid, step_grid_with_changes_and_memo};
 use crate::memo::Memo;
 use crate::normalize::normalize;
-use crate::render::{TerminalBackbuffer, compute_origin_for_bounds, compute_origin_for_cells};
+use crate::render::{
+    TerminalBackbuffer, compute_origin_for_bounds, compute_origin_for_cells,
+    resized_viewport_origin, stable_viewport_origin,
+};
+
+fn assert_grids_eq(label: &str, actual: &BitGrid, expected: &BitGrid) {
+    assert_eq!(
+        actual,
+        expected,
+        "{label}: absolute cell states differ\nactual_bounds={:?} expected_bounds={:?}\nactual={actual:?}\nexpected={expected:?}",
+        actual.bounds(),
+        expected.bounds(),
+    );
+}
 
 #[test]
 fn block_repeats_immediately() {
-    let grid = pattern_by_name("block").unwrap();
+    let grid = pattern_by_name("block").or_invariant("required value");
     let result = classify_seed(
         &grid,
         &ClassificationLimits::default(),
@@ -28,7 +42,7 @@ fn block_repeats_immediately() {
 
 #[test]
 fn blinker_has_period_two() {
-    let grid = pattern_by_name("blinker").unwrap();
+    let grid = pattern_by_name("blinker").or_invariant("required value");
     let result = classify_seed(
         &grid,
         &ClassificationLimits::default(),
@@ -45,7 +59,7 @@ fn blinker_has_period_two() {
 
 #[test]
 fn pulsar_has_period_three() {
-    let grid = pattern_by_name("pulsar").unwrap();
+    let grid = pattern_by_name("pulsar").or_invariant("required value");
     assert_eq!(
         grid.population(),
         48,
@@ -64,12 +78,16 @@ fn pulsar_has_period_three() {
         }
     );
     let evolved = run_steps(grid.clone(), 3);
-    assert_eq!(normalize(&evolved).0, normalize(&grid).0);
+    assert_grids_eq(
+        "pulsar should return to its initial phase after 3 steps",
+        &evolved,
+        &grid,
+    );
 }
 
 #[test]
 fn glider_is_detected_as_spaceship() {
-    let grid = pattern_by_name("glider").unwrap();
+    let grid = pattern_by_name("glider").or_invariant("required value");
     let result = classify_seed(
         &grid,
         &ClassificationLimits::default(),
@@ -87,61 +105,53 @@ fn glider_is_detected_as_spaceship() {
 }
 
 #[test]
-fn gosper_glider_gun_is_detected_as_likely_infinite() {
-    let grid = pattern_by_name("gosper_glider_gun").unwrap();
+fn gosper_glider_gun_is_classified_as_persistently_expanding() {
+    let grid = pattern_by_name("gosper_glider_gun").or_invariant("required value");
     let limits = ClassificationLimits {
         max_generations: 512,
-        max_population: 5_000,
-        max_bounding_box: 256,
     };
     let result = classify_seed(&grid, &limits, &mut Memo::default());
-    assert!(matches!(
-        result,
-        Classification::LikelyInfinite {
-            reason: "population_growth" | "expanding_bounds" | "persistent_expansion",
-            ..
-        } | Classification::Unknown { .. }
-    ));
+    assert_persistent_expansion("gosper glider gun", &result, limits.max_generations);
 }
 
 #[test]
 fn gosper_glider_gun_preserves_gun_core_and_emits_glider() {
-    let initial = pattern_by_name("gosper_glider_gun").unwrap();
+    let initial = pattern_by_name("gosper_glider_gun").or_invariant("required value");
     let core_cycle = run_steps(initial.clone(), 30);
     let emitted_field = run_steps(initial.clone(), 120);
     let initial_core = crop_grid(&initial, 0, 0, 36, 9);
     let evolved_core = crop_grid(&core_cycle, 0, 0, 36, 9);
     let glider_field = crop_grid(&emitted_field, 37, 0, 260, 260);
 
-    assert_eq!(normalize(&initial_core).0, normalize(&evolved_core).0);
+    assert_grids_eq(
+        "gosper gun core should remain stable across one gun period",
+        &initial_core,
+        &evolved_core,
+    );
     assert!(contains_component_variant(
         &glider_field,
-        &all_evolution_variants(&pattern_by_name("glider").unwrap(), 4)
+        &all_evolution_variants(&pattern_by_name("glider").or_invariant("required value"), 4)
     ));
 }
 
 #[test]
-fn gosper_puffer_is_detected_as_likely_infinite() {
-    let grid = pattern_by_name("glider_producing_switch_engine").unwrap();
+fn glider_producing_switch_engine_is_classified_as_persistently_expanding() {
+    let grid = pattern_by_name("glider_producing_switch_engine").or_invariant("required value");
     let limits = ClassificationLimits {
         max_generations: 512,
-        max_population: 10_000,
-        max_bounding_box: 512,
     };
     let result = classify_seed(&grid, &limits, &mut Memo::default());
-    assert!(matches!(
-        result,
-        Classification::LikelyInfinite {
-            reason: "population_growth" | "expanding_bounds" | "persistent_expansion",
-            ..
-        } | Classification::Unknown { .. }
-    ));
+    assert_persistent_expansion(
+        "glider-producing switch engine",
+        &result,
+        limits.max_generations,
+    );
 }
 
 #[test]
 fn glider_puffer_seed_matches_known_population_and_bounds() {
-    let grid = pattern_by_name("glider_producing_switch_engine").unwrap();
-    let (min_x, min_y, max_x, max_y) = grid.bounds().unwrap();
+    let grid = pattern_by_name("glider_producing_switch_engine").or_invariant("required value");
+    let (min_x, min_y, max_x, max_y) = grid.bounds().or_invariant("required value");
     assert_eq!(grid.population(), 123);
     assert_eq!((min_x, min_y), (0, 0));
     assert_eq!((max_x - min_x + 1, max_y - min_y + 1), (67, 60));
@@ -150,52 +160,46 @@ fn glider_puffer_seed_matches_known_population_and_bounds() {
 #[test]
 fn glider_puffer_emits_a_glider_after_simulation() {
     let grid = run_steps(
-        pattern_by_name("glider_producing_switch_engine").unwrap(),
+        pattern_by_name("glider_producing_switch_engine").or_invariant("required value"),
         256,
     );
     assert!(contains_component_variant(
         &grid,
-        &all_evolution_variants(&pattern_by_name("glider").unwrap(), 4)
+        &all_evolution_variants(&pattern_by_name("glider").or_invariant("required value"), 4)
     ));
 }
 
 #[test]
-fn blinker_puffer1_is_detected_as_likely_infinite() {
-    let grid = pattern_by_name("blinker_puffer_1").unwrap();
-    let (min_x, min_y, max_x, max_y) = grid.bounds().unwrap();
+fn blinker_puffer1_is_classified_as_persistently_expanding() {
+    let grid = pattern_by_name("blinker_puffer_1").or_invariant("required value");
+    let (min_x, min_y, max_x, max_y) = grid.bounds().or_invariant("required value");
     assert_eq!(grid.population(), 37);
     assert_eq!((min_x, min_y), (0, 0));
     assert_eq!((max_x - min_x + 1, max_y - min_y + 1), (9, 18));
     let limits = ClassificationLimits {
         max_generations: 512,
-        max_population: 10_000,
-        max_bounding_box: 512,
     };
     let result = classify_seed(&grid, &limits, &mut Memo::default());
-    assert!(matches!(
-        result,
-        Classification::LikelyInfinite {
-            reason: "population_growth" | "expanding_bounds" | "persistent_expansion",
-            ..
-        } | Classification::Unknown { .. }
-    ));
+    assert_persistent_expansion("blinker puffer 1", &result, limits.max_generations);
 }
 
 #[test]
 fn blinker_puffer1_leaves_a_blinker_after_simulation() {
-    let grid = run_steps(pattern_by_name("blinker_puffer_1").unwrap(), 160);
+    let grid = run_steps(
+        pattern_by_name("blinker_puffer_1").or_invariant("required value"),
+        160,
+    );
     assert!(contains_component_variant(
         &grid,
-        &all_normalized_variants(&pattern_by_name("blinker").unwrap())
+        &all_normalized_variants(&pattern_by_name("blinker").or_invariant("required value"))
     ));
 }
 
 #[test]
 fn diehard_eventually_dies() {
-    let grid = pattern_by_name("diehard").unwrap();
+    let grid = pattern_by_name("diehard").or_invariant("required value");
     let limits = ClassificationLimits {
         max_generations: 200,
-        ..ClassificationLimits::default()
     };
     let result = classify_seed(&grid, &limits, &mut Memo::default());
     assert_eq!(result, Classification::DiesOut { at_generation: 130 });
@@ -203,10 +207,9 @@ fn diehard_eventually_dies() {
 
 #[test]
 fn diehard_stops_at_extinction_before_large_generation_limit() {
-    let grid = pattern_by_name("diehard").unwrap();
+    let grid = pattern_by_name("diehard").or_invariant("required value");
     let limits = ClassificationLimits {
         max_generations: 10_000,
-        ..ClassificationLimits::default()
     };
     let result = classify_seed(&grid, &limits, &mut Memo::default());
     assert_eq!(result, Classification::DiesOut { at_generation: 130 });
@@ -214,27 +217,20 @@ fn diehard_stops_at_extinction_before_large_generation_limit() {
 
 #[test]
 fn rpentomino_survives_short_horizon() {
-    let grid = pattern_by_name("r_pentomino").unwrap();
+    let grid = pattern_by_name("r_pentomino").or_invariant("required value");
     let limits = ClassificationLimits {
         max_generations: 100,
-        ..ClassificationLimits::default()
     };
-    let result = classify_seed(&grid, &limits, &mut Memo::default());
-    match result {
-        Classification::Unknown { simulated } => assert!(simulated >= 100),
-        other => panic!("expected unresolved r-pentomino, got {other:?}"),
-    }
+    assert_matches_reference_contract("r-pentomino short horizon", &grid, &limits);
 }
 
 #[test]
 fn bounded_iid_soup_reaches_repeat_before_extended_limit() {
-    let seed =
-        mix_seed(((16_u64) ^ ((30_u64) << 16) ^ (2_u64 << 32)).wrapping_add(SPLITMIX64_GAMMA));
+    const REGRESSION_SEED: u64 = 8_869_397_597_862_540_459;
+    let seed = REGRESSION_SEED;
     let grid = random_soup(16, 16, 30, seed);
     let limits = ClassificationLimits {
         max_generations: 256,
-        max_population: 20_000,
-        max_bounding_box: Coord::MAX,
     };
 
     let result = classify_seed(&grid, &limits, &mut Memo::default());
@@ -250,10 +246,9 @@ fn bounded_iid_soup_reaches_repeat_before_extended_limit() {
 
 #[test]
 fn block_stops_at_repeat_before_large_generation_limit() {
-    let grid = pattern_by_name("block").unwrap();
+    let grid = pattern_by_name("block").or_invariant("required value");
     let limits = ClassificationLimits {
         max_generations: 10_000,
-        ..ClassificationLimits::default()
     };
     let result = classify_seed(&grid, &limits, &mut Memo::default());
     assert_eq!(
@@ -296,8 +291,14 @@ fn half_block_renderer_uses_vertical_pairing() {
     let grid = BitGrid::from_cells(&[(0, 0), (0, 1), (1, 0)]);
     let mut buffer = TerminalBackbuffer::new(2, 1);
     let frame = render_output(&mut buffer, &grid, None);
-    assert!(frame.contains('█'));
-    assert!(frame.contains('▀'));
+    assert!(
+        frame.contains('█'),
+        "half-block renderer should emit a full block for vertically paired live cells\nframe={frame:?}"
+    );
+    assert!(
+        frame.contains('▀'),
+        "half-block renderer should emit an upper half block for mixed vertical occupancy\nframe={frame:?}"
+    );
 }
 
 #[test]
@@ -307,14 +308,25 @@ fn render_diff_only_emits_changed_cells() {
     let updated = BitGrid::from_cells(&[(0, 0), (3, 3), (1, 0)]);
 
     let full = render_output(&mut buffer, &initial, None);
-    assert!(full.contains("\x1b[2;1H"));
+    assert!(
+        full.contains("\x1b[2;1H"),
+        "initial full render should reposition the cursor to the first visible cell\nfull={full:?}"
+    );
 
     let diff = render_output(&mut buffer, &updated, Some(&[(1, 0), (1, 1)]));
     let origin = compute_origin_for_cells(4, 2, &updated.live_cells());
-    let expected_row = usize::try_from((0 - origin.1).div_euclid(2)).unwrap() + 2;
-    let expected_col = usize::try_from(1 - origin.0).unwrap() + 1;
-    assert!(diff.contains(&format!("\x1b[{expected_row};{expected_col}H▀")));
-    assert!(!diff.contains("\x1b[2;1H"));
+    let expected_row =
+        usize::try_from((0 - origin.1).div_euclid(2)).or_invariant("required value") + 2;
+    let expected_col = usize::try_from(1 - origin.0).or_invariant("required value") + 1;
+    let expected_cursor = format!("\x1b[{expected_row};{expected_col}H▀");
+    assert!(
+        diff.contains(&expected_cursor),
+        "diff render should emit only the changed cell cursor sequence\norigin={origin:?}\nexpected_cursor={expected_cursor:?}\ndiff={diff:?}"
+    );
+    assert!(
+        !diff.contains("\x1b[2;1H"),
+        "diff render should not emit a full-frame reset cursor sequence\ndiff={diff:?}"
+    );
 }
 
 #[test]
@@ -324,7 +336,9 @@ fn render_chunk_diff_only_emits_changed_region() {
     let updated = BitGrid::from_cells(&[(0, 0), (3, 3), (1, 0)]);
 
     let mut out = Vec::new();
-    buffer.render_chunk_into(&initial, None, &mut out).unwrap();
+    buffer
+        .render_chunk_into(&initial, None, &mut out)
+        .or_invariant("required value");
 
     let mut diff_out = Vec::new();
     buffer
@@ -337,13 +351,21 @@ fn render_chunk_diff_only_emits_changed_region() {
             }]),
             &mut diff_out,
         )
-        .unwrap();
-    let diff = String::from_utf8(diff_out).unwrap();
+        .or_invariant("required value");
+    let diff = String::from_utf8(diff_out).or_invariant("required value");
     let origin = compute_origin_for_cells(4, 2, &updated.live_cells());
-    let expected_row = usize::try_from((0 - origin.1).div_euclid(2)).unwrap() + 2;
-    let expected_col = usize::try_from(1 - origin.0).unwrap() + 1;
-    assert!(diff.contains(&format!("\x1b[{expected_row};{expected_col}H▀")));
-    assert!(!diff.contains("\x1b[2;1H"));
+    let expected_row =
+        usize::try_from((0 - origin.1).div_euclid(2)).or_invariant("required value") + 2;
+    let expected_col = usize::try_from(1 - origin.0).or_invariant("required value") + 1;
+    let expected_cursor = format!("\x1b[{expected_row};{expected_col}H▀");
+    assert!(
+        diff.contains(&expected_cursor),
+        "chunk diff render should emit only the changed chunk cursor sequence\norigin={origin:?}\nexpected_cursor={expected_cursor:?}\ndiff={diff:?}"
+    );
+    assert!(
+        !diff.contains("\x1b[2;1H"),
+        "chunk diff render should not emit a full-frame reset cursor sequence\ndiff={diff:?}"
+    );
 }
 
 #[test]
@@ -389,7 +411,7 @@ fn viewport_avoids_empty_midpoint_for_split_equal_movers() {
 
 #[test]
 fn pulsar_viewport_stays_centered_across_phases_when_pattern_fits() {
-    let initial = pattern_by_name("pulsar").unwrap();
+    let initial = pattern_by_name("pulsar").or_invariant("required value");
     let phase_two = run_steps(initial.clone(), 1);
 
     let initial_origin = compute_origin_for_cells(20, 10, &initial.live_cells());
@@ -400,14 +422,66 @@ fn pulsar_viewport_stays_centered_across_phases_when_pattern_fits() {
     assert_eq!(phase_two_origin, expected_origin);
 }
 
+#[test]
+fn distant_equal_viewport_candidate_does_not_replace_current_focus() {
+    let current = (0, 0);
+    let proposed = (1_000, 0);
+    assert_eq!(
+        stable_viewport_origin(Some(current), proposed, 100, 101, 80, 24),
+        current,
+        "a negligible population difference should not switch between distant life forms"
+    );
+}
+
+#[test]
+fn materially_better_viewport_candidate_replaces_current_focus() {
+    assert_eq!(
+        stable_viewport_origin(Some((0, 0)), (1_000, 0), 60, 100, 80, 24),
+        (1_000, 0),
+        "the viewport should switch when its current cluster has become materially weaker"
+    );
+}
+
+#[test]
+fn resized_viewport_origin_preserves_world_space_center() {
+    assert_eq!(
+        resized_viewport_origin(Some((100, 200)), 80, 24, 120, 40),
+        Some((80, 184))
+    );
+}
+
+#[test]
+fn resized_terminal_backbuffer_rebuilds_even_with_chunk_diffs() {
+    let grid = BitGrid::from_cells(&[(0, 0), (1, 1)]);
+    let mut renderer = TerminalBackbuffer::new(8, 4);
+    let mut initial = Vec::new();
+    renderer
+        .render_chunk_into(&grid, None, &mut initial)
+        .or_invariant("required value");
+
+    renderer.resize(12, 6);
+    let mut resized = Vec::new();
+    renderer
+        .render_chunk_into(&grid, Some(&[]), &mut resized)
+        .or_invariant("required value");
+
+    let frame = String::from_utf8(resized).or_invariant("required value");
+    assert!(
+        frame.contains('▀') || frame.contains('▄') || frame.contains('█'),
+        "the first diff frame after resize must rebuild live cells\nframe={frame:?}"
+    );
+}
+
 fn assert_viewport_contains_live_cell(origin: Cell, width: usize, height: usize, cells: &[Cell]) {
     assert!(
         !cells.is_empty(),
         "viewport test needs at least one live cell to prove visibility"
     );
     let (origin_x, origin_y) = origin;
-    let max_x = origin_x + width as Coord - 1;
-    let max_y = origin_y + (height as Coord * 2) - 1;
+    let width_coord = Coord::try_from(width).or_invariant("test viewport width exceeded Coord");
+    let height_coord = Coord::try_from(height).or_invariant("test viewport height exceeded Coord");
+    let max_x = origin_x + width_coord - 1;
+    let max_y = origin_y + (height_coord * 2) - 1;
     let visible = cells
         .iter()
         .any(|&(x, y)| x >= origin_x && x <= max_x && y >= origin_y && y <= max_y);
@@ -419,15 +493,19 @@ fn assert_viewport_contains_live_cell(origin: Cell, width: usize, height: usize,
 
 #[test]
 fn step_engine_matches_blinker_rotation() {
-    let grid = pattern_by_name("blinker").unwrap();
+    let grid = pattern_by_name("blinker").or_invariant("required value");
     let next = step_grid(&grid);
     let expected = BitGrid::from_cells(&[(1, -1), (1, 0), (1, 1)]);
-    assert_eq!(normalize(&next).0, normalize(&expected).0);
+    assert_grids_eq(
+        "single-step engine should rotate blinker into its vertical phase",
+        &next,
+        &expected,
+    );
 }
 
 #[test]
 fn chunk_transition_cache_reuses_local_neighborhoods() {
-    let grid = pattern_by_name("gosper_glider_gun").unwrap();
+    let grid = pattern_by_name("gosper_glider_gun").or_invariant("required value");
     let mut memo = Memo::default();
 
     step_grid_with_changes_and_memo(&grid, &mut memo);
@@ -440,23 +518,19 @@ fn chunk_transition_cache_reuses_local_neighborhoods() {
 }
 
 #[test]
-fn stratified_reference_suite_matches_known_labels() {
+fn stratified_reference_suite_matches_exact_replay_contract() {
     let limits = ClassificationLimits {
         max_generations: 256,
-        max_population: 10_000,
-        max_bounding_box: 512,
     };
     for case in curated_reference_suite() {
-        assert_matches_reference_if_decisive(&case.name, &case.grid, &limits);
+        assert_matches_reference_contract(&case.name, &case.grid, &limits);
     }
 }
 
 #[test]
-fn stratified_random_soups_match_reference_when_reference_is_decisive() {
+fn stratified_random_soups_match_exact_replay_contract() {
     let limits = ClassificationLimits {
         max_generations: 192,
-        max_population: 20_000,
-        max_bounding_box: 512,
     };
     for size in [16, 32, 64] {
         for fill_percent in [5, 10, 20, 30, 50] {
@@ -467,7 +541,7 @@ fn stratified_random_soups_match_reference_when_reference_is_decisive() {
                     fill_percent,
                     hash_seed(size, fill_percent, seed),
                 );
-                assert_matches_reference_if_decisive(
+                assert_matches_reference_contract(
                     &format!("random_{size}_{fill_percent}_{seed}"),
                     &grid,
                     &limits,
@@ -478,11 +552,9 @@ fn stratified_random_soups_match_reference_when_reference_is_decisive() {
 }
 
 #[test]
-fn stratified_clustered_soups_match_reference_when_reference_is_decisive() {
+fn stratified_clustered_soups_match_exact_replay_contract() {
     let limits = ClassificationLimits {
         max_generations: 192,
-        max_population: 20_000,
-        max_bounding_box: 512,
     };
     for size in [16, 32, 64] {
         for fill_percent in [5, 10, 20, 30, 50] {
@@ -493,7 +565,7 @@ fn stratified_clustered_soups_match_reference_when_reference_is_decisive() {
                     fill_percent,
                     hash_seed(size, fill_percent, seed),
                 );
-                assert_matches_reference_if_decisive(
+                assert_matches_reference_contract(
                     &format!("clustered_{size}_{fill_percent}_{seed}"),
                     &grid,
                     &limits,
@@ -504,20 +576,14 @@ fn stratified_clustered_soups_match_reference_when_reference_is_decisive() {
 }
 
 #[test]
-fn structured_random_soups_match_reference_when_reference_is_decisive() {
+fn structured_random_soups_match_exact_replay_contract() {
     let limits = ClassificationLimits {
         max_generations: 192,
-        max_population: 20_000,
-        max_bounding_box: 512,
     };
     for size in [16, 32, 64] {
         for seed in 1..=4_u64 {
             let grid = structured_random_soup(size, size, hash_seed(size, 77, seed));
-            assert_matches_reference_if_decisive(
-                &format!("structured_{size}_{seed}"),
-                &grid,
-                &limits,
-            );
+            assert_matches_reference_contract(&format!("structured_{size}_{seed}"), &grid, &limits);
         }
     }
 }
@@ -621,60 +687,63 @@ fn render_output(
     changed_cells: Option<&[Cell]>,
 ) -> String {
     let mut out = Vec::new();
-    buffer.render_into(grid, changed_cells, &mut out).unwrap();
-    String::from_utf8(out).unwrap()
+    buffer
+        .render_into(grid, changed_cells, &mut out)
+        .or_invariant("required value");
+    String::from_utf8(out).or_invariant("required value")
 }
 
-fn assert_matches_reference_if_decisive(name: &str, grid: &BitGrid, limits: &ClassificationLimits) {
-    let expected = reference_classify(grid, limits);
-    if !reference_is_decisive(&expected) {
-        return;
-    }
+fn assert_matches_reference_contract(name: &str, grid: &BitGrid, limits: &ClassificationLimits) {
     let actual = classify_seed(grid, limits, &mut Memo::default());
-    assert_same_outcome(name, &expected, &actual);
+    if let Classification::Unknown { simulated } = &actual {
+        assert!(
+            *simulated >= limits.max_generations,
+            "{name}: Unknown shortened the requested classification horizon\nrequested={}\nactual={actual}",
+            limits.max_generations,
+        );
+    }
+    let verification_horizon = exact_outcome_horizon(&actual).or_invariant(
+        "finite reference suites cannot accept an unverified likely-infinite classification",
+    );
+    let verified = reference_classify(
+        grid,
+        &ClassificationLimits {
+            max_generations: verification_horizon,
+        },
+    );
+    assert_same_outcome(name, &verified, &actual);
 }
 
-pub(super) fn assert_same_outcome(name: &str, expected: &Classification, actual: &Classification) {
-    match (expected, actual) {
-        (Classification::DiesOut { .. }, Classification::DiesOut { .. }) => {}
-        (
-            Classification::Repeats { period: ep, .. },
-            Classification::Repeats { period: ap, .. },
-        ) => {
-            assert_eq!(
-                ep, ap,
-                "{name}: repeat period mismatch: expected {expected}, got {actual}"
-            );
-        }
-        (
-            Classification::Spaceship {
-                period: ep,
-                delta: ed,
-                ..
-            },
-            Classification::Spaceship {
-                period: ap,
-                delta: ad,
-                ..
-            },
-        ) => {
-            assert_eq!(
-                ep, ap,
-                "{name}: spaceship period mismatch: expected {expected}, got {actual}"
-            );
-            assert_eq!(
-                ed, ad,
-                "{name}: spaceship displacement mismatch: expected {expected}, got {actual}"
-            );
-        }
-        (Classification::Unknown { .. }, Classification::Unknown { .. }) => {}
-        (Classification::LikelyInfinite { .. }, Classification::LikelyInfinite { .. }) => {}
-        _ => panic!("{name}: expected {expected}, got {actual}"),
+fn exact_outcome_horizon(classification: &Classification) -> Option<u64> {
+    match classification {
+        Classification::DiesOut { at_generation } => Some(*at_generation),
+        Classification::Repeats { period, first_seen } => first_seen.checked_add(*period),
+        Classification::Spaceship { detected_at, .. } => Some(*detected_at),
+        Classification::Unknown { simulated } => Some(*simulated),
+        Classification::LikelyInfinite { .. } => None,
     }
 }
 
-pub(super) fn reference_is_decisive(classification: &Classification) -> bool {
-    !matches!(classification, Classification::Unknown { .. })
+fn assert_same_outcome(name: &str, expected: &Classification, actual: &Classification) {
+    assert_eq!(
+        actual, expected,
+        "{name}: complete classification contract mismatch\nexpected={expected}\nactual={actual}"
+    );
+}
+
+fn assert_persistent_expansion(name: &str, actual: &Classification, horizon: u64) {
+    match actual {
+        Classification::LikelyInfinite {
+            reason: "persistent_expansion",
+            detected_at,
+        } => assert!(
+            *detected_at <= horizon,
+            "{name}: persistent expansion was reported beyond the requested horizon\nhorizon={horizon}\nactual={actual}"
+        ),
+        _ => crate::invariant_failure!(
+            "{name}: known emitter/puffer must be classified from its observed persistent expansion\nhorizon={horizon}\nactual={actual}"
+        ),
+    }
 }
 
 fn curated_reference_suite() -> Vec<NamedCase> {
@@ -691,12 +760,17 @@ fn curated_reference_suite() -> Vec<NamedCase> {
     ] {
         cases.push(NamedCase {
             name: name.to_string(),
-            grid: pattern_by_name(name).unwrap(),
+            grid: pattern_by_name(name).or_invariant("required value"),
         });
     }
 
     let adversarial = [
-        ("acorn_offset", pattern_by_name("acorn").unwrap().clone()),
+        (
+            "acorn_offset",
+            pattern_by_name("acorn")
+                .or_invariant("required value")
+                .clone(),
+        ),
         (
             "double_glider",
             BitGrid::from_cells(&[
@@ -744,10 +818,10 @@ fn clustered_noise_soup(width: Coord, height: Coord, fill_percent: u32, seed: u6
     let mut cells = Vec::new();
     for (x, y) in base.live_cells() {
         cells.push((x, y));
-        if ((x + y).unsigned_abs() + seed) % 3 == 0 && x + 1 < width {
+        if ((x + y).unsigned_abs() + seed).is_multiple_of(3) && x + 1 < width {
             cells.push((x + 1, y));
         }
-        if ((x * 3 + y * 5).unsigned_abs() + seed) % 5 == 0 && y + 1 < height {
+        if ((x * 3 + y * 5).unsigned_abs() + seed).is_multiple_of(5) && y + 1 < height {
             cells.push((x, y + 1));
         }
     }
@@ -756,7 +830,7 @@ fn clustered_noise_soup(width: Coord, height: Coord, fill_percent: u32, seed: u6
 
 fn structured_random_soup(width: Coord, height: Coord, seed: u64) -> BitGrid {
     let left = random_soup(width / 2, height, 18, seed);
-    let right = random_soup(width / 2, height, 12, seed ^ SPLITMIX64_GAMMA);
+    let right = random_soup(width / 2, height, 12, derive_seed(seed, [1]));
     let mut cells = left.live_cells();
     cells.extend(
         right
@@ -766,14 +840,14 @@ fn structured_random_soup(width: Coord, height: Coord, seed: u64) -> BitGrid {
     );
     cells.extend(
         pattern_by_name("blinker")
-            .unwrap()
+            .or_invariant("required value")
             .live_cells()
             .into_iter()
             .map(|(x, y)| (x + width / 3, y + height / 3)),
     );
     cells.extend(
         pattern_by_name("block")
-            .unwrap()
+            .or_invariant("required value")
             .live_cells()
             .into_iter()
             .map(|(x, y)| (x + width / 2, y + height / 2)),
@@ -782,7 +856,7 @@ fn structured_random_soup(width: Coord, height: Coord, seed: u64) -> BitGrid {
 }
 
 fn hash_seed(a: Coord, b: u32, c: u64) -> u64 {
-    mix_seed(((a as u64) ^ ((b as u64) << 16) ^ (c << 32)).wrapping_add(SPLITMIX64_GAMMA))
+    hash_words(0x5445_5354_5345_4544, [a.cast_unsigned(), u64::from(b), c])
 }
 
 pub(super) fn reference_classify(seed: &BitGrid, limits: &ClassificationLimits) -> Classification {
@@ -811,24 +885,6 @@ pub(super) fn reference_classify(seed: &BitGrid, limits: &ClassificationLimits) 
                     detected_at: generation,
                 }
             };
-        }
-
-        if grid.population() > limits.max_population {
-            return Classification::LikelyInfinite {
-                reason: "population_growth",
-                detected_at: generation,
-            };
-        }
-
-        if let Some((min_x, min_y, max_x, max_y)) = grid.bounds() {
-            let width = max_x - min_x + 1;
-            let height = max_y - min_y + 1;
-            if width > limits.max_bounding_box || height > limits.max_bounding_box {
-                return Classification::LikelyInfinite {
-                    reason: "expanding_bounds",
-                    detected_at: generation,
-                };
-            }
         }
 
         seen.insert(signature.cells, (generation, origin));

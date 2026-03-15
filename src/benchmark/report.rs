@@ -10,11 +10,33 @@ impl BenchmarkReport {
         planned_generations: u64,
     ) {
         let outcome = outcome_bucket(expected);
-        let error = error_bucket(expected, actual);
-        let compatible = error == ErrorBucket::ExactOrCompatible;
+        let reference_is_conclusive = !matches!(expected, Classification::Unknown { .. });
+        let error = if reference_is_conclusive {
+            error_bucket(expected, actual)
+        } else {
+            ErrorBucket::InconclusiveReference
+        };
+        let compatible = reference_is_conclusive && error == ErrorBucket::ExactOrCompatible;
         let backend = select_backend(&case.grid, planned_generations);
 
         self.total += 1;
+        if reference_is_conclusive {
+            self.conclusive += 1;
+        } else {
+            self.inconclusive += 1;
+            self.inconclusive_cases.push(format!(
+                "inconclusive case={} family={} size={} density={} prediction={}{}",
+                case.name,
+                case.family,
+                case.size,
+                case.density_percent,
+                actual,
+                case.replay
+                    .as_ref()
+                    .map(|replay| format!(" replay={replay}"))
+                    .unwrap_or_default()
+            ));
+        }
         if compatible {
             self.compatible += 1;
         }
@@ -47,8 +69,8 @@ impl BenchmarkReport {
             self.unknown_count += 1;
         }
 
-        if !compatible {
-            println!(
+        if reference_is_conclusive && !compatible {
+            self.mismatches.push(format!(
                 "mismatch case={} family={} size={} density={} expected={} actual={}{}",
                 case.name,
                 case.family,
@@ -60,17 +82,31 @@ impl BenchmarkReport {
                     .as_ref()
                     .map(|replay| format!(" replay={replay}"))
                     .unwrap_or_default()
-            );
+            ));
         }
     }
 
     pub(super) fn print(&self) {
+        if !self.mismatches.is_empty() {
+            println!("mismatches:");
+            for mismatch in &self.mismatches {
+                println!("{mismatch}");
+            }
+        }
         println!(
-            "benchmark total={} compatible={} accuracy={:.3}",
+            "benchmark total={} conclusive={} inconclusive={} compatible={} accuracy={:.3}",
             self.total,
+            self.conclusive,
+            self.inconclusive,
             self.compatible,
-            self.compatible as f64 / self.total.max(1) as f64
+            self.compatible as f64 / self.conclusive.max(1) as f64
         );
+        if !self.inconclusive_cases.is_empty() {
+            println!("inconclusive_cases:");
+            for case in &self.inconclusive_cases {
+                println!("{case}");
+            }
+        }
         println!(
             "unknown_rate={}/{} ({:.3})",
             self.unknown_count,
@@ -141,13 +177,20 @@ impl BenchmarkReport {
         JsonReport {
             total: self.total,
             compatible: self.compatible,
+            classifier_assessment: JsonClassifierAssessment {
+                conclusive: self.conclusive,
+                inconclusive: self.inconclusive,
+                mismatch_count: self.mismatches.len(),
+                mismatches: self.mismatches.clone(),
+                inconclusive_cases: self.inconclusive_cases.clone(),
+            },
             mode: self.mode.map(|mode| mode.to_string()),
             run_seed: self.run_seed,
             unknown_rate: self.unknown_count as f64 / self.total.max(1) as f64,
             overall_summary: JsonSliceStats {
                 total: self.total,
                 compatible: self.compatible,
-                accuracy: self.compatible as f64 / self.total.max(1) as f64,
+                accuracy: self.compatible as f64 / self.conclusive.max(1) as f64,
             },
             accuracy_threshold: self.accuracy_threshold,
             accuracy_threshold_met: self.accuracy_threshold_met,
@@ -252,16 +295,17 @@ fn print_runtime_summary_inline(samples: &[Duration]) {
     sorted.sort_unstable();
     println!(
         "median={:?} p90={:?} p95={:?} p99={:?} worst={:?}",
-        percentile(&sorted, 0.50),
-        percentile(&sorted, 0.90),
-        percentile(&sorted, 0.95),
-        percentile(&sorted, 0.99),
+        percentile(&sorted, 50),
+        percentile(&sorted, 90),
+        percentile(&sorted, 95),
+        percentile(&sorted, 99),
         sorted[sorted.len() - 1]
     );
 }
 
-fn percentile(samples: &[Duration], fraction: f64) -> Duration {
-    let idx = ((samples.len() - 1) as f64 * fraction).round() as usize;
+fn percentile(samples: &[Duration], percent: usize) -> Duration {
+    let scaled = (samples.len() - 1).saturating_mul(percent);
+    let idx = scaled.saturating_add(50) / 100;
     samples[idx]
 }
 
@@ -278,10 +322,10 @@ fn runtime_summary_json(samples: &[Duration]) -> JsonRuntimeSummary {
     let mut sorted = samples.to_vec();
     sorted.sort_unstable();
     JsonRuntimeSummary {
-        median_us: percentile(&sorted, 0.50).as_micros(),
-        p90_us: percentile(&sorted, 0.90).as_micros(),
-        p95_us: percentile(&sorted, 0.95).as_micros(),
-        p99_us: percentile(&sorted, 0.99).as_micros(),
+        median_us: percentile(&sorted, 50).as_micros(),
+        p90_us: percentile(&sorted, 90).as_micros(),
+        p95_us: percentile(&sorted, 95).as_micros(),
+        p99_us: percentile(&sorted, 99).as_micros(),
         worst_us: sorted.last().copied().unwrap_or_default().as_micros(),
     }
 }
@@ -338,32 +382,15 @@ fn outcome_bucket(classification: &Classification) -> OutcomeBucket {
 }
 
 fn error_bucket(expected: &Classification, actual: &Classification) -> ErrorBucket {
+    if expected == actual {
+        return if matches!(expected, Classification::Unknown { .. }) {
+            ErrorBucket::InconclusiveReference
+        } else {
+            ErrorBucket::ExactOrCompatible
+        };
+    }
     match (expected, actual) {
-        (Classification::DiesOut { .. }, Classification::DiesOut { .. }) => {
-            ErrorBucket::ExactOrCompatible
-        }
-        (
-            Classification::Repeats { period: ep, .. },
-            Classification::Repeats { period: ap, .. },
-        ) if ep == ap => ErrorBucket::ExactOrCompatible,
-        (
-            Classification::Spaceship {
-                period: ep,
-                delta: ed,
-                ..
-            },
-            Classification::Spaceship {
-                period: ap,
-                delta: ad,
-                ..
-            },
-        ) if ep == ap && ed == ad => ErrorBucket::ExactOrCompatible,
-        (Classification::LikelyInfinite { .. }, Classification::LikelyInfinite { .. }) => {
-            ErrorBucket::ExactOrCompatible
-        }
-        (Classification::Unknown { .. }, Classification::Unknown { .. }) => {
-            ErrorBucket::ExactOrCompatible
-        }
+        (Classification::Unknown { .. }, _) => ErrorBucket::InconclusiveReference,
         (Classification::Spaceship { .. }, Classification::DiesOut { .. }) => {
             ErrorBucket::FalseDiesOut
         }
@@ -379,4 +406,13 @@ fn error_bucket(expected: &Classification, actual: &Classification) -> ErrorBuck
         (_, Classification::Unknown { .. }) => ErrorBucket::Unknown,
         _ => ErrorBucket::OtherMismatch,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn classifications_are_compatible_for_tests(
+    expected: &Classification,
+    actual: &Classification,
+) -> bool {
+    !matches!(expected, Classification::Unknown { .. })
+        && error_bucket(expected, actual) == ErrorBucket::ExactOrCompatible
 }

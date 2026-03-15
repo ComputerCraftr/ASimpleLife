@@ -99,16 +99,12 @@ impl fmt::Display for Classification {
 #[derive(Clone, Debug)]
 pub struct ClassificationLimits {
     pub max_generations: u64,
-    pub max_population: usize,
-    pub max_bounding_box: Coord,
 }
 
 impl Default for ClassificationLimits {
     fn default() -> Self {
         Self {
             max_generations: 512,
-            max_population: 20_000,
-            max_bounding_box: Coord::MAX,
         }
     }
 }
@@ -200,38 +196,10 @@ fn run_classification_from_state(
             );
         }
 
-        if grid.population() > limits.max_population {
-            return (
-                Classification::LikelyInfinite {
-                    reason: "population_growth",
-                    detected_at: generation,
-                },
-                ClassificationCheckpoint {
-                    generation,
-                    grid,
-                    seen,
-                },
-            );
-        }
-
         if let Some(bounds) = grid.bounds() {
             let (min_x, min_y, max_x, max_y) = bounds;
-            let (width, height, span) = bounds_dimensions(bounds);
+            let (_, _, span) = bounds_dimensions(bounds);
             metrics_history.push((grid.population(), min_x, max_x, min_y, max_y, span));
-            if width > limits.max_bounding_box || height > limits.max_bounding_box {
-                return (
-                    Classification::LikelyInfinite {
-                        reason: "expanding_bounds",
-                        detected_at: generation,
-                    },
-                    ClassificationCheckpoint {
-                        generation,
-                        grid,
-                        seen,
-                    },
-                );
-            }
-
             if let Some(result) =
                 detect_persistent_expansion(generation, &metrics_history, &grid, limits)
             {
@@ -289,26 +257,19 @@ fn settling_extension_limit(
         current_population <= SETTLING_MAX_POPULATION && max_span <= SETTLING_MAX_SPAN;
     let bounded_wide_tiny_pattern =
         current_population <= SETTLING_WIDE_MAX_POPULATION && max_span <= SETTLING_WIDE_MAX_SPAN;
-    let bounded_ultra_wide_tiny_pattern =
-        current_population <= SETTLING_ULTRA_WIDE_MAX_POPULATION
-            && max_span <= SETTLING_ULTRA_WIDE_MAX_SPAN;
+    let bounded_ultra_wide_tiny_pattern = current_population <= SETTLING_ULTRA_WIDE_MAX_POPULATION
+        && max_span <= SETTLING_ULTRA_WIDE_MAX_SPAN;
 
     if !bounded_small_pattern && !bounded_wide_tiny_pattern && !bounded_ultra_wide_tiny_pattern {
         return None;
     }
 
-    if bounded_ultra_wide_tiny_pattern
-        && generation_limit < SETTLING_ULTRA_WIDE_MAX_EXTENSION_LIMIT
+    if bounded_ultra_wide_tiny_pattern && generation_limit < SETTLING_ULTRA_WIDE_MAX_EXTENSION_LIMIT
     {
-        return Some(
-            limits
-                .max_generations
-                .saturating_mul(32)
-                .clamp(
-                    SETTLING_MIN_EXTENSION_LIMIT,
-                    SETTLING_ULTRA_WIDE_MAX_EXTENSION_LIMIT,
-                ),
-        );
+        return Some(limits.max_generations.saturating_mul(32).clamp(
+            SETTLING_MIN_EXTENSION_LIMIT,
+            SETTLING_ULTRA_WIDE_MAX_EXTENSION_LIMIT,
+        ));
     }
 
     if generation_limit >= SETTLING_MAX_EXTENSION_LIMIT {
@@ -333,7 +294,7 @@ fn detect_persistent_expansion(
         return None;
     }
 
-    if generation < PERSISTENT_EXPANSION_BURN_IN
+    if generation < PERSISTENT_EXPANSION_EMITTER_BURN_IN
         || metrics_history.len() <= PERSISTENT_EXPANSION_WINDOW * 2
     {
         return None;
@@ -412,8 +373,7 @@ fn detect_persistent_expansion(
     let trailing_blinkers = count_trailing_blinker_ash(grid, &fronts);
     let detached_gliders = count_detached_gliders_anywhere(grid);
     let detached_blinkers = count_detached_blinkers_anywhere(grid);
-    let confirmed_detached_emitter_signal =
-        current_span >= PERSISTENT_EXPANSION_MIN_EMITTER_SPAN
+    let confirmed_detached_emitter_signal = current_span >= PERSISTENT_EXPANSION_MIN_EMITTER_SPAN
         && (frontier_gliders >= 3
             || trailing_blinkers >= 3
             || detached_gliders >= 3
@@ -435,7 +395,11 @@ fn detect_persistent_expansion(
     let confirmed_emitter_signal =
         emitter_scale_population && (frontier_gliders >= 2 || trailing_blinkers >= 2);
 
-    if monotone_population && fronts.any() && confirmed_emitter_signal {
+    if generation >= PERSISTENT_EXPANSION_BURN_IN
+        && monotone_population
+        && fronts.any()
+        && confirmed_emitter_signal
+    {
         return Some(Classification::LikelyInfinite {
             reason: "persistent_expansion",
             detected_at: generation,

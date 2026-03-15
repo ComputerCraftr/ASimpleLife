@@ -1,4 +1,5 @@
 use super::*;
+use crate::RequiredExt;
 
 impl<'a> OracleSession<'a> {
     pub(super) fn plan_step(
@@ -60,6 +61,27 @@ impl<'a> OracleSession<'a> {
         }
     }
 
+    pub(super) fn plan_runtime_hashlife_step(
+        &mut self,
+        remaining: u64,
+        checkpoint_probes: usize,
+    ) -> OracleStepPlan {
+        let shape = self.current_state_shape();
+        let safe_hashlife_jump = max_hashlife_safe_jump_from_span(shape.bounds_span).max(1);
+        let step_span = if checkpoint_probes != 0
+            && checkpoint_probes < ORACLE_HASHLIFE_CHECKPOINT_PROBE_COUNT
+        {
+            remaining.min(ORACLE_HASHLIFE_CHECKPOINT_PROBE_STEP)
+        } else {
+            remaining.min(safe_hashlife_jump).max(1)
+        };
+        OracleStepPlan {
+            generation: self.generation,
+            step_span,
+            backend: SimulationBackend::HashLife,
+        }
+    }
+
     pub(super) fn planned_backend_for_shape(&mut self, step_span: u64) -> SimulationBackend {
         if step_span <= 1 {
             SimulationBackend::SimdChunk
@@ -76,11 +98,11 @@ impl<'a> OracleSession<'a> {
     }
 
     pub(super) fn current_state_shape(&mut self) -> OracleStateMetrics {
-        if self.is_hashlife_phase() || self.simulation.hashlife_loaded() {
+        if self.is_hashlife_phase() {
             let population = self
                 .simulation
-                .hashlife_population()
-                .map(|count| usize::try_from(count).expect("hashlife population exceeded usize"))
+                .hashlife_population_count()
+                .map(|count| usize::try_from(count.lower_bound()).unwrap_or(usize::MAX))
                 .unwrap_or(0);
             let bounds_span = self
                 .simulation
@@ -95,7 +117,7 @@ impl<'a> OracleSession<'a> {
             let grid = self
                 .grid
                 .as_ref()
-                .expect("oracle exact phase should have a grid");
+                .or_invariant("oracle exact phase should have a grid");
             OracleStateMetrics {
                 population: grid.population(),
                 bounds_span: grid
@@ -120,17 +142,19 @@ impl<'a> OracleSession<'a> {
 
     pub(super) fn ensure_sampled_grid(&mut self) -> &BitGrid {
         if self.grid.is_none() {
+            self.simulation
+                .record_hashlife_oracle_confirmation_materialization();
             self.grid = Some(
                 self.simulation
                     .sample_hashlife_state_grid(confirmation_full_grid_policy())
-                    .expect(
+                    .or_invariant(
                         "hashlife state exceeded safe extraction bounds for exact confirmation",
                     ),
             );
         }
         self.grid
             .as_ref()
-            .expect("oracle sampled grid should be available")
+            .or_invariant("oracle sampled grid should be available")
     }
 
     pub(super) fn take_or_sample_grid(&mut self) -> BitGrid {
@@ -139,7 +163,7 @@ impl<'a> OracleSession<'a> {
         }
         self.grid
             .take()
-            .expect("oracle should have a final sampled grid")
+            .or_invariant("oracle should have a final sampled grid")
     }
 
     pub(super) fn is_hashlife_phase(&self) -> bool {

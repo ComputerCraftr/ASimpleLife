@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "targets": [1000000000000000, 1000000000000000000],
+  "cases": [
+    { "pattern": "block", "period": 1 },
+    { "pattern": "blinker", "period": 2 },
+    { "pattern": "pulsar", "period": 3 },
+    { "pattern": "glider", "period": 4 },
+    { "pattern": "gosper_glider_gun", "period": null },
+    { "pattern": "glider_producing_switch_engine", "period": null }
+  ]
+}

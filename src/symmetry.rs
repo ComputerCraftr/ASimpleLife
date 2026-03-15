@@ -35,21 +35,91 @@ impl D4Symmetry {
         }
     }
 
-    pub(crate) fn then(self, next: Self) -> Self {
-        let self_perm = self.quadrant_perm();
-        let next_perm = next.quadrant_perm();
-        let composed = [
-            self_perm[next_perm[0]],
-            self_perm[next_perm[1]],
-            self_perm[next_perm[2]],
-            self_perm[next_perm[3]],
+    pub(crate) const fn then(self, next: Self) -> Self {
+        const COMPOSE: [[D4Symmetry; 8]; 8] = [
+            [
+                Identity,
+                Rotate90,
+                Rotate180,
+                Rotate270,
+                MirrorX,
+                MirrorXRotate90,
+                MirrorXRotate180,
+                MirrorXRotate270,
+            ],
+            [
+                Rotate90,
+                Rotate180,
+                Rotate270,
+                Identity,
+                MirrorXRotate90,
+                MirrorXRotate180,
+                MirrorXRotate270,
+                MirrorX,
+            ],
+            [
+                Rotate180,
+                Rotate270,
+                Identity,
+                Rotate90,
+                MirrorXRotate180,
+                MirrorXRotate270,
+                MirrorX,
+                MirrorXRotate90,
+            ],
+            [
+                Rotate270,
+                Identity,
+                Rotate90,
+                Rotate180,
+                MirrorXRotate270,
+                MirrorX,
+                MirrorXRotate90,
+                MirrorXRotate180,
+            ],
+            [
+                MirrorX,
+                MirrorXRotate270,
+                MirrorXRotate180,
+                MirrorXRotate90,
+                Identity,
+                Rotate270,
+                Rotate180,
+                Rotate90,
+            ],
+            [
+                MirrorXRotate90,
+                MirrorX,
+                MirrorXRotate270,
+                MirrorXRotate180,
+                Rotate90,
+                Identity,
+                Rotate270,
+                Rotate180,
+            ],
+            [
+                MirrorXRotate180,
+                MirrorXRotate90,
+                MirrorX,
+                MirrorXRotate270,
+                Rotate180,
+                Rotate90,
+                Identity,
+                Rotate270,
+            ],
+            [
+                MirrorXRotate270,
+                MirrorXRotate180,
+                MirrorXRotate90,
+                MirrorX,
+                Rotate270,
+                Rotate180,
+                Rotate90,
+                Identity,
+            ],
         ];
-        for candidate in Self::ALL {
-            if candidate.quadrant_perm() == composed {
-                return candidate;
-            }
-        }
-        unreachable!("invalid D4 symmetry composition")
+        use D4Symmetry::*;
+        COMPOSE[self as usize][next as usize]
     }
 
     pub(crate) const fn quadrant_perm(self) -> [usize; 4] {
@@ -89,6 +159,27 @@ impl D4Symmetry {
             Self::MirrorXRotate90 => (max - y, max - x),
             Self::MirrorXRotate180 => (x, max - y),
             Self::MirrorXRotate270 => (y, x),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::D4Symmetry;
+
+    #[test]
+    fn d4_composition_table_matches_quadrant_geometry() {
+        for left in D4Symmetry::ALL {
+            for right in D4Symmetry::ALL {
+                let left_perm = left.quadrant_perm();
+                let right_perm = right.quadrant_perm();
+                let expected = right_perm.map(|index| left_perm[index]);
+                assert_eq!(
+                    left.then(right).quadrant_perm(),
+                    expected,
+                    "composition mismatch for left={left:?} right={right:?}"
+                );
+            }
         }
     }
 }

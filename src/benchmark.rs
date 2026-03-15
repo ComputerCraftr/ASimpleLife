@@ -1,3 +1,4 @@
+use crate::RequiredExt;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -11,7 +12,7 @@ use crate::classify::{
 };
 use crate::engine::{SimulationBackend, select_backend};
 use crate::generators::{pattern_by_name, random_soup};
-use crate::hashing::{SPLITMIX64_GAMMA, mix_seed};
+use crate::hashing::{SPLITMIX64_GAMMA, derive_seed, mix64};
 use crate::memo::Memo;
 use crate::oracle::{OracleSession, OracleStateMetrics, OracleStepPlan};
 
@@ -19,12 +20,14 @@ mod report;
 mod runtime;
 mod suite;
 
+#[cfg(test)]
+pub(crate) use report::classifications_are_compatible_for_tests;
 use runtime::{run_exhaustive_5x5, run_oracle_representative_case, run_oracle_runtime_case};
+pub(crate) use suite::effective_generation_limit;
 use suite::{
     benchmark_family_filter, benchmark_run_mode_and_seed, exhaustive_small_box_cases,
     seeded_benchmark_suite,
 };
-pub(crate) use suite::effective_generation_limit;
 
 fn bounds_dimensions(bounds: (Coord, Coord, Coord, Coord)) -> (Coord, Coord, Coord) {
     let (min_x, min_y, max_x, max_y) = bounds;
@@ -45,6 +48,14 @@ pub enum BenchmarkFormat {
     Json,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum BenchmarkRunStatus {
+    Clean,
+    Diagnostic,
+    Failed,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct BenchmarkOptions {
     pub families: Option<Vec<String>>,
@@ -58,6 +69,7 @@ pub struct BenchmarkOptions {
     pub oracle_representative_case: bool,
     pub oracle_runtime_target_generation: Option<u64>,
     pub progress: bool,
+    pub diagnostic: bool,
 }
 
 const BENCHMARK_PREDICTION_MAX_GENERATIONS: u64 = 1_024;
@@ -69,7 +81,10 @@ const RANDOMIZED_COMPATIBILITY_THRESHOLD: f64 = 0.90;
 #[cfg(test)]
 const TEST_ORACLE_MAX_GENERATIONS: u64 = 4_096;
 
-pub fn run_benchmark_report(format: BenchmarkFormat, options: &BenchmarkOptions) {
+pub fn run_benchmark_report(
+    format: BenchmarkFormat,
+    options: &BenchmarkOptions,
+) -> BenchmarkRunStatus {
     let report = build_benchmark_report(options);
 
     match format {
@@ -77,9 +92,76 @@ pub fn run_benchmark_report(format: BenchmarkFormat, options: &BenchmarkOptions)
         BenchmarkFormat::Json => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&report.to_json()).unwrap()
+                serde_json::to_string_pretty(&report.to_json()).or_invariant("required value")
             );
         }
+    }
+
+    benchmark_run_status(options, &report)
+}
+
+fn benchmark_run_status(
+    options: &BenchmarkOptions,
+    report: &BenchmarkReport,
+) -> BenchmarkRunStatus {
+    if options.diagnostic || options.oracle_runtime_case || options.oracle_representative_case {
+        BenchmarkRunStatus::Diagnostic
+    } else if report.is_regression_clean() {
+        BenchmarkRunStatus::Clean
+    } else {
+        BenchmarkRunStatus::Failed
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn normal_benchmark_status_fails_on_classifier_mismatch() {
+        let report = BenchmarkReport {
+            total: 1,
+            conclusive: 1,
+            mismatches: vec!["wrong classification".to_string()],
+            ..BenchmarkReport::default()
+        };
+        assert_eq!(
+            benchmark_run_status(&BenchmarkOptions::default(), &report),
+            BenchmarkRunStatus::Failed
+        );
+    }
+
+    #[test]
+    fn normal_benchmark_status_fails_on_inconclusive_reference() {
+        let report = BenchmarkReport {
+            total: 1,
+            inconclusive: 1,
+            ..BenchmarkReport::default()
+        };
+        assert_eq!(
+            benchmark_run_status(&BenchmarkOptions::default(), &report),
+            BenchmarkRunStatus::Failed
+        );
+    }
+
+    #[test]
+    fn diagnostic_benchmark_status_does_not_fail_on_mismatch() {
+        let report = BenchmarkReport {
+            total: 1,
+            conclusive: 1,
+            mismatches: vec!["wrong classification".to_string()],
+            ..BenchmarkReport::default()
+        };
+        assert_eq!(
+            benchmark_run_status(
+                &BenchmarkOptions {
+                    diagnostic: true,
+                    ..BenchmarkOptions::default()
+                },
+                &report
+            ),
+            BenchmarkRunStatus::Diagnostic
+        );
     }
 }
 
@@ -100,13 +182,9 @@ pub(crate) fn build_benchmark_report(options: &BenchmarkOptions) -> BenchmarkRep
         .unwrap_or(DEFAULT_BENCHMARK_ORACLE_MAX_GENERATIONS);
     let prediction_limits = ClassificationLimits {
         max_generations: prediction_max_generations,
-        max_population: 20_000,
-        max_bounding_box: Coord::MAX,
     };
     let oracle_limits = ClassificationLimits {
         max_generations: oracle_max_generations,
-        max_population: 5_000_000,
-        max_bounding_box: Coord::MAX,
     };
     let filters = benchmark_family_filter(options);
     let include_smallbox = filters
@@ -171,7 +249,6 @@ pub(crate) fn build_benchmark_report(options: &BenchmarkOptions) -> BenchmarkRep
             predict_seed_with_checkpoint(&case.grid, &prediction_limits, &mut Memo::default());
         let expected = reference_classify_from_checkpoint(
             checkpoint,
-            &actual,
             &prediction_limits,
             &oracle_limits,
             &mut oracle_simulation,
@@ -187,8 +264,10 @@ pub(crate) fn build_benchmark_report(options: &BenchmarkOptions) -> BenchmarkRep
 
     oracle_simulation.finish();
     if let Some(threshold) = report.accuracy_threshold {
-        report.accuracy_threshold_met =
-            Some(report.compatible as f64 / report.total.max(1) as f64 >= threshold);
+        report.accuracy_threshold_met = Some(
+            report.conclusive > 0
+                && report.compatible as f64 / report.conclusive as f64 >= threshold,
+        );
     }
 
     report
@@ -224,7 +303,7 @@ pub(crate) fn benchmark_report_json_value(options: &BenchmarkOptions) -> serde_j
         ));
     }
     oracle_simulation.finish();
-    serde_json::to_value(report.to_json()).unwrap()
+    serde_json::to_value(report.to_json()).or_invariant("required value")
 }
 
 #[cfg(test)]
@@ -260,11 +339,17 @@ pub(crate) fn oracle_representative_seed_grid_for_tests() -> BitGrid {
 
 #[cfg(test)]
 pub(crate) fn oracle_extinction_seed_grid_for_tests() -> BitGrid {
-    suite::distant_glider_trigger(768, pattern_by_name("blinker").unwrap(), (0, 0))
+    suite::distant_glider_trigger(
+        768,
+        pattern_by_name("blinker").or_invariant("required value"),
+        (0, 0),
+    )
 }
 
 #[cfg(test)]
-pub(crate) fn special_oracle_case_for_tests(runtime_case: bool) -> (String, u64, bool, usize, Coord) {
+pub(crate) fn special_oracle_case_for_tests(
+    runtime_case: bool,
+) -> (String, u64, bool, usize, Coord) {
     let mut oracle_simulation = crate::engine::SimulationSession::new();
     let case = if runtime_case {
         run_oracle_runtime_case(TEST_ORACLE_MAX_GENERATIONS, false, &mut oracle_simulation)
@@ -287,21 +372,24 @@ pub(crate) fn canonical_small_box_mask(mask: u32, width: usize, height: usize) -
 }
 
 pub(crate) fn bitmask_pattern(mask: u32, width: Coord, height: Coord) -> BitGrid {
-    let mut cells = Vec::new();
+    let mut grid = BitGrid::new();
     for y in 0..height {
         for x in 0..width {
-            let bit = (y * width + x) as u32;
-            if (mask & (1_u32 << bit)) != 0 {
-                cells.push((x, y));
+            let bit = u32::try_from(y * width + x)
+                .or_invariant("bitmask pattern dimensions exceeded u32");
+            if 1_u32
+                .checked_shl(bit)
+                .is_some_and(|value| mask & value != 0)
+            {
+                grid.set(x, y, true);
             }
         }
     }
-    BitGrid::from_cells(&cells)
+    grid
 }
 
 pub(crate) fn reference_classify_from_checkpoint(
     checkpoint: ClassificationCheckpoint,
-    prediction: &Classification,
     prediction_limits: &ClassificationLimits,
     oracle_limits: &ClassificationLimits,
     oracle_simulation: &mut crate::engine::SimulationSession,
@@ -313,7 +401,9 @@ pub(crate) fn reference_classify_from_checkpoint(
     );
 
     if checkpoint.generation > oracle_limit {
-        return prediction.clone();
+        return Classification::Unknown {
+            simulated: checkpoint.generation,
+        };
     }
 
     OracleSession::new(
@@ -325,53 +415,36 @@ pub(crate) fn reference_classify_from_checkpoint(
     .classify_continuation(
         oracle_limit.max(prediction_limits.max_generations),
         prediction_limits.max_generations,
-        oracle_limits,
     )
 }
 
 #[cfg(test)]
-pub(crate) fn reference_is_decisive(classification: &Classification) -> bool {
-    !matches!(classification, Classification::Unknown { .. })
+pub(crate) fn assert_same_classification(
+    name: &str,
+    expected: &Classification,
+    actual: &Classification,
+) {
+    assert_eq!(expected, actual, "{name}: classifier result mismatch");
 }
 
 #[cfg(test)]
-pub(crate) fn assert_same_outcome(name: &str, expected: &Classification, actual: &Classification) {
-    match (expected, actual) {
-        (Classification::DiesOut { .. }, Classification::DiesOut { .. }) => {}
-        (
-            Classification::Repeats { period: ep, .. },
-            Classification::Repeats { period: ap, .. },
-        ) => {
-            assert_eq!(
-                ep, ap,
-                "{name}: repeat period mismatch: expected {expected}, got {actual}"
-            );
-        }
-        (
-            Classification::Spaceship {
-                period: ep,
-                delta: ed,
-                ..
-            },
-            Classification::Spaceship {
-                period: ap,
-                delta: ad,
-                ..
-            },
-        ) => {
-            assert_eq!(
-                ep, ap,
-                "{name}: spaceship period mismatch: expected {expected}, got {actual}"
-            );
-            assert_eq!(
-                ed, ad,
-                "{name}: spaceship displacement mismatch: expected {expected}, got {actual}"
-            );
-        }
-        (Classification::Unknown { .. }, Classification::Unknown { .. }) => {}
-        (Classification::LikelyInfinite { .. }, Classification::LikelyInfinite { .. }) => {}
-        _ => panic!("{name}: expected {expected}, got {actual}"),
-    }
+pub(crate) fn assert_classifier_regression_clean(context: &str, report: &BenchmarkReport) {
+    assert!(report.total > 0, "{context}: regression evaluated no cases");
+    assert_eq!(
+        report.inconclusive,
+        0,
+        "{context}: oracle could not decide {} case(s):\n{}",
+        report.inconclusive,
+        report.inconclusive_cases.join("\n")
+    );
+    assert_eq!(
+        report.compatible,
+        report.conclusive,
+        "{context}: {} of {} conclusive classifier case(s) mismatched:\n{}",
+        report.conclusive - report.compatible,
+        report.conclusive,
+        report.mismatches.join("\n")
+    );
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -453,6 +526,7 @@ impl fmt::Display for OutcomeBucket {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum ErrorBucket {
     ExactOrCompatible,
+    InconclusiveReference,
     FalseDiesOut,
     FalseRepeats,
     FalseLikelyInfinite,
@@ -464,6 +538,7 @@ impl fmt::Display for ErrorBucket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             Self::ExactOrCompatible => "exact_or_compatible",
+            Self::InconclusiveReference => "inconclusive_reference",
             Self::FalseDiesOut => "false_dies_out",
             Self::FalseRepeats => "false_repeats",
             Self::FalseLikelyInfinite => "false_likely_infinite",
@@ -487,6 +562,8 @@ struct BenchmarkCase {
 #[derive(Default)]
 pub(crate) struct BenchmarkReport {
     total: usize,
+    conclusive: usize,
+    inconclusive: usize,
     compatible: usize,
     mode: Option<BenchmarkRunMode>,
     by_family: BTreeMap<BenchmarkFamily, SliceStats>,
@@ -501,11 +578,19 @@ pub(crate) struct BenchmarkReport {
     runtime_by_size: BTreeMap<i32, Vec<Duration>>,
     runtime_by_backend: BTreeMap<SimulationBackend, Vec<Duration>>,
     unknown_count: usize,
+    mismatches: Vec<String>,
+    inconclusive_cases: Vec<String>,
     run_seed: Option<u64>,
     accuracy_threshold: Option<f64>,
     accuracy_threshold_met: Option<bool>,
     oracle_runtime_case: Option<OracleRuntimeCaseReport>,
     oracle_representative_case: Option<OracleRuntimeCaseReport>,
+}
+
+impl BenchmarkReport {
+    fn is_regression_clean(&self) -> bool {
+        self.total > 0 && self.inconclusive == 0 && self.mismatches.is_empty()
+    }
 }
 
 #[derive(Default, Clone, Debug)]
@@ -518,6 +603,7 @@ struct SliceStats {
 pub(crate) struct JsonReport {
     total: usize,
     compatible: usize,
+    classifier_assessment: JsonClassifierAssessment,
     mode: Option<String>,
     run_seed: Option<u64>,
     unknown_rate: f64,
@@ -537,6 +623,15 @@ pub(crate) struct JsonReport {
     by_error: BTreeMap<String, usize>,
     oracle_runtime_case: Option<JsonOracleRuntimeCaseReport>,
     oracle_representative_case: Option<JsonOracleRuntimeCaseReport>,
+}
+
+#[derive(Serialize)]
+struct JsonClassifierAssessment {
+    conclusive: usize,
+    inconclusive: usize,
+    mismatch_count: usize,
+    mismatches: Vec<String>,
+    inconclusive_cases: Vec<String>,
 }
 
 #[derive(Serialize)]

@@ -1,5 +1,12 @@
+use crate::RequiredExt as _;
 use crate::bitgrid::{BitGrid, Cell, Coord};
-use crate::hashing::{SPLITMIX64_GAMMA, mix_seed};
+use crate::hashing::{SPLITMIX64_GAMMA, splitmix64_output};
+use crate::persistence;
+
+pub fn pattern_from_file(path: &str) -> Option<BitGrid> {
+    let s = std::fs::read_to_string(path).ok()?;
+    persistence::deserialize_grid(&s).ok()
+}
 
 pub fn pattern_by_name(name: &str) -> Option<BitGrid> {
     let cells = match name {
@@ -117,7 +124,8 @@ fn parse_rle_cells(rle: &str) -> Vec<Cell> {
     for ch in rle.chars() {
         match ch {
             '0'..='9' => {
-                run = run * 10 + (ch as i64 - '0' as i64);
+                run =
+                    run * 10 + i64::from(ch.to_digit(10).or_invariant("matched decimal RLE digit"));
             }
             'b' => {
                 x += run_length(run);
@@ -179,6 +187,6 @@ impl SplitMix64 {
 
     pub(crate) fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(SPLITMIX64_GAMMA);
-        mix_seed(self.state)
+        splitmix64_output(self.state)
     }
 }

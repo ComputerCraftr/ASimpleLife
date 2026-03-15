@@ -1,6 +1,7 @@
 pub(crate) const HASHLIFE_GC_MIN_NODES: usize = 4_096;
 pub(crate) const HASHLIFE_GC_GROWTH_TRIGGER: usize = 1_024;
 pub(crate) const HASHLIFE_GC_MIN_RECLAIM: usize = 256;
+pub(crate) const HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER: usize = 131_072;
 
 pub(crate) const SIMD_TRANSITION_CACHE_LIMIT: usize = 262_144;
 pub(crate) const SIMD_CANONICALIZATION_CACHE_LIMIT: usize = 262_144;
@@ -20,18 +21,16 @@ pub(crate) fn hashlife_gc_reason(
     last_gc_nodes: usize,
 ) -> &'static str {
     let grew = node_count.saturating_sub(last_gc_nodes) >= HASHLIFE_GC_GROWTH_TRIGGER;
-    if previous_root_changed {
-        "root_changed"
-    } else if node_count >= HASHLIFE_GC_MIN_NODES {
-        "node_threshold"
-    } else if grew {
-        "growth_threshold"
-    } else {
+    if node_count < HASHLIFE_GC_MIN_NODES || !grew {
         "skip"
+    } else if previous_root_changed {
+        "root_changed"
+    } else {
+        "growth_threshold"
     }
 }
 
 pub(crate) fn should_run_active_hashlife_gc(node_count: usize, last_gc_nodes: usize) -> bool {
-    node_count >= HASHLIFE_GC_MIN_NODES
-        || node_count.saturating_sub(last_gc_nodes) >= HASHLIFE_GC_GROWTH_TRIGGER
+    let minimum_growth = HASHLIFE_GC_GROWTH_TRIGGER.max(last_gc_nodes / 4);
+    node_count.saturating_sub(last_gc_nodes) >= minimum_growth
 }

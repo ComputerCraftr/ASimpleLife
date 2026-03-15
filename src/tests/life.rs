@@ -1,13 +1,16 @@
+use crate::RequiredExt;
 use crate::classify::Classification;
 use crate::memo::Memo;
 use crate::normalize::{NormalizedGridSignature, normalize};
 
 use super::{
-    ChunkNeighborhood, build_neighborhood, evolve_center_chunk_bitwise,
-    gather_neighborhoods_staged,
+    ChunkNeighborhood, GameOfLife, build_neighborhood, evolve_center_chunk_bitwise,
+    gather_neighborhoods_into,
 };
 use crate::bitgrid::BitGrid;
-use crate::life::step_grid_with_chunk_changes_and_memo;
+use crate::life::{
+    CellStepWorkspace, step_grid_state_only_with_workspace, step_grid_with_chunk_changes_and_memo,
+};
 
 #[test]
 fn symmetric_neighborhoods_share_chunk_transition_cache_entries() {
@@ -20,7 +23,7 @@ fn symmetric_neighborhoods_share_chunk_transition_cache_entries() {
     let mirrored_next = evolve_center_chunk_bitwise(&mirrored);
 
     let mut memo = Memo::default();
-    memo.insert_chunk_transition(base.clone(), next);
+    memo.insert_chunk_transition(base, next);
     assert_eq!(memo.chunk_transition_cache_len(), 1);
     let canonicalization_after_base = memo.chunk_canonicalization_cache_len();
     assert!(canonicalization_after_base >= 1);
@@ -33,7 +36,7 @@ fn symmetric_neighborhoods_share_chunk_transition_cache_entries() {
     let canonicalization_after_mirror = memo.chunk_canonicalization_cache_len();
     assert!(canonicalization_after_mirror >= canonicalization_after_base);
 
-    memo.insert_chunk_transition(mirrored.clone(), mirrored_next);
+    memo.insert_chunk_transition(mirrored, mirrored_next);
     assert_eq!(memo.chunk_transition_cache_len(), 1);
     assert_eq!(
         memo.chunk_canonicalization_cache_len(),
@@ -48,7 +51,8 @@ fn neighborhood_from_cells(cells: &[(usize, usize)]) -> ChunkNeighborhood {
         let chunk_y = y / 8;
         let local_x = x % 8;
         let local_y = y % 8;
-        let bit = (local_y * 8 + local_x) as u32;
+        let bit =
+            u32::try_from(local_y * 8 + local_x).or_invariant("test neighborhood bit exceeded u32");
         chunks[chunk_y * 3 + chunk_x] |= 1_u64 << bit;
     }
     ChunkNeighborhood(chunks)
@@ -87,7 +91,10 @@ fn normalized_grid_signature_fingerprint_is_translation_stable() {
     let base_signature = normalize(&base).0;
     let shifted_signature = normalize(&shifted).0;
     assert_eq!(base_signature, shifted_signature);
-    assert_eq!(base_signature.fingerprint(), shifted_signature.fingerprint());
+    assert_eq!(
+        base_signature.fingerprint(),
+        shifted_signature.fingerprint()
+    );
 }
 
 #[test]
@@ -114,22 +121,76 @@ fn batched_neighborhood_gather_matches_scalar_gather() {
         (-1, 1),
         (0, 1),
     ];
-    let batched = gather_neighborhoods_staged(&grid, &targets);
+    let mut batched = [super::EMPTY_CHUNK_NEIGHBORHOOD; super::SIMD_BATCH_LANES];
+    gather_neighborhoods_into(&grid, &targets, &mut batched);
     for (index, &(cx, cy)) in targets.iter().enumerate() {
-        assert_eq!(batched.neighborhoods[index], build_neighborhood(&grid, cx, cy));
+        assert_eq!(batched[index], build_neighborhood(&grid, cx, cy));
     }
 }
 
 #[test]
-fn batched_chunk_transition_probe_tracks_hits_misses_and_inserts() {
-    let grid = BitGrid::from_cells(&[
-        (-1, -1),
+fn game_reuses_cell_step_frontier_capacity() {
+    let grid = BitGrid::from_cells(&[(0, 0), (1, 0), (2, 0), (64, 64), (65, 64), (66, 64)]);
+    let mut game = GameOfLife::new(grid);
+
+    game.step_with_chunk_changes();
+    let target_capacity = game.workspace.frontier.targets.capacity();
+    let seen_capacity = game.workspace.frontier.seen.capacity();
+    assert!(target_capacity > 0);
+    assert!(seen_capacity > 0);
+
+    game.step_with_chunk_changes();
+    assert!(game.workspace.frontier.targets.capacity() >= target_capacity);
+    assert!(game.workspace.frontier.seen.capacity() >= seen_capacity);
+}
+
+#[test]
+fn state_only_step_matches_chunk_change_step_and_reuses_workspace() {
+    let mut state_only = BitGrid::from_cells(&[
+        (-9, -8),
+        (-8, -8),
+        (-7, -8),
         (0, 0),
         (1, 0),
-        (8, 8),
-        (9, 8),
+        (1, 1),
         (16, 16),
     ]);
+    let mut with_changes = state_only.clone();
+    let mut state_memo = Memo::default();
+    let mut change_memo = Memo::default();
+    let mut workspace = CellStepWorkspace::default();
+
+    for _ in 0..8 {
+        state_only =
+            step_grid_state_only_with_workspace(&state_only, &mut state_memo, &mut workspace);
+        with_changes = step_grid_with_chunk_changes_and_memo(&with_changes, &mut change_memo).0;
+        assert_eq!(state_only, with_changes);
+    }
+
+    let target_capacity = workspace.frontier.targets.capacity();
+    let seen_capacity = workspace.frontier.seen.capacity();
+    let _ = step_grid_state_only_with_workspace(&state_only, &mut state_memo, &mut workspace);
+    assert!(workspace.frontier.targets.capacity() >= target_capacity);
+    assert!(workspace.frontier.seen.capacity() >= seen_capacity);
+}
+
+#[test]
+fn game_state_only_step_advances_without_changing_public_change_apis() {
+    let grid = BitGrid::from_cells(&[(0, 0), (1, 0), (2, 0)]);
+    let mut state_only = GameOfLife::new(grid.clone());
+    let mut with_changes = GameOfLife::new(grid);
+
+    state_only.step();
+    let changed = with_changes.step_with_chunk_changes();
+
+    assert_eq!(state_only.generation(), 1);
+    assert_eq!(state_only.grid(), with_changes.grid());
+    assert!(!changed.is_empty());
+}
+
+#[test]
+fn batched_chunk_transition_probe_tracks_hits_misses_and_inserts() {
+    let grid = BitGrid::from_cells(&[(-1, -1), (0, 0), (1, 0), (8, 8), (9, 8), (16, 16)]);
     let mut memo = Memo::default();
 
     let (_next, _changed) = step_grid_with_chunk_changes_and_memo(&grid, &mut memo);

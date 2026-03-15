@@ -1,153 +1,43 @@
-use super::*;
 use super::deps::{notify_dependents, notify_step0_dependents, push_dependent};
+use super::*;
+use crate::RequiredExt;
+
+mod arena;
 
 impl HashLifeEngine {
-    fn dedupe_discovered_jump_tasks<const N: usize>(
-        child_tasks: [DiscoveredJumpTask; N],
-    ) -> ([DiscoveredJumpTask; N], [u8; N], usize) {
-        let mut unique_keys = [DiscoveredJumpTask {
-            key: CanonicalJumpKey {
-                packed: PackedNodeKey::new(0, [0; 4]),
-                step_exp: 0,
-            },
-            source_node: 0,
-        }; N];
-        let mut duplicate_counts = [0_u8; N];
-        let mut unique_count = 0;
-
-        for child_key in child_tasks {
-            let mut existing = None;
-            for index in 0..unique_count {
-                if unique_keys[index].key == child_key.key {
-                    existing = Some(index);
-                    break;
-                }
-            }
-            if let Some(index) = existing {
-                duplicate_counts[index] += 1;
-            } else {
-                unique_keys[unique_count] = child_key;
-                duplicate_counts[unique_count] = 1;
-                unique_count += 1;
-            }
-        }
-
-        (unique_keys, duplicate_counts, unique_count)
-    }
-
-    pub(in crate::hashlife) fn discovered_jump_tasks_from_nodes<const N: usize>(
-        &mut self,
-        child_nodes: [NodeId; N],
-        step_exp: u32,
-    ) -> [DiscoveredJumpTask; N] {
-        let mut child_keys = [DiscoveredJumpTask {
-            key: CanonicalJumpKey {
-                packed: PackedNodeKey::new(0, [0; 4]),
-                step_exp: 0,
-            },
-            source_node: 0,
-        }; N];
-        for lane in 0..N {
-            child_keys[lane] = DiscoveredJumpTask {
-                key: self.canonical_jump_key_packed((child_nodes[lane], step_exp)).0,
-                source_node: child_nodes[lane],
-            };
-        }
-        child_keys
-    }
-
-    fn stage_pending_discovered_child_keys<const N: usize>(
-        &mut self,
-        unique_keys: &[DiscoveredJumpTask; N],
-        duplicate_counts: &[u8; N],
-        unique_count: usize,
-    ) -> ([DiscoveredJumpTask; N], [u8; N], usize) {
-        let mut present_keys = [CanonicalJumpKey {
-            packed: PackedNodeKey::new(0, [0; 4]),
-            step_exp: 0,
-        }; N];
-        for index in 0..unique_count {
-            present_keys[index] = unique_keys[index].key;
-        }
-        let present = self.probe_jump_cache_presence_batch(&present_keys, unique_count);
-        let mut pending_keys = [DiscoveredJumpTask {
-            key: CanonicalJumpKey {
-                packed: PackedNodeKey::new(0, [0; 4]),
-                step_exp: 0,
-            },
-            source_node: 0,
-        }; N];
-        let mut pending_counts = [0_u8; N];
-        let mut pending_count = 0;
-        for index in 0..unique_count {
-            if present[index] {
-                continue;
-            }
-            pending_keys[pending_count] = unique_keys[index];
-            pending_counts[pending_count] = duplicate_counts[index];
-            pending_count += 1;
-        }
-        (pending_keys, pending_counts, pending_count)
-    }
-
-    fn probe_jump_cache_presence_batch<const N: usize>(
-        &mut self,
-        keys: &[CanonicalJumpKey; N],
-        active_lanes: usize,
-    ) -> [bool; N] {
-        let mut present = [false; N];
-        if active_lanes == 0 {
-            return present;
-        }
-
-        let mut packed_keys = [PackedJumpCacheKey {
-            packed: PackedNodeKey::new(0, [0; 4]),
-            step_exp: 0,
-        }; N];
-        let mut fingerprints = [0_u64; N];
-        self.stats.jump_presence_probe_batches += 1;
-        self.stats.jump_presence_probe_lanes += active_lanes;
-        self.stats.scheduler_probe_batches += 1;
-        for lane in 0..active_lanes {
-            packed_keys[lane] = PackedJumpCacheKey {
-                packed: keys[lane].packed,
-                step_exp: keys[lane].step_exp,
-            };
-            fingerprints[lane] =
-                hash_packed_jump_fingerprint(keys[lane].packed.fingerprint(), keys[lane].step_exp);
-        }
-        let cached =
-            self.jump_cache
-                .get_many_with_fingerprints(&packed_keys, &fingerprints, active_lanes);
-        for lane in 0..active_lanes {
-            present[lane] = cached[lane].is_some();
-            self.stats.jump_presence_probe_hits += usize::from(present[lane]);
-        }
-        present
-    }
-
     pub(in crate::hashlife::scheduler) fn schedule_recursive_children(
         &mut self,
         child_keys: [DiscoveredJumpTask; 4],
         task_id: usize,
-        discover: &mut Vec<DiscoveredJumpTask>,
-        task_index: &mut FlatTable<CanonicalJumpKey, usize>,
-        tasks: &mut [Option<TaskRecord>],
-        dependents: &mut FlatTable<CanonicalJumpKey, usize>,
-        dependent_edges: &mut Vec<DependentEdge>,
+        state: &mut RecursiveSchedulerState<'_>,
     ) {
-        let (unique_keys, duplicate_counts, unique_count) =
-            Self::dedupe_discovered_jump_tasks(child_keys);
-        let (pending_keys, pending_counts, pending_count) =
-            self.stage_pending_discovered_child_keys(&unique_keys, &duplicate_counts, unique_count);
-        for index in 0..pending_count {
-            let child_key = pending_keys[index].key;
-            for _ in 0..pending_counts[index] {
-                push_dependent(dependents, dependent_edges, child_key, task_id);
-                tasks[task_id].as_mut().unwrap().remaining += 1;
+        let (compacted, unique_count) = self.compact_discovered_jump_tasks(child_keys);
+        let chunk_child_states =
+            self.build_chunk_child_states(compacted, unique_count, state.task_index);
+        for child_state in &chunk_child_states[..unique_count] {
+            if child_state.present {
+                continue;
             }
-            if !task_index.contains_key(&child_key) {
-                discover.push(pending_keys[index]);
+            let compacted_child = child_state.compacted;
+            let child_task = compacted_child.task;
+            let child_key = child_task.key;
+            for _ in 0..compacted_child.duplicate_count {
+                if !push_dependent(
+                    self,
+                    state.dependents,
+                    state.dependent_edges,
+                    child_key,
+                    task_id,
+                ) {
+                    return;
+                }
+                state.tasks[task_id]
+                    .as_mut()
+                    .or_invariant("required value")
+                    .remaining += 1;
+            }
+            if !child_state.blocked && !self.try_push_transient(state.discover, child_task) {
+                return;
             }
         }
     }
@@ -156,25 +46,36 @@ impl HashLifeEngine {
         &mut self,
         child_nodes: [NodeId; 4],
         task_id: usize,
-        discover: &mut Vec<DiscoveredJumpTask>,
-        task_index: &mut FlatTable<CanonicalJumpKey, usize>,
-        tasks: &mut [Option<Step0TaskRecord>],
-        dependents: &mut FlatTable<CanonicalJumpKey, usize>,
-        dependent_edges: &mut Vec<DependentEdge>,
+        state: &mut Step0SchedulerState<'_>,
     ) {
         let child_keys = self.discovered_jump_tasks_from_nodes(child_nodes, 0);
-        let (unique_keys, duplicate_counts, unique_count) =
-            Self::dedupe_discovered_jump_tasks(child_keys);
-        let (pending_keys, pending_counts, pending_count) =
-            self.stage_pending_discovered_child_keys(&unique_keys, &duplicate_counts, unique_count);
-        for index in 0..pending_count {
-            let child_key = pending_keys[index].key;
-            for _ in 0..pending_counts[index] {
-                push_dependent(dependents, dependent_edges, child_key, task_id);
-                tasks[task_id].as_mut().unwrap().remaining += 1;
+        let (compacted, unique_count) = self.compact_discovered_jump_tasks(child_keys);
+        let chunk_child_states =
+            self.build_chunk_child_states(compacted, unique_count, state.task_index);
+        for child_state in &chunk_child_states[..unique_count] {
+            if child_state.present {
+                continue;
             }
-            if !task_index.contains_key(&child_key) {
-                discover.push(pending_keys[index]);
+            let compacted_child = child_state.compacted;
+            let child_task = compacted_child.task;
+            let child_key = child_task.key;
+            for _ in 0..compacted_child.duplicate_count {
+                if !push_dependent(
+                    self,
+                    state.dependents,
+                    state.dependent_edges,
+                    child_key,
+                    task_id,
+                ) {
+                    return;
+                }
+                state.tasks[task_id]
+                    .as_mut()
+                    .or_invariant("required value")
+                    .remaining += 1;
+            }
+            if !child_state.blocked && !self.try_push_transient(state.discover, child_task) {
+                return;
             }
         }
     }
@@ -184,393 +85,295 @@ impl HashLifeEngine {
         root_node: NodeId,
         root_step_exp: u32,
     ) -> NodeId {
-        let debug = hashlife_debug_enabled();
         let level = self.node_columns.level(root_node) as usize;
         let task_capacity = 1usize << level.saturating_sub(root_step_exp as usize + 1).min(10);
-        let mut discover = Vec::with_capacity(task_capacity.max(8));
+        let Some(mut discover) = self.try_transient_vec(task_capacity.max(8)) else {
+            return self.dead_leaf;
+        };
+        let root_jump_probe = self.canonical_jump_probe((root_node, root_step_exp));
+        if self.allocation_failure.is_some() {
+            return self.dead_leaf;
+        }
         discover.push(DiscoveredJumpTask {
-            key: self.canonical_jump_key_packed((root_node, root_step_exp)).0,
+            key: root_jump_probe.key,
             source_node: root_node,
+            canonical_packed: root_jump_probe.node.packed,
         });
-        let mut task_index: FlatTable<CanonicalJumpKey, usize> =
-            FlatTable::with_capacity(task_capacity);
-        let mut tasks = Vec::<Option<TaskRecord>>::with_capacity(task_capacity);
-        let mut task_keys = Vec::<Option<CanonicalJumpKey>>::with_capacity(task_capacity);
-        let mut dependents: FlatTable<CanonicalJumpKey, usize> =
-            FlatTable::with_capacity(task_capacity);
-        let mut dependent_edges =
-            Vec::<DependentEdge>::with_capacity(task_capacity.saturating_mul(4));
-        let mut ready = Vec::<usize>::with_capacity(task_capacity);
+        let Some(mut task_index) = self.try_transient_flat_table(task_capacity) else {
+            return self.dead_leaf;
+        };
+        let Some(mut tasks) = self.try_transient_vec::<Option<TaskRecord>>(task_capacity) else {
+            return self.dead_leaf;
+        };
+        let Some(mut task_keys) = self.try_transient_vec::<Option<CanonicalJumpKey>>(task_capacity)
+        else {
+            return self.dead_leaf;
+        };
+        let Some(mut dependents) = self.try_transient_flat_table(task_capacity) else {
+            return self.dead_leaf;
+        };
+        let Some(mut dependent_edges) =
+            self.try_transient_vec::<DependentEdge>(task_capacity.saturating_mul(4))
+        else {
+            return self.dead_leaf;
+        };
+        let Some(mut ready) = self.try_transient_vec::<usize>(task_capacity) else {
+            return self.dead_leaf;
+        };
         let mut batch = [DiscoveredJumpTask {
-            key: CanonicalJumpKey {
-                packed: PackedNodeKey::new(0, [0; 4]),
-                step_exp: 0,
-            },
+            key: CanonicalJumpKey::empty(),
             source_node: 0,
+            canonical_packed: PackedNodeKey::new(0, [0; 4]),
         }; DISCOVER_BATCH];
-        let mut phase_one_candidates =
-            Vec::<SimdProvisionalRecord>::with_capacity(SIMD_BATCH_LANES);
-        let mut phase_two_candidates =
-            Vec::<SimdProvisionalRecord>::with_capacity(SIMD_BATCH_LANES);
-        let mut iterations = 0_usize;
-        let mut max_stack = discover.len();
-        let mut next_iteration_log = HASHLIFE_DEBUG_ITERATION_LOG_INTERVAL;
-        let mut next_stack_log = HASHLIFE_DEBUG_INITIAL_STACK_LOG_THRESHOLD;
+        let mut batch_keys = [CanonicalJumpKey::empty(); DISCOVER_BATCH];
+        let Some(mut phase_one_candidates) =
+            self.try_transient_vec::<SimdProvisionalRecord>(SIMD_BATCH_LANES)
+        else {
+            return self.dead_leaf;
+        };
+        let Some(mut phase_two_candidates) =
+            self.try_transient_vec::<SimdProvisionalRecord>(SIMD_BATCH_LANES)
+        else {
+            return self.dead_leaf;
+        };
+        let mut phase1_ready = [Phase1ReadyLane {
+            task_id: 0,
+            key: CanonicalJumpKey::empty(),
+            next_exp: 0,
+            inputs: [0; 9],
+        }; SIMD_BATCH_LANES];
+        let mut phase1_pending = 0usize;
+        let mut phase2_ready = [Phase2ReadyLane {
+            key: CanonicalJumpKey::empty(),
+            next_exp: 0,
+            inputs: [0; 4],
+        }; SIMD_BATCH_LANES];
+        let mut phase2_pending = 0usize;
+        let Some(mut parent_child_arena) =
+            self.try_transient_vec::<RecursiveParentChildRef>(DISCOVER_BATCH * 9)
+        else {
+            return self.dead_leaf;
+        };
 
-        while self.cached_jump_result((root_node, root_step_exp)).is_none() {
+        while self
+            .cached_jump_result((root_node, root_step_exp))
+            .is_none()
+        {
+            if self.allocation_failure.is_some() {
+                return self.dead_leaf;
+            }
             while !discover.is_empty() {
-                let mut batch_len = 0;
-                let mut parent_count = 0;
-                let mut parent_records = [RecursiveParentBatchRecord {
-                    cache_key: CanonicalJumpKey {
-                        packed: PackedNodeKey::new(0, [0; 4]),
-                        step_exp: 0,
-                    },
-                    packed_parent: PackedNodeKey::new(0, [0; 4]),
-                    packed_fingerprint: 0,
-                    inverse_symmetry: Symmetry::Identity,
-                    level: 0,
-                    next_exp: 0,
-                    overlaps: [0; 9],
-                    child_keys: [CanonicalJumpKey {
-                        packed: PackedNodeKey::new(0, [0; 4]),
-                        step_exp: 0,
-                    }; 9],
-                    child_nodes: [0; 9],
-                }; DISCOVER_BATCH];
-                while batch_len < DISCOVER_BATCH {
-                    let Some(entry) = discover.pop() else {
-                        break;
-                    };
-                    batch[batch_len] = entry;
-                    batch_len += 1;
+                if self.allocation_failure.is_some() {
+                    return self.dead_leaf;
                 }
-                let mut batch_keys = [CanonicalJumpKey {
-                    packed: PackedNodeKey::new(0, [0; 4]),
-                    step_exp: 0,
-                }; DISCOVER_BATCH];
-                for lane in 0..batch_len {
-                    batch_keys[lane] = batch[lane].key;
-                }
+                let batch_len =
+                    Self::drain_discover_batch(&mut discover, &mut batch, &mut batch_keys);
+                let Some(mut parent_records) =
+                    self.try_transient_vec::<RecursiveParentBatchRecord>(batch_len)
+                else {
+                    return self.dead_leaf;
+                };
+                let mut base_tasks = [batch[0]; SIMD_BATCH_LANES];
+                let mut base_nodes = [self.dead_leaf; SIMD_BATCH_LANES];
+                let mut base_count = 0;
                 let discovered_present =
                     self.probe_jump_cache_presence_batch(&batch_keys, batch_len);
                 for (lane, discovered_task) in batch[..batch_len].iter().enumerate() {
-                    let canonical_task = discovered_task.key;
-                    let discovered_node = discovered_task.source_node;
+                    let discovered = *discovered_task;
+                    let canonical_task = discovered.key;
+                    let discovered_node = discovered.source_node;
                     let discovered_step_exp = canonical_task.step_exp;
-                    iterations += 1;
-                    if discover.len() > max_stack {
-                        max_stack = discover.len();
-                    }
-                    if debug && iterations == next_iteration_log {
-                        eprintln!(
-                            "[hashlife] rec iter={iterations} discover={} ready={} task_index={} jump_cache={}",
-                            discover.len(),
-                            ready.len(),
-                            task_index.len(),
-                            self.jump_cache.len(),
-                        );
-                        next_iteration_log += HASHLIFE_DEBUG_ITERATION_LOG_INTERVAL;
-                    }
-                    if debug && max_stack >= next_stack_log {
-                        eprintln!(
-                            "[hashlife] rec max_stack={max_stack} discover={} ready={} task_index={} jump_cache={}",
-                            discover.len(),
-                            ready.len(),
-                            task_index.len(),
-                            self.jump_cache.len(),
-                        );
-                        next_stack_log *= 2;
-                    }
-
-                    let cache_key = canonical_task;
                     if discovered_present[lane] {
-                        self.stats.jump_cache_hits += 1;
-                        self.stats.simd_disabled_fast_exits += 1;
+                        self.stats.scheduler.simd_disabled_fast_exits += 1;
                         continue;
                     }
-                    self.stats.jump_cache_misses += 1;
                     if task_index.contains_key(&canonical_task) {
                         continue;
                     }
 
                     let discovered_level = self.node_columns.level(discovered_node);
-                    assert!(discovered_level >= 3);
+                    let discovered_population = self.node_columns.population(discovered_node);
+                    assert!(discovered_level >= 2);
 
-                    if self.node_columns.population(discovered_node) == 0 {
-                        self.stats.simd_disabled_fast_exits += 1;
+                    if discovered_population == 0 {
+                        self.stats.scheduler.simd_disabled_fast_exits += 1;
                         let result = self.empty(discovered_level - 1);
-                        self.insert_jump_result((discovered_node, cache_key.step_exp), result);
-                        notify_dependents(
-                            &cache_key,
+                        self.complete_recursive_fast_exit(
+                            discovered,
+                            result,
                             &mut tasks,
                             &mut dependents,
-                            &mut dependent_edges,
+                            &dependent_edges,
                             &mut ready,
                         );
-                        if ready.len() > self.stats.scheduler_ready_max {
-                            self.stats.scheduler_ready_max = ready.len();
-                        }
                         continue;
                     }
 
-                    if discovered_level <= DENSE_SHORTCUT_MAX_LEVEL {
-                        self.stats.simd_disabled_fast_exits += 1;
-                        let result =
-                            self.dense_advance_centered(discovered_node, discovered_step_exp);
-                        self.insert_jump_result((discovered_node, cache_key.step_exp), result);
-                        notify_dependents(
-                            &cache_key,
-                            &mut tasks,
-                            &mut dependents,
-                            &mut dependent_edges,
-                            &mut ready,
-                        );
-                        if ready.len() > self.stats.scheduler_ready_max {
-                            self.stats.scheduler_ready_max = ready.len();
-                        }
+                    if discovered_level == 2 {
+                        debug_assert_eq!(discovered_step_exp, 0);
+                        base_tasks[base_count] = discovered;
+                        base_nodes[base_count] = discovered_node;
+                        base_count += 1;
                         continue;
                     }
 
                     if discovered_step_exp == 0 {
-                        self.stats.simd_disabled_fast_exits += 1;
+                        self.stats.scheduler.simd_disabled_fast_exits += 1;
                         let result = self.advance_one_generation_centered(discovered_node);
-                        self.insert_jump_result((discovered_node, cache_key.step_exp), result);
-                        notify_dependents(
-                            &cache_key,
+                        self.complete_recursive_fast_exit(
+                            discovered,
+                            result,
                             &mut tasks,
                             &mut dependents,
-                            &mut dependent_edges,
+                            &dependent_edges,
                             &mut ready,
                         );
-                        if ready.len() > self.stats.scheduler_ready_max {
-                            self.stats.scheduler_ready_max = ready.len();
-                        }
                         continue;
                     }
 
-                    parent_records[parent_count] = RecursiveParentBatchRecord {
-                        cache_key: canonical_task,
-                        packed_parent: canonical_task.packed,
-                        packed_fingerprint: canonical_task.packed.fingerprint(),
-                        inverse_symmetry: Symmetry::Identity,
-                        level: discovered_level,
-                        next_exp: discovered_step_exp - 1,
-                        overlaps: [0; 9],
-                        child_keys: [CanonicalJumpKey {
-                            packed: PackedNodeKey::new(0, [0; 4]),
-                            step_exp: 0,
-                        }; 9],
-                        child_nodes: [0; 9],
-                    };
-                    parent_count += 1;
+                    if !self.try_push_transient(
+                        &mut parent_records,
+                        RecursiveParentBatchRecord {
+                            discovered,
+                            next_exp: discovered_step_exp - 1,
+                            canonical_structural: canonical_task.structural,
+                            canonical_fingerprint: canonical_task.structural.fingerprint(),
+                            overlaps: [0; 9],
+                            child_arena_start: 0,
+                            child_arena_len: 0,
+                        },
+                    ) {
+                        return self.dead_leaf;
+                    }
                 }
 
-                if parent_count != 0 {
-                    self.stats.recursive_overlap_batch_batches += 1;
-                    self.stats.recursive_overlap_batch_lanes += parent_count;
-                    let mut parent_packed_keys = [PackedNodeKey::new(0, [0; 4]); DISCOVER_BATCH];
-                    let mut parent_packed_fingerprints = [0_u64; DISCOVER_BATCH];
-                    for lane in 0..parent_count {
-                        parent_packed_keys[lane] = parent_records[lane].packed_parent;
-                        parent_packed_fingerprints[lane] = parent_records[lane].packed_fingerprint;
-                        debug_assert_eq!(parent_records[lane].inverse_symmetry, Symmetry::Identity);
-                        debug_assert_eq!(parent_records[lane].level, parent_records[lane].packed_parent.level);
-                        debug_assert_eq!(parent_records[lane].packed_parent, parent_records[lane].cache_key.packed);
+                if base_count != 0 {
+                    let base_results = self.base_transition_batch(base_nodes, base_count);
+                    for lane in 0..base_count {
+                        self.complete_recursive_fast_exit(
+                            base_tasks[lane],
+                            base_results[lane],
+                            &mut tasks,
+                            &mut dependents,
+                            &dependent_edges,
+                            &mut ready,
+                        );
                     }
-                    self.stats.cache_probe_batches += 1;
-                    self.stats.scheduler_probe_batches += 1;
-                    self.stats.overlap_prep_batches += 1;
-                    let overlaps = self.probe_and_build_canonical_overlaps_staged(
-                        &parent_packed_keys,
-                        &parent_packed_fingerprints,
-                        parent_count,
-                    );
-                    for lane in 0..parent_count {
-                        parent_records[lane].overlaps = overlaps[lane];
-                        let child_nodes = [
-                            overlaps[lane][8],
-                            overlaps[lane][7],
-                            overlaps[lane][6],
-                            overlaps[lane][5],
-                            overlaps[lane][4],
-                            overlaps[lane][3],
-                            overlaps[lane][2],
-                            overlaps[lane][1],
-                            overlaps[lane][0],
-                        ];
-                        let discovered_children = self
-                            .discovered_jump_tasks_from_nodes(child_nodes, parent_records[lane].next_exp);
-                        for index in 0..9 {
-                            parent_records[lane].child_keys[index] = discovered_children[index].key;
-                            parent_records[lane].child_nodes[index] = discovered_children[index].source_node;
-                        }
+                }
+
+                if !parent_records.is_empty() {
+                    self.stats.simd.recursive_overlap_batch_batches += 1;
+                    self.stats.simd.recursive_overlap_batch_lanes += parent_records.len();
+                    self.stats.scheduler.cache_probe_batches += 1;
+                    self.stats.scheduler.scheduler_probe_batches += 1;
+                    self.stats.simd.overlap_prep_batches += 1;
+                    if !self.probe_and_attach_recursive_parent_overlaps(&mut parent_records) {
+                        return self.dead_leaf;
                     }
-                    for lane in 0..parent_count {
-                        let record = parent_records[lane];
-                        let canonical_task = record.cache_key;
+                    const CHILD_CHUNK: usize = DISCOVER_BATCH * 9;
+                    let (mut chunk_child_states, _) = self
+                        .build_recursive_parent_chunk_child_states::<CHILD_CHUNK>(
+                            &mut parent_records,
+                            &task_index,
+                            &mut parent_child_arena,
+                        );
+                    for record in &parent_records {
+                        let canonical_task = record.discovered.key;
                         let [q00, q01, q02, q10, q11, q12, q20, q21, q22] = record.overlaps;
                         let task_id = tasks.len();
-                        self.stats.scheduler_tasks += 1;
-                        task_index.insert(canonical_task, task_id);
-                        tasks.push(Some(TaskRecord {
-                            remaining: 0,
-                            task: PendingTask::PhaseOne {
-                                next_exp: record.next_exp,
-                                a: q00,
-                                b: q01,
-                                c: q02,
-                                d: q10,
-                                e: q11,
-                                f: q12,
-                                g: q20,
-                                h: q21,
-                                i: q22,
-                            },
-                        }));
-                        task_keys.push(Some(canonical_task));
-                        let task = tasks[task_id].as_mut().unwrap();
-                        let mut discovered_children = [DiscoveredJumpTask {
-                            key: CanonicalJumpKey {
-                                packed: PackedNodeKey::new(0, [0; 4]),
-                                step_exp: 0,
-                            },
-                            source_node: 0,
-                        }; 9];
-                        for index in 0..9 {
-                            discovered_children[index] = DiscoveredJumpTask {
-                                key: record.child_keys[index],
-                                source_node: record.child_nodes[index],
-                            };
+                        self.stats.scheduler.scheduler_tasks += 1;
+                        if !self.try_insert_transient_table(
+                            &mut task_index,
+                            canonical_task,
+                            task_id,
+                        ) || !self.try_push_transient(
+                            &mut tasks,
+                            Some(TaskRecord {
+                                remaining: 0,
+                                task: PendingTask::PhaseOne {
+                                    next_exp: record.next_exp,
+                                    a: q00,
+                                    b: q01,
+                                    c: q02,
+                                    d: q10,
+                                    e: q11,
+                                    f: q12,
+                                    g: q20,
+                                    h: q21,
+                                    i: q22,
+                                },
+                            }),
+                        ) || !self.try_push_transient(&mut task_keys, Some(canonical_task))
+                        {
+                            return self.dead_leaf;
                         }
-                        let (child_keys, child_duplicate_counts, child_unique_count) =
-                            Self::dedupe_discovered_jump_tasks(discovered_children);
-                        let (pending_child_keys, pending_child_counts, pending_child_count) =
-                            self.stage_pending_discovered_child_keys(
-                                &child_keys,
-                                &child_duplicate_counts,
-                                child_unique_count,
-                            );
-                        for index in 0..pending_child_count {
-                            let child_key = pending_child_keys[index].key;
-                            for _ in 0..pending_child_counts[index] {
-                                push_dependent(
+                        let task = tasks[task_id].as_mut().or_invariant("required value");
+                        let child_range_start = usize::from(record.child_arena_start);
+                        let child_range_end =
+                            child_range_start + usize::from(record.child_arena_len);
+                        for child_ref in &parent_child_arena[child_range_start..child_range_end] {
+                            let chunk_index = usize::from(child_ref.query_index);
+                            let child_task = chunk_child_states[chunk_index].compacted.task;
+                            let child_key = child_task.key;
+                            if chunk_child_states[chunk_index].present {
+                                continue;
+                            }
+                            for _ in 0..child_ref.duplicate_count {
+                                if !push_dependent(
+                                    self,
                                     &mut dependents,
                                     &mut dependent_edges,
                                     child_key,
                                     task_id,
-                                );
+                                ) {
+                                    return self.dead_leaf;
+                                }
                                 task.remaining += 1;
                             }
-                            if !task_index.contains_key(&child_key) {
-                                discover.push(pending_child_keys[index]);
+                            if !chunk_child_states[chunk_index].blocked
+                                && !chunk_child_states[chunk_index].enqueued
+                            {
+                                if !self.try_push_transient(&mut discover, child_task) {
+                                    return self.dead_leaf;
+                                }
+                                chunk_child_states[chunk_index].enqueued = true;
                             }
                         }
                         if task.remaining == 0 {
-                            ready.push(task_id);
-                            self.stats.phase1_ready_max =
-                                self.stats.phase1_ready_max.max(ready.len());
-                            self.stats.scheduler_ready_max =
-                                self.stats.scheduler_ready_max.max(ready.len());
+                            if !self.try_push_transient(&mut ready, task_id) {
+                                return self.dead_leaf;
+                            }
+                            self.stats.scheduler.phase1_ready_max =
+                                self.stats.scheduler.phase1_ready_max.max(ready.len());
+                            self.stats.scheduler.scheduler_ready_max =
+                                self.stats.scheduler.scheduler_ready_max.max(ready.len());
                         }
                     }
                 }
             }
 
-            if self.cached_jump_result((root_node, root_step_exp)).is_some() {
+            if self
+                .cached_jump_result((root_node, root_step_exp))
+                .is_some()
+            {
                 break;
             }
 
-            let Some(task_id) = ready.pop() else {
-                self.stats.dependency_stalls += 1;
-                panic!(
+            if ready.is_empty() {
+                self.stats.scheduler.dependency_stalls += 1;
+                crate::invariant_failure!(
                     "hashlife recursive dependency resolution stalled root={root_node} step_exp={root_step_exp} pending={} ready={} cache={}",
                     task_index.len(),
                     ready.len(),
-                    self.jump_cache.len(),
+                    self.result_caches.jump.len(),
                 );
-            };
-            {
-                let Some(task) = tasks[task_id].take() else {
-                    panic!("ready recursive task missing state for task_id={task_id}");
-                };
-                match task.task {
-                    PendingTask::PhaseOne {
-                        next_exp,
-                        a: q00,
-                        b: q01,
-                        c: q02,
-                        d: q10,
-                        e: q11,
-                        f: q12,
-                        g: q20,
-                        h: q21,
-                        i: q22,
-                    } => {
-                        debug_assert_eq!(task.remaining, 0);
-                        let parent_key = task_keys[task_id].take();
-                        let task_key = parent_key.unwrap_or_else(|| {
-                            panic!("phase1 task missing key for task_id={task_id}")
-                        });
-                        task_index.remove(&task_key);
-                        phase_one_candidates.push(self.build_phase1_provisional_record(
-                            task_id,
-                            task_key,
-                            next_exp,
-                            [q00, q01, q02, q10, q11, q12, q20, q21, q22],
-                        ));
-                        if phase_one_candidates.len() == SIMD_BATCH_LANES {
-                            self.flush_recursive_simd_candidates(
-                                SimdTaskKind::PhaseOne,
-                                &mut phase_one_candidates,
-                                &mut discover,
-                                &mut task_index,
-                                &mut tasks,
-                                &mut task_keys,
-                                &mut dependents,
-                                &mut dependent_edges,
-                                &mut ready,
-                            );
-                        }
-                    }
-                    PendingTask::PhaseTwo {
-                        next_exp,
-                        nw,
-                        ne,
-                        sw,
-                        se,
-                    } => {
-                        debug_assert_eq!(task.remaining, 0);
-                        let task_key = task_keys[task_id]
-                            .expect("phase2 task should always have a cached key");
-                        task_keys[task_id] = None;
-                        task_index.remove(&task_key);
-                        phase_two_candidates.push(self.build_phase2_provisional_record(
-                            task_id,
-                            task_key,
-                            next_exp,
-                            [nw, ne, sw, se],
-                        ));
-                        if phase_two_candidates.len() == SIMD_BATCH_LANES {
-                            self.flush_recursive_simd_candidates(
-                                SimdTaskKind::PhaseTwo,
-                                &mut phase_two_candidates,
-                                &mut discover,
-                                &mut task_index,
-                                &mut tasks,
-                                &mut task_keys,
-                                &mut dependents,
-                                &mut dependent_edges,
-                                &mut ready,
-                            );
-                        }
-                    }
-                }
             }
 
             while let Some(task_id) = ready.pop() {
                 let Some(task) = tasks[task_id].take() else {
-                    panic!("drained recursive task missing state for task_id={task_id}");
+                    crate::invariant_failure!(
+                        "drained recursive task missing state for task_id={task_id}"
+                    );
                 };
                 match task.task {
                     PendingTask::PhaseOne {
@@ -588,26 +391,37 @@ impl HashLifeEngine {
                         debug_assert_eq!(task.remaining, 0);
                         let parent_key = task_keys[task_id].take();
                         let task_key = parent_key.unwrap_or_else(|| {
-                            panic!("phase1 task missing key for task_id={task_id}")
+                            crate::invariant_failure!(
+                                "phase1 task missing key for task_id={task_id}"
+                            )
                         });
                         task_index.remove(&task_key);
-                        phase_one_candidates.push(self.build_phase1_provisional_record(
+                        phase1_ready[phase1_pending] = Phase1ReadyLane {
                             task_id,
-                            task_key,
+                            key: task_key,
                             next_exp,
-                            [q00, q01, q02, q10, q11, q12, q20, q21, q22],
-                        ));
-                        if phase_one_candidates.len() == SIMD_BATCH_LANES {
-                            self.flush_recursive_simd_candidates(
-                                SimdTaskKind::PhaseOne,
+                            inputs: [q00, q01, q02, q10, q11, q12, q20, q21, q22],
+                        };
+                        phase1_pending += 1;
+                        if phase1_pending == SIMD_BATCH_LANES {
+                            self.build_phase1_provisional_records_batch(
+                                &phase1_ready,
+                                phase1_pending,
                                 &mut phase_one_candidates,
-                                &mut discover,
-                                &mut task_index,
-                                &mut tasks,
-                                &mut task_keys,
-                                &mut dependents,
-                                &mut dependent_edges,
-                                &mut ready,
+                            );
+                            phase1_pending = 0;
+                            self.flush_recursive_kernel_candidates(
+                                false,
+                                &mut phase_one_candidates,
+                                &mut RecursiveSchedulerState {
+                                    discover: &mut discover,
+                                    task_index: &mut task_index,
+                                    tasks: &mut tasks,
+                                    task_keys: &mut task_keys,
+                                    dependents: &mut dependents,
+                                    dependent_edges: &mut dependent_edges,
+                                    ready: &mut ready,
+                                },
                             );
                         }
                     }
@@ -620,62 +434,82 @@ impl HashLifeEngine {
                     } => {
                         debug_assert_eq!(task.remaining, 0);
                         let task_key = task_keys[task_id]
-                            .expect("phase2 task should always have a cached key");
+                            .or_invariant("phase2 task should always have a cached key");
                         task_keys[task_id] = None;
                         task_index.remove(&task_key);
-                        phase_two_candidates.push(self.build_phase2_provisional_record(
-                            task_id,
-                            task_key,
+                        phase2_ready[phase2_pending] = Phase2ReadyLane {
+                            key: task_key,
                             next_exp,
-                            [nw, ne, sw, se],
-                        ));
-                        if phase_two_candidates.len() == SIMD_BATCH_LANES {
-                            self.flush_recursive_simd_candidates(
-                                SimdTaskKind::PhaseTwo,
+                            inputs: [nw, ne, sw, se],
+                        };
+                        phase2_pending += 1;
+                        if phase2_pending == SIMD_BATCH_LANES {
+                            self.build_phase2_provisional_records_batch(
+                                &phase2_ready,
+                                phase2_pending,
                                 &mut phase_two_candidates,
-                                &mut discover,
-                                &mut task_index,
-                                &mut tasks,
-                                &mut task_keys,
-                                &mut dependents,
-                                &mut dependent_edges,
-                                &mut ready,
+                            );
+                            phase2_pending = 0;
+                            self.flush_recursive_kernel_candidates(
+                                true,
+                                &mut phase_two_candidates,
+                                &mut RecursiveSchedulerState {
+                                    discover: &mut discover,
+                                    task_index: &mut task_index,
+                                    tasks: &mut tasks,
+                                    task_keys: &mut task_keys,
+                                    dependents: &mut dependents,
+                                    dependent_edges: &mut dependent_edges,
+                                    ready: &mut ready,
+                                },
                             );
                         }
                     }
                 }
             }
 
-            self.flush_recursive_simd_candidates(
-                SimdTaskKind::PhaseOne,
-                &mut phase_one_candidates,
-                &mut discover,
-                &mut task_index,
-                &mut tasks,
-                &mut task_keys,
-                &mut dependents,
-                &mut dependent_edges,
-                &mut ready,
-            );
-            self.flush_recursive_simd_candidates(
-                SimdTaskKind::PhaseTwo,
-                &mut phase_two_candidates,
-                &mut discover,
-                &mut task_index,
-                &mut tasks,
-                &mut task_keys,
-                &mut dependents,
-                &mut dependent_edges,
-                &mut ready,
-            );
-        }
+            if phase1_pending != 0 {
+                self.build_phase1_provisional_records_batch(
+                    &phase1_ready,
+                    phase1_pending,
+                    &mut phase_one_candidates,
+                );
+                phase1_pending = 0;
+            }
+            if phase2_pending != 0 {
+                self.build_phase2_provisional_records_batch(
+                    &phase2_ready,
+                    phase2_pending,
+                    &mut phase_two_candidates,
+                );
+                phase2_pending = 0;
+            }
 
-        if debug {
-            eprintln!(
-                "[hashlife] advance_pow2_recursive done root={root_node} step_exp={root_step_exp} iterations={iterations} max_stack={max_stack} cache={} pending={} ready={}",
-                self.jump_cache.len(),
-                task_index.len(),
-                ready.len(),
+            self.flush_recursive_kernel_candidates(
+                false,
+                &mut phase_one_candidates,
+                &mut RecursiveSchedulerState {
+                    discover: &mut discover,
+                    task_index: &mut task_index,
+                    tasks: &mut tasks,
+                    task_keys: &mut task_keys,
+                    dependents: &mut dependents,
+                    dependent_edges: &mut dependent_edges,
+                    ready: &mut ready,
+                },
+            );
+            self.flush_recursive_kernel_candidates(
+                true,
+                &mut phase_two_candidates,
+                &mut RecursiveSchedulerState {
+                    discover: &mut discover,
+                    task_index: &mut task_index,
+                    tasks: &mut tasks,
+                    task_keys: &mut task_keys,
+                    dependents: &mut dependents,
+                    dependent_edges: &mut dependent_edges,
+                    ready: &mut ready,
+                },
             );
         }
 
@@ -688,67 +522,79 @@ impl HashLifeEngine {
     ) -> NodeId {
         let root_key = (root_node, 0);
         if self.cached_jump_result(root_key).is_some() {
-            self.stats.jump_cache_hits += 1;
             return self.jump_result(root_key);
         }
 
-        let debug = hashlife_debug_enabled();
         let level = self.node_columns.level(root_node) as usize;
         let task_capacity = 1usize << level.saturating_sub(1).min(10);
-        let mut discover = Vec::with_capacity(task_capacity.max(8));
+        let Some(mut discover) = self.try_transient_vec(task_capacity.max(8)) else {
+            return self.dead_leaf;
+        };
+        let root_jump_probe = self.canonical_jump_probe((root_node, 0));
+        if self.allocation_failure.is_some() {
+            return self.dead_leaf;
+        }
         discover.push(DiscoveredJumpTask {
-            key: self.canonical_jump_key_packed((root_node, 0)).0,
+            key: root_jump_probe.key,
             source_node: root_node,
+            canonical_packed: root_jump_probe.node.packed,
         });
-        let mut task_index: FlatTable<CanonicalJumpKey, usize> =
-            FlatTable::with_capacity(task_capacity);
-        let mut tasks = Vec::<Option<Step0TaskRecord>>::with_capacity(task_capacity);
-        let mut task_keys = Vec::<Option<CanonicalJumpKey>>::with_capacity(task_capacity);
-        let mut dependents: FlatTable<CanonicalJumpKey, usize> =
-            FlatTable::with_capacity(task_capacity);
-        let mut dependent_edges =
-            Vec::<DependentEdge>::with_capacity(task_capacity.saturating_mul(4));
-        let mut ready = Vec::<usize>::with_capacity(task_capacity);
+        let Some(mut task_index) = self.try_transient_flat_table(task_capacity) else {
+            return self.dead_leaf;
+        };
+        let Some(mut tasks) = self.try_transient_vec::<Option<Step0TaskRecord>>(task_capacity)
+        else {
+            return self.dead_leaf;
+        };
+        let Some(mut task_keys) = self.try_transient_vec::<Option<CanonicalJumpKey>>(task_capacity)
+        else {
+            return self.dead_leaf;
+        };
+        let Some(mut dependents) = self.try_transient_flat_table(task_capacity) else {
+            return self.dead_leaf;
+        };
+        let Some(mut dependent_edges) =
+            self.try_transient_vec::<DependentEdge>(task_capacity.saturating_mul(4))
+        else {
+            return self.dead_leaf;
+        };
+        let Some(mut ready) = self.try_transient_vec::<usize>(task_capacity) else {
+            return self.dead_leaf;
+        };
         let mut batch = [DiscoveredJumpTask {
-            key: CanonicalJumpKey {
-                packed: PackedNodeKey::new(0, [0; 4]),
-                step_exp: 0,
-            },
+            key: CanonicalJumpKey::empty(),
             source_node: 0,
+            canonical_packed: PackedNodeKey::new(0, [0; 4]),
         }; DISCOVER_BATCH];
-        let mut provisional_candidates = Vec::<CanonicalJumpKey>::with_capacity(SIMD_BATCH_LANES);
-        let mut iterations = 0_usize;
-
+        let mut batch_keys = [CanonicalJumpKey::empty(); DISCOVER_BATCH];
+        let Some(mut provisional_candidates) =
+            self.try_transient_vec::<DiscoveredJumpTask>(SIMD_BATCH_LANES)
+        else {
+            return self.dead_leaf;
+        };
         while self.cached_jump_result(root_key).is_none() {
+            if self.allocation_failure.is_some() {
+                return self.dead_leaf;
+            }
             while !discover.is_empty() {
-                let mut batch_len = 0;
-                while batch_len < DISCOVER_BATCH {
-                    let Some(entry) = discover.pop() else {
-                        break;
-                    };
-                    batch[batch_len] = entry;
-                    batch_len += 1;
+                if self.allocation_failure.is_some() {
+                    return self.dead_leaf;
                 }
-                let mut batch_keys = [CanonicalJumpKey {
-                    packed: PackedNodeKey::new(0, [0; 4]),
-                    step_exp: 0,
-                }; DISCOVER_BATCH];
-                for lane in 0..batch_len {
-                    batch_keys[lane] = batch[lane].key;
-                }
+                let batch_len =
+                    Self::drain_discover_batch(&mut discover, &mut batch, &mut batch_keys);
+                let mut base_tasks = [batch[0]; SIMD_BATCH_LANES];
+                let mut base_nodes = [self.dead_leaf; SIMD_BATCH_LANES];
+                let mut base_count = 0;
                 let discovered_present =
                     self.probe_jump_cache_presence_batch(&batch_keys, batch_len);
                 for (lane, discovered_task) in batch[..batch_len].iter().enumerate() {
                     let canonical_task = discovered_task.key;
                     let discovered_node = discovered_task.source_node;
-                    iterations += 1;
-                    let cache_key = canonical_task;
+                    let discovered_population = self.node_columns.population(discovered_node);
                     if discovered_present[lane] {
-                        self.stats.jump_cache_hits += 1;
-                        self.stats.simd_disabled_fast_exits += 1;
+                        self.stats.scheduler.simd_disabled_fast_exits += 1;
                         continue;
                     }
-                    self.stats.jump_cache_misses += 1;
                     if task_index.contains_key(&canonical_task) {
                         continue;
                     }
@@ -756,80 +602,79 @@ impl HashLifeEngine {
                     let discovered_level = self.node_columns.level(discovered_node);
                     assert!(discovered_level >= 2);
 
-                    if self.node_columns.population(discovered_node) == 0 {
-                        self.stats.simd_disabled_fast_exits += 1;
+                    if discovered_population == 0 {
+                        self.stats.scheduler.simd_disabled_fast_exits += 1;
                         let result = self.empty(discovered_level - 1);
-                        self.insert_jump_result((discovered_node, cache_key.step_exp), result);
+                        self.insert_jump_result((discovered_node, canonical_task.step_exp), result);
                         notify_step0_dependents(
-                            cache_key,
+                            self,
+                            canonical_task,
                             &mut tasks,
                             &mut dependents,
-                            &mut dependent_edges,
+                            &dependent_edges,
                             &mut ready,
                         );
-                        if ready.len() > self.stats.scheduler_ready_max {
-                            self.stats.scheduler_ready_max = ready.len();
-                        }
+                        self.stats.scheduler.scheduler_ready_max =
+                            self.stats.scheduler.scheduler_ready_max.max(ready.len());
                         continue;
                     }
 
                     if discovered_level == 2 {
-                        self.stats.simd_disabled_fast_exits += 1;
-                        let result = self.base_transition(discovered_node);
-                        self.insert_jump_result((discovered_node, cache_key.step_exp), result);
-                        notify_step0_dependents(
-                            cache_key,
-                            &mut tasks,
-                            &mut dependents,
-                            &mut dependent_edges,
-                            &mut ready,
-                        );
-                        if ready.len() > self.stats.scheduler_ready_max {
-                            self.stats.scheduler_ready_max = ready.len();
-                        }
+                        base_tasks[base_count] = *discovered_task;
+                        base_nodes[base_count] = discovered_node;
+                        base_count += 1;
                         continue;
                     }
 
-                    if discovered_level <= DENSE_SHORTCUT_MAX_LEVEL {
-                        self.stats.simd_disabled_fast_exits += 1;
-                        let result = self.dense_advance_centered(discovered_node, 0);
-                        self.insert_jump_result((discovered_node, cache_key.step_exp), result);
-                        notify_step0_dependents(
-                            cache_key,
-                            &mut tasks,
-                            &mut dependents,
-                            &mut dependent_edges,
-                            &mut ready,
-                        );
-                        if ready.len() > self.stats.scheduler_ready_max {
-                            self.stats.scheduler_ready_max = ready.len();
-                        }
-                        continue;
+                    if !self.try_push_transient(&mut provisional_candidates, *discovered_task) {
+                        return self.dead_leaf;
                     }
-
-                    provisional_candidates.push(canonical_task);
                     if provisional_candidates.len() == SIMD_BATCH_LANES {
-                        self.flush_step0_simd_candidates(
+                        self.flush_step0_kernel_candidates(
                             &mut provisional_candidates,
-                            &mut discover,
-                            &mut task_index,
-                            &mut tasks,
-                            &mut task_keys,
-                            &mut dependents,
-                            &mut dependent_edges,
-                            &mut ready,
+                            &mut Step0SchedulerState {
+                                discover: &mut discover,
+                                task_index: &mut task_index,
+                                tasks: &mut tasks,
+                                task_keys: &mut task_keys,
+                                dependents: &mut dependents,
+                                dependent_edges: &mut dependent_edges,
+                                ready: &mut ready,
+                            },
                         );
                     }
                 }
-                self.flush_step0_simd_candidates(
+                if base_count != 0 {
+                    let base_results = self.base_transition_batch(base_nodes, base_count);
+                    for lane in 0..base_count {
+                        let discovered_task = base_tasks[lane];
+                        self.insert_jump_result(
+                            (discovered_task.source_node, discovered_task.key.step_exp),
+                            base_results[lane],
+                        );
+                        notify_step0_dependents(
+                            self,
+                            discovered_task.key,
+                            &mut tasks,
+                            &mut dependents,
+                            &dependent_edges,
+                            &mut ready,
+                        );
+                        self.stats.scheduler.scheduler_ready_max =
+                            self.stats.scheduler.scheduler_ready_max.max(ready.len());
+                    }
+                }
+                self.flush_step0_kernel_candidates(
                     &mut provisional_candidates,
-                    &mut discover,
-                    &mut task_index,
-                    &mut tasks,
-                    &mut task_keys,
-                    &mut dependents,
-                    &mut dependent_edges,
-                    &mut ready,
+                    &mut Step0SchedulerState {
+                        discover: &mut discover,
+                        task_index: &mut task_index,
+                        tasks: &mut tasks,
+                        task_keys: &mut task_keys,
+                        dependents: &mut dependents,
+                        dependent_edges: &mut dependent_edges,
+                        ready: &mut ready,
+                    },
                 );
             }
 
@@ -839,22 +684,27 @@ impl HashLifeEngine {
 
             let Some(task_id) = ready.pop() else {
                 let sample = task_index.iter().next().map(|(pending_key, task_id)| {
-                    let task = tasks[task_id].unwrap();
-                    (pending_key.packed, pending_key.step_exp, task.remaining, task.children)
+                    let task = tasks[task_id].or_invariant("required value");
+                    (
+                        pending_key.structural,
+                        pending_key.step_exp,
+                        task.remaining,
+                        task.children,
+                    )
                 });
-                self.stats.dependency_stalls += 1;
-                panic!(
+                self.stats.scheduler.dependency_stalls += 1;
+                crate::invariant_failure!(
                     "hashlife step-0 dependency resolution stalled root_node={root_node} pending={} ready={} cache={} sample={sample:?}",
                     task_index.len(),
                     ready.len(),
-                    self.jump_cache.len(),
+                    self.result_caches.jump.len(),
                 );
             };
             let Some(task_key) = task_keys[task_id].take() else {
-                panic!("step0 task missing key for task_id={task_id}");
+                crate::invariant_failure!("step0 task missing key for task_id={task_id}");
             };
             task_index.remove(&task_key);
-            let task = tasks[task_id].take().unwrap();
+            let task = tasks[task_id].take().or_invariant("required value");
             debug_assert_eq!(task.remaining, 0);
             let [nw, ne, sw, se] = task.children;
             let q00 = self.jump_result((nw, 0));
@@ -864,24 +714,16 @@ impl HashLifeEngine {
             let result = self.join(q00, q01, q10, q11);
             self.insert_canonical_jump_result(task_key, result);
             notify_step0_dependents(
+                self,
                 task_key,
                 &mut tasks,
                 &mut dependents,
-                &mut dependent_edges,
+                &dependent_edges,
                 &mut ready,
             );
-            if ready.len() > self.stats.scheduler_ready_max {
-                self.stats.scheduler_ready_max = ready.len();
+            if ready.len() > self.stats.scheduler.scheduler_ready_max {
+                self.stats.scheduler.scheduler_ready_max = ready.len();
             }
-        }
-
-        if debug {
-            eprintln!(
-                "[hashlife] advance_step0 done root={root_node} iterations={iterations} cache={} pending={} ready={}",
-                self.jump_cache.len(),
-                task_index.len(),
-                ready.len(),
-            );
         }
 
         self.jump_result(root_key)

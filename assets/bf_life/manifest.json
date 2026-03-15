@@ -1,0 +1,28 @@
+{
+  "schema": "asimplelife/bf-life-assets/v1",
+  "status": "blocked",
+  "components": [],
+  "blocker": {
+    "reason": "No permissively licensed, independently verified physical component library satisfies the v1 machine contract.",
+    "missing_components": [
+      "clock",
+      "conduit",
+      "delay",
+      "splitter",
+      "crossover",
+      "eater",
+      "state_latch",
+      "head_token_mover",
+      "bit_increment",
+      "bit_decrement",
+      "zero_detector",
+      "conditional_router",
+      "halt_latch",
+      "output_bit_transducer"
+    ],
+    "required_tape_cells": 64,
+    "required_cell_bits": 8,
+    "input_supported": false,
+    "output_encoding": "one synchronization pulse followed by eight LSB-first glider data pulses"
+  }
+}
