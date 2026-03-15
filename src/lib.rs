@@ -1,5 +1,6 @@
 pub mod app;
 pub mod benchmark;
+pub mod bf;
 pub mod bitgrid;
 pub(crate) mod cache_policy;
 pub mod classify;
