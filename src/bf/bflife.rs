@@ -691,182 +691,106 @@ pub fn emit_c(program: &[BfIr], opts: CodegenOpts) -> String {
     let needs_cell_mask = matches!(opts.io_mode, IoMode::Number)
         && any_ir(program, &|node| matches!(node, BfIr::Input | BfIr::Output));
 
-    let mut out = String::new();
-    out.push_str(
-        "#include <stdio.h>\n\
-#include <stdint.h>\n\
-#include <stddef.h>\n\
-#include <inttypes.h>\n\
-#include <stdckdint.h>\n\
-\n\
-static uint64_t bf_bits_mask(unsigned bits) {\n\
-    return bits == 0 ? UINT64_C(0) : ((UINT64_C(1) << bits) - 1);\n\
-}\n\
-static int64_t bf_wrap_from_u64_signed(uint64_t raw, unsigned bits) {\n\
-    if (bits == 0) return 0;\n\
-    raw &= bf_bits_mask(bits);\n\
-    if (bits == 63) {\n\
-        uint64_t sign = UINT64_C(1) << 62;\n\
-        if ((raw & sign) == 0) {\n\
-            return (int64_t)raw;\n\
-        }\n\
-        uint64_t mag = raw - sign;\n\
-        return (int64_t)mag - (int64_t)sign;\n\
-    }\n\
-    uint64_t sign = UINT64_C(1) << (bits - 1);\n\
-    if ((raw & sign) == 0) {\n\
-        return (int64_t)raw;\n\
-    }\n\
-    return (int64_t)raw - (int64_t)(UINT64_C(1) << bits);\n\
-}\n\
-static int64_t bf_wrap_from_u64_unsigned(uint64_t raw, unsigned bits) {\n\
-    if (bits == 0) return 0;\n\
-    return (int64_t)(raw & bf_bits_mask(bits));\n\
-}\n\
-static uint64_t bf_wrap_to_u64(int64_t value, unsigned bits) {\n\
-    if (bits == 0) return UINT64_C(0);\n\
-    return ((uint64_t)value) & bf_bits_mask(bits);\n\
-}\n\
-static int64_t bf_wrap_add_i64_signed(int64_t a, int64_t b, unsigned bits) {\n\
-    uint64_t ua = bf_wrap_to_u64(a, bits);\n\
-    uint64_t ub = bf_wrap_to_u64(b, bits);\n\
-    uint64_t out = 0;\n\
-    if (ckd_add(&out, ua, ub)) {\n\
-        out = ua + ub;\n\
-    }\n\
-    return bf_wrap_from_u64_signed(out, bits);\n\
-}\n\
-static int64_t bf_wrap_sub_i64_signed(int64_t a, int64_t b, unsigned bits) {\n\
-    uint64_t ua = bf_wrap_to_u64(a, bits);\n\
-    uint64_t ub = bf_wrap_to_u64(b, bits);\n\
-    uint64_t out = 0;\n\
-    if (ckd_sub(&out, ua, ub)) {\n\
-        out = ua - ub;\n\
-    }\n\
-    return bf_wrap_from_u64_signed(out, bits);\n\
-}\n\
-static int64_t bf_wrap_mul_i64_signed(int64_t a, int64_t b, unsigned bits) {\n\
-    uint64_t ua = bf_wrap_to_u64(a, bits);\n\
-    uint64_t ub = bf_wrap_to_u64(b, bits);\n\
-    uint64_t out = 0;\n\
-    if (ckd_mul(&out, ua, ub)) {\n\
-        out = ua * ub;\n\
-    }\n\
-    return bf_wrap_from_u64_signed(out, bits);\n\
-}\n\
-static int64_t bf_wrap_add_i64_unsigned(int64_t a, int64_t b, unsigned bits) {\n\
-    uint64_t ua = bf_wrap_to_u64(a, bits);\n\
-    uint64_t ub = bf_wrap_to_u64(b, bits);\n\
-    uint64_t out = 0;\n\
-    if (ckd_add(&out, ua, ub)) {\n\
-        out = ua + ub;\n\
-    }\n\
-    return bf_wrap_from_u64_unsigned(out, bits);\n\
-}\n\
-static int64_t bf_wrap_sub_i64_unsigned(int64_t a, int64_t b, unsigned bits) {\n\
-    uint64_t ua = bf_wrap_to_u64(a, bits);\n\
-    uint64_t ub = bf_wrap_to_u64(b, bits);\n\
-    uint64_t out = 0;\n\
-    if (ckd_sub(&out, ua, ub)) {\n\
-        out = ua - ub;\n\
-    }\n\
-    return bf_wrap_from_u64_unsigned(out, bits);\n\
-}\n\
-static int64_t bf_wrap_mul_i64_unsigned(int64_t a, int64_t b, unsigned bits) {\n\
-    uint64_t ua = bf_wrap_to_u64(a, bits);\n\
-    uint64_t ub = bf_wrap_to_u64(b, bits);\n\
-    uint64_t out = 0;\n\
-    if (ckd_mul(&out, ua, ub)) {\n\
-        out = ua * ub;\n\
-    }\n\
-    return bf_wrap_from_u64_unsigned(out, bits);\n\
-}\n\
-static _Noreturn void bf_diverge_forever(void) {\n\
-    static volatile int bf_diverge_sink = 0;\n\
-    for (;;) {\n\
-        bf_diverge_sink = 1;\n\
-    }\n\
-}\n\
-",
-    );
-
-    if needs_ptr_wrap {
-        out.push_str(
-            "static ptrdiff_t bf_wrap_ptr(ptrdiff_t ptr, ptrdiff_t delta, ptrdiff_t len) {\n\
-    if (len <= 0) return 0;\n\
-    ptr %= len;\n\
-    if (ptr < 0) ptr += len;\n\
-    delta %= len;\n\
-    if (delta < 0) delta += len;\n\
-    return (ptr + delta) % len;\n\
-}\n\
-",
-        );
+    fn mask_str(bits: u32) -> String {
+        match bits {
+            0 => "UINT64_C(0)".to_owned(),
+            n => format!("UINT64_C({})", (1u64 << n) - 1),
+        }
     }
-    out.push_str("int main(void) {\n");
-
-    let cell_ty = "int64_t";
 
     let input_bits = opts.input_bits.unwrap_or(opts.cell_bits).min(63);
     let output_bits = opts.output_bits.unwrap_or(opts.cell_bits).min(63);
 
-    let input_mask = match input_bits {
-        0 => "UINT64_C(0)",
-        n => {
-            let mask = (1u64 << n) - 1;
-            Box::leak(format!("UINT64_C({})", mask).into_boxed_str())
-        }
-    };
+    let mut ir_body = String::new();
+    emit_ir_stack(&mut ir_body, program, opts);
 
-    let output_mask = match output_bits {
-        0 => "UINT64_C(0)",
-        n => {
-            let mask = (1u64 << n) - 1;
-            Box::leak(format!("UINT64_C({})", mask).into_boxed_str())
-        }
-    };
-
-    let cell_mask = match opts.cell_bits {
-        0 => "UINT64_C(0)",
-        n => {
-            let mask = (1u64 << n) - 1;
-            Box::leak(format!("UINT64_C({})", mask).into_boxed_str())
-        }
-    };
-
-    push_line(&mut out, 1, "enum {");
-    push_line(&mut out, 2, &format!("BF_TAPE_LEN = {},", C_TAPE_LEN));
-    push_line(&mut out, 2, &format!("BF_CELL_BITS = {},", opts.cell_bits));
-    push_line(
-        &mut out,
-        2,
-        &format!(
-            "BF_SIGNED_CELLS = {},",
-            if matches!(opts.cell_sign, CellSign::Signed) {
-                1
+    fn strip_block(s: &mut String, begin: &str, end: &str) {
+        if let (Some(a), Some(b)) = (s.find(begin), s.find(end)) {
+            let end_pos = b + end.len();
+            let end_pos = if s.as_bytes().get(end_pos) == Some(&b'\n') {
+                end_pos + 1
             } else {
-                0
-            }
-        ),
-    );
+                end_pos
+            };
+            s.replace_range(a..end_pos, "");
+        }
+    }
+
+    fn keep_block(s: &mut String, begin: &str, end: &str) {
+        s.replace_range(
+            s.find(begin).unwrap()..s.find(begin).unwrap() + begin.len() + 1,
+            "",
+        );
+        let end_pos = s.find(end).unwrap();
+        let end_pos_after = end_pos + end.len();
+        let end_pos_after = if s.as_bytes().get(end_pos_after) == Some(&b'\n') {
+            end_pos_after + 1
+        } else {
+            end_pos_after
+        };
+        s.replace_range(end_pos..end_pos_after, "");
+    }
+
+    let mut out = include_str!("bf.c.in").to_owned();
+
+    // conditional blocks
+    if needs_ptr_wrap {
+        keep_block(
+            &mut out,
+            "/* @BF_WRAP_PTR_BEGIN */",
+            "/* @BF_WRAP_PTR_END */",
+        );
+    } else {
+        strip_block(
+            &mut out,
+            "/* @BF_WRAP_PTR_BEGIN */",
+            "/* @BF_WRAP_PTR_END */",
+        );
+    }
     if needs_cell_mask {
-        push_line(&mut out, 2, &format!("BF_CELL_MASK = {},", cell_mask));
+        keep_block(
+            &mut out,
+            "/* @BF_CELL_MASK_BEGIN */",
+            "/* @BF_CELL_MASK_END */",
+        );
+    } else {
+        strip_block(
+            &mut out,
+            "/* @BF_CELL_MASK_BEGIN */",
+            "/* @BF_CELL_MASK_END */",
+        );
     }
     if needs_input {
-        push_line(&mut out, 2, &format!("BF_INPUT_MASK = {},", input_mask));
+        keep_block(
+            &mut out,
+            "/* @BF_INPUT_MASK_BEGIN */",
+            "/* @BF_INPUT_MASK_END */",
+        );
+    } else {
+        strip_block(
+            &mut out,
+            "/* @BF_INPUT_MASK_BEGIN */",
+            "/* @BF_INPUT_MASK_END */",
+        );
     }
-    push_line(&mut out, 2, &format!("BF_OUTPUT_MASK = {}", output_mask));
-    push_line(&mut out, 1, "};");
-    push_line(
-        &mut out,
-        1,
-        &format!("{} tape[BF_TAPE_LEN] = {{0}};", cell_ty),
-    );
-    push_line(&mut out, 1, "ptrdiff_t ptr = 0;");
-    out.push('\n');
-    emit_ir_stack(&mut out, program, opts);
-    out.push_str("\n    return 0;\n");
-    out.push_str("}\n");
+
+    // value substitutions
+    out = out
+        .replace("/* @BF_TAPE_LEN */", &C_TAPE_LEN.to_string())
+        .replace("/* @BF_CELL_BITS */", &opts.cell_bits.to_string())
+        .replace(
+            "/* @BF_SIGNED_CELLS */",
+            if matches!(opts.cell_sign, CellSign::Signed) {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .replace("/* @BF_CELL_MASK */", &mask_str(opts.cell_bits))
+        .replace("/* @BF_INPUT_MASK */", &mask_str(input_bits))
+        .replace("/* @BF_OUTPUT_MASK */", &mask_str(output_bits))
+        .replace("/* @BF_PROGRAM */", &ir_body);
+
     out
 }
 
@@ -1116,7 +1040,7 @@ mod tests {
         assert!(c.contains("tape[ptr] = BF_SIGNED_CELLS ? bf_wrap_add_i64_signed(tape[ptr], INT64_C(3), BF_CELL_BITS) : bf_wrap_add_i64_unsigned(tape[ptr], INT64_C(3), BF_CELL_BITS);"));
         assert!(c.contains("putchar((unsigned char)(((uint64_t)tape[ptr]) & BF_OUTPUT_MASK));"));
         assert!(c.contains("fflush(stdout);"));
-        assert!(c.contains("int64_t tape[BF_TAPE_LEN] = {0};"));
+        assert!(c.contains("int64_t tape[BF_TAPE_LEN] = {};"));
         assert!(c.contains("BF_TAPE_LEN = 30000"));
         assert!(c.contains("BF_CELL_BITS = 8"));
         assert!(c.contains("BF_SIGNED_CELLS = 1"));
@@ -1324,7 +1248,7 @@ mod tests {
         );
         assert!(c.contains("{ int64_t tmp = 0; if (scanf(\"%\" SCNd64, &tmp) != 1) tmp = 0; tape[ptr] = bf_wrap_from_u64_signed(((uint64_t)tmp) & BF_INPUT_MASK, BF_CELL_BITS); }"));
         assert!(c.contains("printf(\"%\" PRId64 \"\\n\", bf_wrap_from_u64_signed(((uint64_t)tape[ptr]) & BF_OUTPUT_MASK, BF_CELL_BITS));"));
-        assert!(c.contains("int64_t tape[BF_TAPE_LEN] = {0};"));
+        assert!(c.contains("int64_t tape[BF_TAPE_LEN] = {};"));
         assert!(c.contains("BF_CELL_BITS = 32"));
         assert!(c.contains("BF_CELL_MASK = UINT64_C(4294967295)"));
         assert!(c.contains("BF_INPUT_MASK = UINT64_C(4294967295)"));
@@ -1365,7 +1289,7 @@ mod tests {
                 cell_sign: CellSign::Signed,
             },
         );
-        assert!(c.contains("int64_t tape[BF_TAPE_LEN] = {0};"));
+        assert!(c.contains("int64_t tape[BF_TAPE_LEN] = {};"));
         assert!(c.contains("BF_CELL_BITS = 63"));
         assert!(!c.contains("BF_CELL_MASK = "));
         assert!(c.contains("ptrdiff_t ptr = 0;"));
