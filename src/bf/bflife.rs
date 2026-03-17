@@ -27,6 +27,8 @@ pub enum BfIr {
     Distribute {
         targets: Vec<(isize, i32)>,
     },
+
+    Diverge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +60,14 @@ pub struct CodegenOpts {
 
 const C_TAPE_LEN: usize = 30_000;
 
+fn indent_spaces(n: usize) -> String {
+    " ".repeat(n)
+}
+
+fn indent_levels(level: usize) -> String {
+    indent_spaces(level * 4)
+}
+
 pub struct Parser {
     chars: Vec<char>,
     pos: usize,
@@ -73,92 +83,84 @@ impl Parser {
     }
 
     pub fn parse(mut self) -> Result<Vec<BfIr>, String> {
-        self.parse_block(false)
-    }
-
-    fn parse_block(&mut self, in_loop: bool) -> Result<Vec<BfIr>, String> {
-        let mut out = Vec::new();
+        let mut stack: Vec<Vec<BfIr>> = vec![Vec::new()];
 
         while let Some(&ch) = self.chars.get(self.pos) {
             match ch {
                 '+' => {
                     self.pos += 1;
-                    out.push(BfIr::Add(1));
+                    stack
+                        .last_mut()
+                        .expect("parser stack must contain a current block")
+                        .push(BfIr::Add(1));
                 }
                 '-' => {
                     self.pos += 1;
-                    out.push(BfIr::Add(-1));
+                    stack
+                        .last_mut()
+                        .expect("parser stack must contain a current block")
+                        .push(BfIr::Add(-1));
                 }
                 '>' => {
                     self.pos += 1;
-                    out.push(BfIr::MovePtr(1));
+                    stack
+                        .last_mut()
+                        .expect("parser stack must contain a current block")
+                        .push(BfIr::MovePtr(1));
                 }
                 '<' => {
                     self.pos += 1;
-                    out.push(BfIr::MovePtr(-1));
+                    stack
+                        .last_mut()
+                        .expect("parser stack must contain a current block")
+                        .push(BfIr::MovePtr(-1));
                 }
                 '.' => {
                     self.pos += 1;
-                    out.push(BfIr::Output);
+                    stack
+                        .last_mut()
+                        .expect("parser stack must contain a current block")
+                        .push(BfIr::Output);
                 }
                 ',' => {
                     self.pos += 1;
-                    out.push(BfIr::Input);
+                    stack
+                        .last_mut()
+                        .expect("parser stack must contain a current block")
+                        .push(BfIr::Input);
                 }
                 '[' => {
-                    self.pos += 1; // consume '['
-                    let body = self.parse_block(true)?;
-                    out.push(BfIr::Loop(body));
+                    self.pos += 1;
+                    stack.push(Vec::new());
                 }
                 ']' => {
-                    if !in_loop {
+                    if stack.len() == 1 {
                         return Err(format!(
                             "unmatched ']' at filtered token index {}",
                             self.pos
                         ));
                     }
-                    self.pos += 1; // consume ']'
-                    return Ok(out);
+                    self.pos += 1;
+                    let body = stack
+                        .pop()
+                        .expect("parser stack must contain a loop body to close");
+                    stack
+                        .last_mut()
+                        .expect("parser stack must contain a parent block")
+                        .push(BfIr::Loop(body));
                 }
                 _ => unreachable!(),
             }
         }
 
-        if in_loop {
+        if stack.len() != 1 {
             Err("unmatched '['".to_string())
         } else {
-            Ok(out)
+            Ok(stack
+                .pop()
+                .expect("parser stack must contain the top-level block"))
         }
     }
-}
-
-pub fn optimize(program: Vec<BfIr>) -> Vec<BfIr> {
-    let mut out = Vec::new();
-
-    for node in program {
-        match node {
-            BfIr::Loop(body) => {
-                let body = optimize(body);
-
-                if body.is_empty() {
-                    // [] is an infinite loop if entered; keep it.
-                    out.push(BfIr::Loop(body));
-                    continue;
-                }
-
-                if let Some(replacement) = recognize_loop(&body) {
-                    out.push(replacement);
-                } else {
-                    out.push(BfIr::Loop(body));
-                }
-            }
-            BfIr::Add(0) | BfIr::MovePtr(0) => {}
-            other => out.push(other),
-        }
-    }
-
-    merge_adjacent(&mut out);
-    out
 }
 
 fn merge_adjacent(nodes: &mut Vec<BfIr>) {
@@ -186,16 +188,132 @@ fn merge_adjacent(nodes: &mut Vec<BfIr>) {
     *nodes = merged;
 }
 
-fn recognize_loop(body: &[BfIr]) -> Option<BfIr> {
-    // Common clear idioms for wrapping cell semantics.
-    match body {
-        [BfIr::Add(delta)] if *delta == -1 || *delta == 1 => {
-            return Some(BfIr::Clear);
+fn can_peel_one_shot_wrapper(body: &[BfIr]) -> bool {
+    let mut ptr = 0isize;
+    let mut known_zero = BTreeMap::<isize, ()>::new();
+
+    for op in body {
+        match op {
+            BfIr::MovePtr(n) => {
+                ptr += *n;
+            }
+            BfIr::Add(_) | BfIr::Input => {
+                known_zero.remove(&ptr);
+            }
+            BfIr::Output => {}
+            BfIr::Clear => {
+                known_zero.insert(ptr, ());
+            }
+            BfIr::Distribute { targets } => {
+                for (off, coeff) in targets {
+                    if *coeff != 0 {
+                        known_zero.remove(&(ptr + *off));
+                    }
+                }
+                known_zero.insert(ptr, ());
+            }
+            BfIr::Diverge => {
+                return true;
+            }
+            BfIr::Loop(_) => {
+                return false;
+            }
         }
-        _ => {}
     }
 
-    recognize_distribute(body)
+    known_zero.contains_key(&ptr)
+}
+
+fn summarize_loop(body: &[BfIr]) -> Option<BfIr> {
+    match body {
+        [] => Some(BfIr::Diverge),
+        [BfIr::Diverge] => Some(BfIr::Diverge),
+        [BfIr::Clear] => Some(BfIr::Clear),
+        [BfIr::Distribute { targets }] => Some(BfIr::Distribute {
+            targets: targets.clone(),
+        }),
+        [BfIr::Add(delta)] if *delta == -1 || *delta == 1 => Some(BfIr::Clear),
+        _ => recognize_affine_loop(body),
+    }
+}
+
+fn truncate_after_diverge(nodes: &mut Vec<BfIr>) {
+    if let Some(pos) = nodes.iter().position(|n| matches!(n, BfIr::Diverge)) {
+        nodes.truncate(pos + 1);
+    }
+}
+
+fn normalize_sequence(nodes: &mut Vec<BfIr>) {
+    merge_adjacent(nodes);
+    truncate_after_diverge(nodes);
+}
+
+enum OptimizeFrame {
+    Seq {
+        input: std::vec::IntoIter<BfIr>,
+        out: Vec<BfIr>,
+    },
+    LoopFinalize,
+}
+
+// Bottom-up optimizer pass: optimize child loop bodies first, peel any one-shot
+// loop wrappers until stable, then summarize the normalized loop body if a
+// closed-form structured equivalent exists.
+fn optimize_sequence(program: Vec<BfIr>) -> Vec<BfIr> {
+    let mut stack = vec![OptimizeFrame::Seq {
+        input: program.into_iter(),
+        out: Vec::new(),
+    }];
+    let mut completed: Option<Vec<BfIr>> = None;
+
+    while let Some(frame) = stack.last_mut() {
+        match frame {
+            OptimizeFrame::Seq { input, out } => {
+                let Some(node) = input.next() else {
+                    let mut result = std::mem::take(out);
+                    normalize_sequence(&mut result);
+                    stack.pop();
+                    completed = Some(result);
+                    continue;
+                };
+
+                match node {
+                    BfIr::Loop(body) => {
+                        stack.push(OptimizeFrame::LoopFinalize);
+                        stack.push(OptimizeFrame::Seq {
+                            input: body.into_iter(),
+                            out: Vec::new(),
+                        });
+                    }
+                    BfIr::Add(0) | BfIr::MovePtr(0) => {}
+                    other => out.push(other),
+                }
+            }
+            OptimizeFrame::LoopFinalize => {
+                let body = completed
+                    .take()
+                    .expect("loop finalization requires an optimized child body");
+                stack.pop();
+
+                let OptimizeFrame::Seq { out, .. } = stack
+                    .last_mut()
+                    .expect("loop finalization requires a parent sequence frame")
+                else {
+                    unreachable!("parent frame must be a sequence");
+                };
+
+                if let Some(summary) = summarize_loop(&body) {
+                    out.push(summary);
+                } else if can_peel_one_shot_wrapper(&body) {
+                    out.extend(body);
+                } else {
+                    out.push(BfIr::Loop(body));
+                }
+            }
+        }
+    }
+
+    completed.unwrap_or_default()
 }
 
 #[derive(Debug)]
@@ -229,7 +347,7 @@ fn summarize_simple_loop(body: &[BfIr]) -> Option<LoopSummary> {
     })
 }
 
-fn recognize_distribute(body: &[BfIr]) -> Option<BfIr> {
+fn recognize_affine_loop(body: &[BfIr]) -> Option<BfIr> {
     let summary = summarize_simple_loop(body)?;
 
     // Must return to source cell.
@@ -237,8 +355,17 @@ fn recognize_distribute(body: &[BfIr]) -> Option<BfIr> {
         return None;
     }
 
-    // Must consume exactly one unit of the source per iteration.
     let src_delta = *summary.deltas.get(&0).unwrap_or(&0);
+
+    // We only summarize loops that monotonically consume the source cell.
+    if src_delta >= 0 {
+        return None;
+    }
+
+    // To preserve exact BF semantics with closed-form replacement, the loop must
+    // consume the source cell in a way that reaches zero exactly for all starting
+    // values under the current abstract machine model. With integer cells, that is
+    // only guaranteed for a unit decrement countdown loop.
     if src_delta != -1 {
         return None;
     }
@@ -253,7 +380,6 @@ fn recognize_distribute(body: &[BfIr]) -> Option<BfIr> {
         }
     }
 
-    // If there are no targets, that's just a clear loop.
     if targets.is_empty() {
         return Some(BfIr::Clear);
     }
@@ -262,49 +388,91 @@ fn recognize_distribute(body: &[BfIr]) -> Option<BfIr> {
 }
 
 pub fn format_ir(program: &[BfIr]) -> String {
-    fn fmt_block(nodes: &[BfIr], indent: usize, out: &mut String) {
-        let pad = " ".repeat(indent);
-        for node in nodes {
-            match node {
-                BfIr::MovePtr(n) => {
-                    out.push_str(&format!("{pad}MovePtr({n})\n"));
+    enum FormatFrame<'a> {
+        Seq {
+            nodes: &'a [BfIr],
+            index: usize,
+            indent: usize,
+        },
+        CloseLoop {
+            indent: usize,
+        },
+    }
+
+    let mut out = String::new();
+    let mut stack = vec![FormatFrame::Seq {
+        nodes: program,
+        index: 0,
+        indent: 0,
+    }];
+
+    while let Some(frame) = stack.pop() {
+        match frame {
+            FormatFrame::Seq {
+                nodes,
+                mut index,
+                indent,
+            } => {
+                if index >= nodes.len() {
+                    continue;
                 }
-                BfIr::Add(n) => {
-                    out.push_str(&format!("{pad}Add({n})\n"));
+
+                let pad = indent_spaces(indent);
+                let node = &nodes[index];
+                index += 1;
+
+                stack.push(FormatFrame::Seq {
+                    nodes,
+                    index,
+                    indent,
+                });
+
+                match node {
+                    BfIr::MovePtr(n) => {
+                        out.push_str(&format!("{pad}MovePtr({n})\n"));
+                    }
+                    BfIr::Add(n) => {
+                        out.push_str(&format!("{pad}Add({n})\n"));
+                    }
+                    BfIr::Input => {
+                        out.push_str(&format!("{pad}Input\n"));
+                    }
+                    BfIr::Output => {
+                        out.push_str(&format!("{pad}Output\n"));
+                    }
+                    BfIr::Clear => {
+                        out.push_str(&format!("{pad}Clear\n"));
+                    }
+                    BfIr::Distribute { targets } => {
+                        out.push_str(&format!("{pad}Distribute {{ targets: {:?} }}\n", targets));
+                    }
+                    BfIr::Diverge => {
+                        out.push_str(&format!("{pad}Diverge\n"));
+                    }
+                    BfIr::Loop(body) => {
+                        out.push_str(&format!("{pad}Loop {{\n"));
+                        stack.push(FormatFrame::CloseLoop { indent });
+                        stack.push(FormatFrame::Seq {
+                            nodes: body,
+                            index: 0,
+                            indent: indent + 2,
+                        });
+                    }
                 }
-                BfIr::Input => {
-                    out.push_str(&format!("{pad}Input\n"));
-                }
-                BfIr::Output => {
-                    out.push_str(&format!("{pad}Output\n"));
-                }
-                BfIr::Clear => {
-                    out.push_str(&format!("{pad}Clear\n"));
-                }
-                BfIr::Distribute { targets } => {
-                    out.push_str(&format!("{pad}Distribute {{ targets: {:?} }}\n", targets));
-                }
-                BfIr::Loop(body) => {
-                    out.push_str(&format!("{pad}Loop {{\n"));
-                    fmt_block(body, indent + 2, out);
-                    out.push_str(&format!("{pad}}}\n"));
-                }
+            }
+            FormatFrame::CloseLoop { indent } => {
+                let pad = indent_spaces(indent);
+                out.push_str(&format!("{pad}}}\n"));
             }
         }
     }
 
-    let mut s = String::new();
-    fmt_block(program, 0, &mut s);
-    s
+    out
 }
 
 pub fn emit_c(program: &[BfIr], opts: CodegenOpts) -> String {
-    fn indent(level: usize) -> String {
-        "    ".repeat(level)
-    }
-
     fn push_line(out: &mut String, level: usize, line: &str) {
-        out.push_str(&indent(level));
+        out.push_str(&indent_levels(level));
         out.push_str(line);
         out.push('\n');
     }
@@ -341,163 +509,187 @@ pub fn emit_c(program: &[BfIr], opts: CodegenOpts) -> String {
         )
     }
 
-    fn emit_block(nodes: &[BfIr], level: usize, out: &mut String, opts: CodegenOpts) {
-        for node in nodes {
-            match node {
-                BfIr::MovePtr(n) => {
-                    if *n != 0 {
-                        push_line(out, level, &format!("ptr = {};", wrap_ptr_expr(*n)));
+    enum EmitFrame<'a> {
+        Seq {
+            nodes: &'a [BfIr],
+            index: usize,
+            level: usize,
+        },
+        CloseLoop {
+            level: usize,
+        },
+    }
+
+    fn emit_ir_stack(out: &mut String, program: &[BfIr], opts: CodegenOpts) {
+        let mut stack = vec![EmitFrame::Seq {
+            nodes: program,
+            index: 0,
+            level: 1,
+        }];
+
+        while let Some(frame) = stack.pop() {
+            match frame {
+                EmitFrame::Seq {
+                    nodes,
+                    mut index,
+                    level,
+                } => {
+                    if index >= nodes.len() {
+                        continue;
+                    }
+
+                    let node = &nodes[index];
+                    index += 1;
+                    stack.push(EmitFrame::Seq {
+                        nodes,
+                        index,
+                        level,
+                    });
+
+                    match node {
+                        BfIr::MovePtr(n) => {
+                            if *n != 0 {
+                                push_line(out, level, &format!("ptr = {};", wrap_ptr_expr(*n)));
+                            }
+                        }
+                        BfIr::Add(n) => {
+                            if *n > 0 {
+                                push_line(
+                                    out,
+                                    level,
+                                    &format!("tape[ptr] = {};", add_expr(*n as u64)),
+                                );
+                            } else if *n < 0 {
+                                let amount = (-(*n as i64)) as u64;
+                                push_line(
+                                    out,
+                                    level,
+                                    &format!("tape[ptr] = {};", sub_expr(amount)),
+                                );
+                            }
+                        }
+                        BfIr::Input => match opts.io_mode {
+                            IoMode::Char => {
+                                push_line(
+                                    out,
+                                    level,
+                                    "{ int ch = getchar(); tape[ptr] = (ch == EOF) ? 0 : (BF_SIGNED_CELLS ? bf_wrap_from_u64_signed(((uint64_t)(uint8_t)ch) & BF_INPUT_MASK, BF_CELL_BITS) : bf_wrap_from_u64_unsigned(((uint64_t)(uint8_t)ch) & BF_INPUT_MASK, BF_CELL_BITS)); }",
+                                );
+                            }
+                            IoMode::Number => match opts.cell_sign {
+                                CellSign::Signed => {
+                                    push_line(
+                                        out,
+                                        level,
+                                        "{ int64_t tmp = 0; if (scanf(\"%\" SCNd64, &tmp) != 1) tmp = 0; tape[ptr] = bf_wrap_from_u64_signed(((uint64_t)tmp) & BF_INPUT_MASK, BF_CELL_BITS); }",
+                                    );
+                                }
+                                CellSign::Unsigned => {
+                                    push_line(
+                                        out,
+                                        level,
+                                        "{ uint64_t tmp = 0; if (scanf(\"%\" SCNu64, &tmp) != 1) tmp = 0; tape[ptr] = bf_wrap_from_u64_unsigned(tmp & BF_INPUT_MASK, BF_CELL_BITS); }",
+                                    );
+                                }
+                            },
+                        },
+                        BfIr::Output => match opts.io_mode {
+                            IoMode::Char => {
+                                push_line(
+                                    out,
+                                    level,
+                                    "putchar((unsigned char)(((uint64_t)tape[ptr]) & BF_OUTPUT_MASK));",
+                                );
+                                push_line(out, level, "fflush(stdout);");
+                            }
+                            IoMode::Number => {
+                                let line = match opts.cell_sign {
+                                    CellSign::Signed => {
+                                        "printf(\"%\" PRId64 \"\\n\", bf_wrap_from_u64_signed(((uint64_t)tape[ptr]) & BF_OUTPUT_MASK, BF_CELL_BITS));"
+                                    }
+                                    CellSign::Unsigned => {
+                                        "printf(\"%\" PRIu64 \"\\n\", (uint64_t)(((uint64_t)tape[ptr]) & BF_OUTPUT_MASK));"
+                                    }
+                                };
+                                push_line(out, level, line);
+                                push_line(out, level, "fflush(stdout);");
+                            }
+                        },
+                        BfIr::Loop(body) => {
+                            push_line(out, level, "while (tape[ptr] != 0) {");
+                            stack.push(EmitFrame::CloseLoop { level });
+                            stack.push(EmitFrame::Seq {
+                                nodes: body,
+                                index: 0,
+                                level: level + 1,
+                            });
+                        }
+                        BfIr::Clear => {
+                            push_line(out, level, "tape[ptr] = 0;");
+                        }
+                        BfIr::Distribute { targets } => {
+                            push_line(out, level, "{");
+                            push_line(out, level + 1, "int64_t v = tape[ptr];");
+                            for (offset, coeff) in targets {
+                                if *coeff > 0 {
+                                    push_line(
+                                        out,
+                                        level + 1,
+                                        &format!(
+                                            "{};",
+                                            distribute_add_expr(*offset, *coeff as u64)
+                                        ),
+                                    );
+                                } else if *coeff < 0 {
+                                    let amount = (-(*coeff as i64)) as u64;
+                                    push_line(
+                                        out,
+                                        level + 1,
+                                        &format!("{};", distribute_sub_expr(*offset, amount)),
+                                    );
+                                }
+                            }
+                            push_line(out, level + 1, "tape[ptr] = 0;");
+                            push_line(out, level, "}");
+                        }
+                        BfIr::Diverge => {
+                            push_line(out, level, "bf_diverge_forever();");
+                        }
                     }
                 }
-                BfIr::Add(n) => {
-                    if *n > 0 {
-                        push_line(out, level, &format!("tape[ptr] = {};", add_expr(*n as u64)));
-                    } else if *n < 0 {
-                        let amount = (-(*n as i64)) as u64;
-                        push_line(out, level, &format!("tape[ptr] = {};", sub_expr(amount)));
-                    }
-                }
-                BfIr::Input => match opts.io_mode {
-                    IoMode::Char => {
-                        push_line(
-                            out,
-                            level,
-                            "{ int ch = getchar(); tape[ptr] = (ch == EOF) ? 0 : (BF_SIGNED_CELLS ? bf_wrap_from_u64_signed(((uint64_t)(uint8_t)ch) & BF_INPUT_MASK, BF_CELL_BITS) : bf_wrap_from_u64_unsigned(((uint64_t)(uint8_t)ch) & BF_INPUT_MASK, BF_CELL_BITS)); }",
-                        );
-                    }
-                    IoMode::Number => match opts.cell_sign {
-                        CellSign::Signed => {
-                            push_line(
-                                out,
-                                level,
-                                "{ int64_t tmp = 0; if (scanf(\"%\" SCNd64, &tmp) != 1) tmp = 0; tape[ptr] = bf_wrap_from_u64_signed(((uint64_t)tmp) & BF_INPUT_MASK, BF_CELL_BITS); }",
-                            );
-                        }
-                        CellSign::Unsigned => {
-                            push_line(
-                                out,
-                                level,
-                                "{ uint64_t tmp = 0; if (scanf(\"%\" SCNu64, &tmp) != 1) tmp = 0; tape[ptr] = bf_wrap_from_u64_unsigned(tmp & BF_INPUT_MASK, BF_CELL_BITS); }",
-                            );
-                        }
-                    },
-                },
-                BfIr::Output => match opts.io_mode {
-                    IoMode::Char => {
-                        push_line(
-                            out,
-                            level,
-                            "putchar((unsigned char)(((uint64_t)tape[ptr]) & BF_OUTPUT_MASK));",
-                        );
-                        push_line(out, level, "fflush(stdout);");
-                    }
-                    IoMode::Number => {
-                        let line = match opts.cell_sign {
-                            CellSign::Signed => {
-                                "printf(\"%\" PRId64 \"\\n\", bf_wrap_from_u64_signed(((uint64_t)tape[ptr]) & BF_OUTPUT_MASK, BF_CELL_BITS));"
-                            }
-                            CellSign::Unsigned => {
-                                "printf(\"%\" PRIu64 \"\\n\", (uint64_t)(((uint64_t)tape[ptr]) & BF_OUTPUT_MASK));"
-                            }
-                        };
-                        push_line(out, level, line);
-                        push_line(out, level, "fflush(stdout);");
-                    }
-                },
-                BfIr::Loop(body) => {
-                    push_line(out, level, "while (tape[ptr] != 0) {");
-                    emit_block(body, level + 1, out, opts);
+                EmitFrame::CloseLoop { level } => {
                     push_line(out, level, "}");
                 }
-                BfIr::Clear => {
-                    push_line(out, level, "tape[ptr] = 0;");
-                }
-                BfIr::Distribute { targets } => {
-                    push_line(out, level, "{");
-                    push_line(out, level + 1, "int64_t v = tape[ptr];");
-                    for (offset, coeff) in targets {
-                        if *coeff > 0 {
-                            push_line(
-                                out,
-                                level + 1,
-                                &format!("{};", distribute_add_expr(*offset, *coeff as u64)),
-                            );
-                        } else if *coeff < 0 {
-                            let amount = (-(*coeff as i64)) as u64;
-                            push_line(
-                                out,
-                                level + 1,
-                                &format!("{};", distribute_sub_expr(*offset, amount)),
-                            );
-                        }
-                    }
-                    push_line(out, level + 1, "tape[ptr] = 0;");
-                    push_line(out, level, "}");
-                }
             }
         }
     }
 
-    // --- Compute usage booleans directly ---
-    fn block_uses_ptr_wrap(nodes: &[BfIr]) -> bool {
-        for node in nodes {
-            match node {
-                BfIr::MovePtr(n) => {
-                    if *n != 0 {
-                        return true;
-                    }
+    // --- Compute usage booleans with a generic walker ---
+    fn any_ir(nodes: &[BfIr], pred: &impl Fn(&BfIr) -> bool) -> bool {
+        let mut stack: Vec<&[BfIr]> = vec![nodes];
+
+        while let Some(seq) = stack.pop() {
+            for node in seq {
+                if pred(node) {
+                    return true;
                 }
-                BfIr::Loop(body) => {
-                    if block_uses_ptr_wrap(body) {
-                        return true;
-                    }
+                if let BfIr::Loop(body) = node {
+                    stack.push(body);
                 }
-                BfIr::Distribute { targets } => {
-                    if targets.iter().any(|(off, _)| *off != 0) {
-                        return true;
-                    }
-                }
-                _ => {}
             }
         }
+
         false
     }
 
-    fn block_uses_input(nodes: &[BfIr]) -> bool {
-        for node in nodes {
-            match node {
-                BfIr::Input => return true,
-                BfIr::Loop(body) => {
-                    if block_uses_input(body) {
-                        return true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-
-    fn block_uses_cell_mask(nodes: &[BfIr], opts: CodegenOpts) -> bool {
-        if matches!(opts.io_mode, IoMode::Number) {
-            for node in nodes {
-                match node {
-                    BfIr::Input | BfIr::Output => return true,
-                    BfIr::Loop(body) => {
-                        if block_uses_cell_mask(body, opts) {
-                            return true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        false
-    }
-
-    let needs_ptr_wrap = block_uses_ptr_wrap(program);
-    let needs_input = block_uses_input(program);
-    let needs_cell_mask = block_uses_cell_mask(program, opts);
+    let needs_ptr_wrap = any_ir(program, &|node| match node {
+        BfIr::MovePtr(n) => *n != 0,
+        BfIr::Distribute { targets } => targets.iter().any(|(off, _)| *off != 0),
+        _ => false,
+    });
+    let needs_input = any_ir(program, &|node| matches!(node, BfIr::Input));
+    let needs_cell_mask = matches!(opts.io_mode, IoMode::Number)
+        && any_ir(program, &|node| matches!(node, BfIr::Input | BfIr::Output));
 
     let mut out = String::new();
     out.push_str(
@@ -589,6 +781,12 @@ static int64_t bf_wrap_mul_i64_unsigned(int64_t a, int64_t b, unsigned bits) {\n
     }\n\
     return bf_wrap_from_u64_unsigned(out, bits);\n\
 }\n\
+static _Noreturn void bf_diverge_forever(void) {\n\
+    static volatile int bf_diverge_sink = 0;\n\
+    for (;;) {\n\
+        bf_diverge_sink = 1;\n\
+    }\n\
+}\n\
 ",
     );
 
@@ -666,7 +864,7 @@ static int64_t bf_wrap_mul_i64_unsigned(int64_t a, int64_t b, unsigned bits) {\n
     );
     push_line(&mut out, 1, "ptrdiff_t ptr = 0;");
     out.push('\n');
-    emit_block(program, 1, &mut out, opts);
+    emit_ir_stack(&mut out, program, opts);
     out.push_str("\n    return 0;\n");
     out.push_str("}\n");
     out
@@ -833,10 +1031,10 @@ pub fn main() {
         }
     };
 
-    let optimized = optimize(parsed.clone());
-
     match mode {
         OutputMode::DumpIr => {
+            let optimized = optimize_sequence(parsed.clone());
+
             println!("=== Parsed IR ===");
             print!("{}", format_ir(&parsed));
 
@@ -844,6 +1042,7 @@ pub fn main() {
             print!("{}", format_ir(&optimized));
         }
         OutputMode::EmitC => {
+            let optimized = optimize_sequence(parsed);
             print!("{}", emit_c(&optimized, codegen_opts));
         }
     }
@@ -855,7 +1054,7 @@ mod tests {
 
     fn parse_and_opt(src: &str) -> Vec<BfIr> {
         let parsed = Parser::new(src).parse().unwrap();
-        optimize(parsed)
+        optimize_sequence(parsed)
     }
 
     fn parse_only(src: &str) -> Vec<BfIr> {
@@ -1037,6 +1236,47 @@ mod tests {
     }
 
     #[test]
+    fn affine_loop_with_extra_balanced_motion_still_becomes_distribute() {
+        let ir = parse_and_opt("[->+>+<+<]");
+        assert_eq!(
+            ir,
+            vec![BfIr::Distribute {
+                targets: vec![(1, 2), (2, 1)]
+            }]
+        );
+    }
+
+    #[test]
+    fn affine_loop_with_net_nonzero_pointer_is_not_summarized() {
+        let ir = parse_and_opt("[->+>+<]");
+        assert_eq!(
+            ir,
+            vec![BfIr::Loop(vec![
+                BfIr::Add(-1),
+                BfIr::MovePtr(1),
+                BfIr::Add(1),
+                BfIr::MovePtr(1),
+                BfIr::Add(1),
+                BfIr::MovePtr(-1),
+            ])]
+        );
+    }
+
+    #[test]
+    fn affine_loop_with_non_unit_source_delta_is_not_summarized() {
+        let ir = parse_and_opt("[--->+<]");
+        assert_eq!(
+            ir,
+            vec![BfIr::Loop(vec![
+                BfIr::Add(-3),
+                BfIr::MovePtr(1),
+                BfIr::Add(1),
+                BfIr::MovePtr(-1),
+            ])]
+        );
+    }
+
+    #[test]
     fn keeps_general_loops() {
         let ir = parse_and_opt("[->+<+]");
         assert_eq!(
@@ -1054,7 +1294,7 @@ mod tests {
     #[test]
     fn nested_optimization() {
         let ir = parse_and_opt("[[-]]");
-        assert_eq!(ir, vec![BfIr::Loop(vec![BfIr::Clear])]);
+        assert_eq!(ir, vec![BfIr::Clear]);
     }
 
     #[test]
@@ -1203,5 +1443,101 @@ mod tests {
         assert!(c.contains(
             "printf(\"%\" PRIu64 \"\\n\", (uint64_t)(((uint64_t)tape[ptr]) & BF_OUTPUT_MASK));"
         ));
+    }
+
+    #[test]
+    fn emit_c_for_diverge() {
+        let c = parse_opt_and_emit_c("[]");
+        assert!(c.contains("static _Noreturn void bf_diverge_forever(void) {"));
+        assert!(c.contains("volatile int bf_diverge_sink"));
+        assert!(c.contains("bf_diverge_forever();"));
+    }
+
+    #[test]
+    fn empty_loop_becomes_diverge() {
+        let ir = parse_and_opt("[]");
+        assert_eq!(ir, vec![BfIr::Diverge]);
+    }
+
+    #[test]
+    fn nested_empty_loops_become_diverge_at_all_tested_depths() {
+        for src in ["[[]]", "[[[]]]", "[[[[]]]]"] {
+            let ir = parse_and_opt(src);
+            assert_eq!(ir, vec![BfIr::Diverge], "failed for {src}");
+        }
+    }
+
+    #[test]
+    fn outer_loop_over_distribute_becomes_distribute() {
+        let ir = parse_and_opt("[[->+<]]");
+        assert_eq!(
+            ir,
+            vec![BfIr::Distribute {
+                targets: vec![(1, 1)]
+            }]
+        );
+    }
+
+    #[test]
+    fn dead_suffix_after_diverge_is_removed() {
+        let ir = parse_and_opt("[]+++");
+        assert_eq!(ir, vec![BfIr::Diverge]);
+    }
+
+    #[test]
+    fn one_shot_wrapper_with_final_clear_is_flattened() {
+        let ir = parse_and_opt("[>[-]]");
+        assert_eq!(ir, vec![BfIr::MovePtr(1), BfIr::Clear]);
+    }
+
+    #[test]
+    fn one_shot_wrapper_with_prefix_and_final_clear_is_flattened() {
+        let ir = parse_and_opt("[>+<[-]]");
+        assert_eq!(
+            ir,
+            vec![
+                BfIr::MovePtr(1),
+                BfIr::Add(1),
+                BfIr::MovePtr(-1),
+                BfIr::Clear,
+            ]
+        );
+    }
+
+    #[test]
+    fn one_shot_wrapper_with_suffix_after_clear_is_flattened() {
+        let ir = parse_and_opt("[[-]>+<]");
+        assert_eq!(
+            ir,
+            vec![
+                BfIr::Clear,
+                BfIr::MovePtr(1),
+                BfIr::Add(1),
+                BfIr::MovePtr(-1),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_shot_wrapper_with_diverging_body_is_flattened() {
+        let ir = parse_and_opt("[+[]]");
+        assert_eq!(ir, vec![BfIr::Add(1), BfIr::Diverge]);
+    }
+
+    #[test]
+    fn repeated_wrapper_canonicalization_reaches_clear_fixed_point() {
+        let ir = parse_and_opt("[[[-]]]");
+        assert_eq!(ir, vec![BfIr::Clear]);
+    }
+
+    #[test]
+    fn repeated_wrapper_canonicalization_reaches_distribute_fixed_point() {
+        let ir = parse_and_opt("[[[->+<]]]");
+        assert_eq!(
+            ir,
+            vec![BfIr::Distribute {
+                targets: vec![(1, 1)]
+            }]
+        );
     }
 }
