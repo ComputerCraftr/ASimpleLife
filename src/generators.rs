@@ -1,5 +1,11 @@
 use crate::bitgrid::{BitGrid, Cell, Coord};
 use crate::hashing::{SPLITMIX64_GAMMA, mix_seed};
+use crate::life_grid_format;
+
+pub fn pattern_from_file(path: &str) -> Option<BitGrid> {
+    let s = std::fs::read_to_string(path).ok()?;
+    life_grid_format::deserialize(&s).ok()
+}
 
 pub fn pattern_by_name(name: &str) -> Option<BitGrid> {
     let cells = match name {

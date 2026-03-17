@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::OnceLock;
 
-use bytemuck::must_cast;
 use crate::bitgrid::{BitGrid, Coord};
 use crate::cache_policy::{HASHLIFE_GC_MIN_NODES, should_run_active_hashlife_gc};
 use crate::flat_table::{FlatKey, FlatTable};
@@ -10,13 +9,14 @@ use crate::hashing::{
     hash_leaf_population, hash_packed_jump_fingerprint, hash_packed_node_fingerprint,
     hash_u64_words_with_level, hash_u64_words_with_level_batch, mix_seed,
 };
+#[cfg(test)]
+use crate::simd_layout::transpose_u64_words_9xn;
 use crate::simd_layout::{
     AlignedU32Batch, AlignedU64WordBatch4, AlignedU64WordBatch9, SIMD_BATCH_LANES,
     transpose_u64_lanes_9xn,
 };
-#[cfg(test)]
-use crate::simd_layout::transpose_u64_words_9xn;
 use crate::symmetry::D4Symmetry as Symmetry;
+use bytemuck::must_cast;
 use wide::u64x8;
 
 mod canonical;
@@ -27,6 +27,8 @@ mod scheduler;
 mod session;
 mod signature;
 mod simd;
+#[cfg(test)]
+mod test_probes;
 
 pub use session::HashLifeSession;
 pub use signature::{HashLifeCheckpoint, HashLifeCheckpointKey, HashLifeCheckpointSignature};
@@ -326,7 +328,15 @@ impl NodeColumns {
         self.levels.len()
     }
 
-    fn push(&mut self, level: u32, population: u64, nw: NodeId, ne: NodeId, sw: NodeId, se: NodeId) {
+    fn push(
+        &mut self,
+        level: u32,
+        population: u64,
+        nw: NodeId,
+        ne: NodeId,
+        sw: NodeId,
+        se: NodeId,
+    ) {
         self.levels.push(level);
         self.populations.push(population);
         self.nws.push(nw);
@@ -583,8 +593,13 @@ struct SimdProvisionalRecord {
 
 #[derive(Clone, Copy)]
 enum SimdProvisionalPayload {
-    Step0 { dispatch: Step0LaneDispatch },
-    Recursive { next_exp: u32, source_task_id: usize },
+    Step0 {
+        dispatch: Step0LaneDispatch,
+    },
+    Recursive {
+        next_exp: u32,
+        source_task_id: usize,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -980,7 +995,6 @@ impl HashLifeEngine {
         }
     }
 }
-
 
 fn max_hashlife_safe_jump(current: &BitGrid) -> u64 {
     let Some((min_x, min_y, max_x, max_y)) = current.bounds() else {

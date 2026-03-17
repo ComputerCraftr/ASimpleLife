@@ -189,7 +189,10 @@ fn validate(config: Config) -> Result<Config, CliAction> {
     if config.pattern.trim().is_empty() {
         return Err(CliAction::Error("--pattern must not be empty".to_string()));
     }
-    if config.pattern != "random" && pattern_by_name(&config.pattern).is_none() {
+    if config.pattern != "random"
+        && pattern_by_name(&config.pattern).is_none()
+        && !std::path::Path::new(&config.pattern).exists()
+    {
         return Err(CliAction::Error(format!(
             "unknown pattern: {}",
             config.pattern

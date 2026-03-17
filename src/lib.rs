@@ -11,6 +11,7 @@ pub mod generators;
 pub(crate) mod hashing;
 pub mod hashlife;
 pub mod life;
+pub mod life_grid_format;
 pub mod memo;
 pub mod normalize;
 pub mod oracle;
