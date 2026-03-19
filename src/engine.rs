@@ -162,6 +162,11 @@ impl SimulationSession {
             .sample_region(min_x, min_y, max_x, max_y)
     }
 
+    pub(crate) fn record_hashlife_oracle_confirmation_materialization(&mut self) {
+        self.hashlife_session
+            .record_oracle_confirmation_materialization();
+    }
+
     pub fn advance_simd_chunk_exact(
         &mut self,
         grid: &BitGrid,

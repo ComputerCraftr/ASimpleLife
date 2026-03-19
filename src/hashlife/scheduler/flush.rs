@@ -163,20 +163,7 @@ impl HashLifeEngine {
         if active == 0 {
             return;
         }
-        let mut lanes = [Phase1CommitLane {
-            provisional: SimdProvisionalRecord {
-                cache_key: CanonicalJumpKey::empty(),
-                level: 0,
-                inputs: SimdProvisionalInputs::Nine {
-                    nodes: [0; 9],
-                    populations: [0; 9],
-                },
-                payload: SimdProvisionalPayload::PhaseTwo,
-            },
-            task_id: 0,
-            next_exp: 0,
-            next_children: [0; 4],
-        }; SIMD_BATCH_LANES];
+        let mut lanes = Vec::with_capacity(active);
         let mut intents = [[None; SIMD_BATCH_LANES]; 4];
         for lane in 0..active {
             let provisional = provisional_candidates[lane];
@@ -188,9 +175,12 @@ impl HashLifeEngine {
             else {
                 unreachable!("phase1 provisional records must use recursive payload");
             };
-            lanes[lane].provisional = provisional;
-            lanes[lane].task_id = task_id;
-            lanes[lane].next_exp = next_exp;
+            lanes.push(Phase1CommitLane {
+                provisional,
+                task_id,
+                next_exp,
+                next_children: [0; 4],
+            });
             let level = provisional.level;
             let centered = match provisional.inputs {
                 SimdProvisionalInputs::Nine { nodes, .. } => nodes,
@@ -292,25 +282,18 @@ impl HashLifeEngine {
         if active == 0 {
             return;
         }
-        let mut lanes = [Phase2CommitLane {
-            key: CanonicalJumpKey::empty(),
-            intent: None,
-            fallback: 0,
-            result: 0,
-        }; SIMD_BATCH_LANES];
-        for lane in 0..active {
-            let provisional = provisional_candidates[lane];
-            let lane_result = batch_result.lanes[lane];
-            lanes[lane].key = provisional.cache_key;
-            lanes[lane].fallback = self.empty(provisional.level - 1);
+        let mut lanes = Vec::with_capacity(active);
+        let mut intents = [None; SIMD_BATCH_LANES];
+        for (lane, provisional) in provisional_candidates.iter().enumerate() {
+            let fallback = self.empty(provisional.level - 1);
             let input_nodes = match provisional.inputs {
                 SimdProvisionalInputs::Four { nodes, .. } => nodes,
                 SimdProvisionalInputs::Nine { .. } => {
                     unreachable!("phase2 provisional records must carry 4-node inputs")
                 }
             };
-            if lane_result.output_nonzero_mask != 0 {
-                lanes[lane].intent = Some(JoinIntent {
+            let intent = if batch_result.lanes[lane].output_nonzero_mask != 0 {
+                Some(JoinIntent {
                     level: provisional.level - 1,
                     children: [
                         input_nodes[0],
@@ -318,27 +301,63 @@ impl HashLifeEngine {
                         input_nodes[2],
                         input_nodes[3],
                     ],
-                });
-            }
+                })
+            } else {
+                None
+            };
+            intents[lane] = intent;
+            lanes.push(Phase2CommitLane {
+                key: provisional.cache_key,
+                fallback,
+                result: 0,
+                unique_input_index: usize::MAX,
+                packed_input: PackedSymmetryKey {
+                    packed: PackedNodeKey::new(0, [0; 4]),
+                    symmetry: Symmetry::Identity,
+                },
+                canonical_entry: PackedSymmetryKey {
+                    packed: PackedNodeKey::new(0, [0; 4]),
+                    symmetry: Symmetry::Identity,
+                },
+            });
         }
-        let intents = lanes.map(|lane| lane.intent);
         let resolved = self.resolve_join_intents_staged(intents);
-        let mut keys = [CanonicalJumpKey::empty(); SIMD_BATCH_LANES];
-        let mut results = [0_u64; SIMD_BATCH_LANES];
-        for (lane, _provisional) in provisional_candidates.drain(..).enumerate() {
-            keys[lane] = lanes[lane].key;
-            lanes[lane].result = if let Some(resolved) = resolved[lane] {
+        for (lane, (lane_state, provisional)) in lanes
+            .iter_mut()
+            .zip(provisional_candidates.iter())
+            .enumerate()
+        {
+            match provisional.payload {
+                SimdProvisionalPayload::PhaseTwo => {}
+                SimdProvisionalPayload::PhaseOne { .. } | SimdProvisionalPayload::Step0 { .. } => {
+                    unreachable!("phase2 flush must only receive phase2 provisionals")
+                }
+            };
+            lane_state.result = if let Some(resolved) = resolved[lane] {
                 resolved
             } else {
                 self.stats.join_shortcut_avoided += 1;
-                lanes[lane].fallback
+                lane_state.fallback
             };
-            results[lane] = lanes[lane].result;
+            lane_state.packed_input = PackedSymmetryKey {
+                packed: self.node_columns.packed_key(lane_state.result),
+                symmetry: Symmetry::Identity,
+            };
             self.stats.scalar_commit_lanes += 1;
         }
-        self.insert_canonical_jump_results_batch(&keys, &results, active);
+        provisional_candidates.clear();
+        self.canonicalize_phase2_commit_lanes(&mut lanes);
         for lane in 0..active {
-            notify_dependents(&keys[lane], tasks, dependents, dependent_edges, ready);
+            let fingerprint = hash_packed_jump_fingerprint(
+                lanes[lane].key.structural.fingerprint(),
+                lanes[lane].key.step_exp,
+            );
+            self.jump_cache.insert_with_fingerprint(
+                lanes[lane].key,
+                fingerprint,
+                lanes[lane].canonical_entry,
+            );
+            notify_dependents(&lanes[lane].key, tasks, dependents, dependent_edges, ready);
         }
         self.stats.scheduler_ready_max = self.stats.scheduler_ready_max.max(ready.len());
     }

@@ -120,6 +120,8 @@ impl<'a> OracleSession<'a> {
 
     pub(super) fn ensure_sampled_grid(&mut self) -> &BitGrid {
         if self.grid.is_none() {
+            self.simulation
+                .record_hashlife_oracle_confirmation_materialization();
             self.grid = Some(
                 self.simulation
                     .sample_hashlife_state_grid(confirmation_full_grid_policy())

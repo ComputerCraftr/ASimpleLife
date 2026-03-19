@@ -1,6 +1,7 @@
 pub(crate) const HASHLIFE_GC_MIN_NODES: usize = 4_096;
 pub(crate) const HASHLIFE_GC_GROWTH_TRIGGER: usize = 1_024;
 pub(crate) const HASHLIFE_GC_MIN_RECLAIM: usize = 256;
+pub(crate) const HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER: usize = 131_072;
 
 pub(crate) const SIMD_TRANSITION_CACHE_LIMIT: usize = 262_144;
 pub(crate) const SIMD_CANONICALIZATION_CACHE_LIMIT: usize = 262_144;

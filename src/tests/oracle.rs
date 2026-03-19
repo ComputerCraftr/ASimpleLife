@@ -6,6 +6,9 @@ use crate::generators::{pattern_by_name, random_soup};
 use crate::hashlife::{GridExtractionError, GridExtractionPolicy, HashLifeSession};
 use crate::normalize::normalize;
 use crate::oracle::{OracleSession, OracleStateMetrics, OracleStepPlan};
+use crate::tests::hashlife_support::{
+    GEN_SPARSE_SESSION_COVERAGE, GEN_SPARSE_SESSION_REGRESSION,
+};
 
 #[test]
 fn hashlife_session_matches_one_shot_advance() {
@@ -358,8 +361,7 @@ fn rotate_180(grid: &crate::bitgrid::BitGrid) -> crate::bitgrid::BitGrid {
     crate::bitgrid::BitGrid::from_cells(&cells)
 }
 
-#[test]
-fn huge_sparse_hashlife_state_rejects_full_materialization_but_allows_viewport_sampling() {
+fn huge_sparse_glider_pair() -> crate::bitgrid::BitGrid {
     let glider = pattern_by_name("glider").unwrap();
     let mirrored = rotate_180(&glider);
     let mut cells = mirrored.live_cells();
@@ -369,11 +371,137 @@ fn huge_sparse_hashlife_state_rejects_full_materialization_but_allows_viewport_s
             .into_iter()
             .map(|(x, y)| (x + 256, y + 256)),
     );
-    let grid = crate::bitgrid::BitGrid::from_cells(&cells);
+    crate::bitgrid::BitGrid::from_cells(&cells)
+}
+
+fn huge_sparse_block_and_glider() -> crate::bitgrid::BitGrid {
+    let block = pattern_by_name("block").unwrap();
+    let glider = pattern_by_name("glider").unwrap();
+    let mut cells = block.live_cells();
+    cells.extend(
+        glider
+            .live_cells()
+            .into_iter()
+            .map(|(x, y)| (x + 512, y + 512)),
+    );
+    crate::bitgrid::BitGrid::from_cells(&cells)
+}
+
+fn narrow_live_region(
+    session: &mut SimulationSession,
+    bounds: (i64, i64, i64, i64),
+) -> ((i64, i64, i64, i64), crate::bitgrid::BitGrid) {
+    let mut region = bounds;
+    let mut viewport = session
+        .sample_hashlife_state_region(region.0, region.1, region.2, region.3)
+        .expect("full reported bounds should remain sampleable as a bounded region");
+    assert!(viewport.population() > 0);
+
+    while (region.2 - region.0) > 64 || (region.3 - region.1) > 64 {
+        let mid_x = region.0 + (region.2 - region.0) / 2;
+        let mid_y = region.1 + (region.3 - region.1) / 2;
+        let quadrants = [
+            (region.0, region.1, mid_x, mid_y),
+            (mid_x + 1, region.1, region.2, mid_y),
+            (region.0, mid_y + 1, mid_x, region.3),
+            (mid_x + 1, mid_y + 1, region.2, region.3),
+        ];
+        if let Some((next_region, next_viewport)) = quadrants.into_iter().find_map(|candidate| {
+            let sampled = session.sample_hashlife_state_region(
+                candidate.0,
+                candidate.1,
+                candidate.2,
+                candidate.3,
+            )?;
+            (sampled.population() > 0).then_some((candidate, sampled))
+        }) {
+            region = next_region;
+            viewport = next_viewport;
+        } else {
+            break;
+        }
+    }
+
+    (region, viewport)
+}
+
+#[test]
+fn huge_sparse_hashlife_root_advance_preserves_population_and_bounds() {
+    let grid = huge_sparse_glider_pair();
+    let generations = GEN_SPARSE_SESSION_COVERAGE;
+    let expected = crate::hashlife::HashLifeEngine::default().advance(&grid, generations);
 
     let mut session = SimulationSession::new();
     session.load_hashlife_state(&grid);
-    session.advance_hashlife_root(1_000_000);
+    session.advance_hashlife_root(generations);
+
+    assert_eq!(session.hashlife_population(), Some(expected.population() as u64));
+    assert_eq!(session.hashlife_bounds(), expected.bounds());
+}
+
+#[test]
+fn huge_sparse_block_and_glider_root_advance_matches_one_shot_advance() {
+    let grid = huge_sparse_block_and_glider();
+    let generations = GEN_SPARSE_SESSION_REGRESSION;
+    let expected = crate::hashlife::HashLifeEngine::default().advance(&grid, generations);
+
+    let mut session = SimulationSession::new();
+    session.load_hashlife_state(&grid);
+    session.advance_hashlife_root(generations);
+
+    assert_eq!(session.hashlife_population(), Some(expected.population() as u64));
+    assert_eq!(session.hashlife_bounds(), expected.bounds());
+}
+
+#[test]
+fn huge_sparse_block_and_glider_root_advance_does_not_materialize_full_grid() {
+    let grid = huge_sparse_block_and_glider();
+    let mut session = SimulationSession::new();
+    session.load_hashlife_state(&grid);
+
+    assert_eq!(session.hashlife_sample_materializations(), 0);
+    session.advance_hashlife_root(GEN_SPARSE_SESSION_REGRESSION);
+    assert_eq!(
+        session.hashlife_sample_materializations(),
+        0,
+        "root-native HashLife session advance should not materialize a full grid"
+    );
+}
+
+#[test]
+fn huge_sparse_block_and_glider_root_advance_matches_segment_prefixes() {
+    let grid = huge_sparse_block_and_glider();
+    let segments = [524_288_u64, 262_144, 131_072, 65_536, 16_384, 512, 64];
+    let mut session = SimulationSession::new();
+    let mut expected_engine = crate::hashlife::HashLifeEngine::default();
+    let mut expected = grid.clone();
+    let mut total = 0_u64;
+    session.load_hashlife_state(&grid);
+
+    for step in segments {
+        session.advance_hashlife_root(step);
+        total += step;
+        expected = expected_engine.advance(&expected, step);
+        assert_eq!(
+            session.hashlife_population(),
+            Some(expected.population() as u64),
+            "population mismatch after cumulative generations={total}"
+        );
+        assert_eq!(
+            session.hashlife_bounds(),
+            expected.bounds(),
+            "bounds mismatch after cumulative generations={total}"
+        );
+    }
+}
+
+#[test]
+fn huge_sparse_hashlife_state_rejects_full_materialization_but_allows_viewport_sampling() {
+    let grid = huge_sparse_block_and_glider();
+
+    let mut session = SimulationSession::new();
+    session.load_hashlife_state(&grid);
+    session.advance_hashlife_root(GEN_SPARSE_SESSION_REGRESSION);
 
     let full = session.sample_hashlife_state_grid(GridExtractionPolicy::FullGridIfUnder {
         max_population: 4,
@@ -389,20 +517,21 @@ fn huge_sparse_hashlife_state_rejects_full_materialization_but_allows_viewport_s
         ),
         "expected bounded full-grid extraction to fail for a huge sparse state, got {full:?}"
     );
-
-    let (min_x, min_y, _, _) = session
+    let bounds = session
         .hashlife_bounds()
-        .expect("huge sparse state should still report bounds");
+        .expect("advanced sparse state should still report bounds");
+    let (region, expected_viewport) = narrow_live_region(&mut session, bounds);
     let materializations_before_viewport = session.hashlife_sample_materializations();
+    let (first_min_x, first_min_y, first_max_x, first_max_y) = region;
     let viewport = session
-        .sample_hashlife_state_region(min_x - 8, min_y - 8, min_x + 32, min_y + 32)
-        .expect("visible viewport should still be sampleable");
-    assert!(viewport.population() > 0);
+        .sample_hashlife_state_region(first_min_x, first_min_y, first_max_x, first_max_y)
+        .expect("expected live bounded region should remain sampleable");
+    assert_eq!(normalize(&viewport).0, normalize(&expected_viewport).0);
     let materializations_after_first_viewport = session.hashlife_sample_materializations();
     let second_viewport = session
-        .sample_hashlife_state_region(min_x - 4, min_y - 4, min_x + 36, min_y + 36)
-        .expect("repeated bounded viewport sampling should remain possible");
-    assert!(second_viewport.population() > 0);
+        .sample_hashlife_state_region(first_min_x, first_min_y, first_max_x, first_max_y)
+        .expect("repeated bounded live-region sampling should remain possible");
+    assert_eq!(normalize(&second_viewport).0, normalize(&expected_viewport).0);
     assert!(
         session.hashlife_sample_materializations() <= materializations_before_viewport + 2,
         "bounded viewport sampling should stay cheap and avoid sticky full-grid retention after a rejected extraction"
@@ -414,7 +543,89 @@ fn huge_sparse_hashlife_state_rejects_full_materialization_but_allows_viewport_s
 }
 
 #[test]
-#[ignore = "can be enabled when optimized better"]
+fn huge_sparse_bounded_region_sampling_never_counts_as_full_grid_materialization() {
+    let grid = huge_sparse_block_and_glider();
+    let mut session = SimulationSession::new();
+    session.load_hashlife_state(&grid);
+    session.advance_hashlife_root(GEN_SPARSE_SESSION_REGRESSION);
+
+    let bounds = session
+        .hashlife_bounds()
+        .expect("advanced sparse state should still report bounds");
+    let (region, expected_viewport) = narrow_live_region(&mut session, bounds);
+    let materializations_before = session.hashlife_sample_materializations();
+    let viewport = session
+        .sample_hashlife_state_region(region.0, region.1, region.2, region.3)
+        .expect("expected live bounded region should remain sampleable");
+    assert_eq!(normalize(&viewport).0, normalize(&expected_viewport).0);
+    assert_eq!(
+        session.hashlife_sample_materializations(),
+        materializations_before,
+        "bounded region sampling must not be counted as full-grid materialization"
+    );
+}
+
+#[test]
+fn huge_sparse_failed_full_grid_extraction_counts_sampling_without_session_full_materialization() {
+    let grid = huge_sparse_block_and_glider();
+    let mut session = SimulationSession::new();
+    session.load_hashlife_state(&grid);
+    session.advance_hashlife_root(GEN_SPARSE_SESSION_REGRESSION);
+
+    let sample_materializations_before = session.hashlife_sample_materializations();
+    let full = session.sample_hashlife_state_grid(GridExtractionPolicy::FullGridIfUnder {
+        max_population: 4,
+        max_chunks: 1,
+        max_bounds_span: i64::MAX,
+    });
+
+    assert!(
+        matches!(
+            full,
+            Err(GridExtractionError::ChunkLimitExceeded { .. })
+                | Err(GridExtractionError::BoundsSpanLimitExceeded { .. })
+                | Err(GridExtractionError::PopulationLimitExceeded { .. })
+        ),
+        "expected bounded full-grid extraction to fail for a huge sparse state, got {full:?}"
+    );
+    assert_eq!(
+        session.hashlife_sample_materializations(),
+        sample_materializations_before + 1,
+        "failed full-grid extraction should count as exactly one sampling attempt"
+    );
+}
+
+#[test]
+fn huge_sparse_hashlife_bounded_viewport_matches_unrestricted_region_contents() {
+    let grid = huge_sparse_glider_pair();
+    let generations = GEN_SPARSE_SESSION_COVERAGE;
+
+    let mut session = SimulationSession::new();
+    session.load_hashlife_state(&grid);
+    session.advance_hashlife_root(generations);
+
+    let bounds = session
+        .hashlife_bounds()
+        .expect("huge sparse state should still report bounds");
+    let (region, viewport) = narrow_live_region(&mut session, bounds);
+    let unrestricted = session
+        .sample_hashlife_state_grid(GridExtractionPolicy::FullGridIfUnder {
+            max_population: u64::MAX,
+            max_chunks: usize::MAX,
+            max_bounds_span: i64::MAX,
+        })
+        .expect("unrestricted sparse extraction should succeed");
+    let expected_cells = unrestricted
+        .live_cells()
+        .into_iter()
+        .filter(|(x, y)| *x >= region.0 && *x <= region.2 && *y >= region.1 && *y <= region.3)
+        .collect::<Vec<_>>();
+    let expected = crate::bitgrid::BitGrid::from_cells(&expected_cells);
+
+    assert_eq!(normalize(&viewport).0, normalize(&expected).0);
+}
+
+#[test]
 fn random_seed_420_billion_target_runtime_classification_avoids_full_materialization() {
     let config = Config {
         pattern: "random".to_string(),
@@ -430,14 +641,38 @@ fn random_seed_420_billion_target_runtime_classification_avoids_full_materializa
     };
     let grid = initial_grid(&config);
     let mut simulation = SimulationSession::new();
+    let mut planned_steps = Vec::new();
+    let mut observed_metrics = Vec::new();
+    let mut callback = |plan: OracleStepPlan, metrics: OracleStateMetrics| {
+        if plan.step_span > 0 {
+            planned_steps.push((plan.generation, plan.step_span, plan.backend));
+            observed_metrics.push(metrics);
+        }
+    };
     let outcome = OracleSession::new(grid, 0, Default::default(), &mut simulation)
-        .advance_runtime_target(1_000_000_000, None);
+        .advance_runtime_target(1_000_000_000, Some(&mut callback));
 
     assert_eq!(outcome.final_generation, 1_000_000_000);
     assert_eq!(
         simulation.hashlife_sample_materializations(),
         0,
         "runtime target classification should stay metadata-only for billion-generation sparse random states"
+    );
+    assert!(
+        !planned_steps.is_empty(),
+        "expected billion-generation runtime target to plan at least one step"
+    );
+    assert!(
+        planned_steps
+            .iter()
+            .any(|(_, step_span, backend)| matches!(backend, SimulationBackend::HashLife) && *step_span >= (1 << 20)),
+        "expected billion-generation runtime target to use at least one large HashLife jump, got {planned_steps:?}"
+    );
+    assert!(
+        observed_metrics
+            .iter()
+            .all(|metrics| metrics.population > 0 && metrics.bounds_span > 0),
+        "expected runtime-target callback metrics to stay metadata-only but still report live nonzero state, got {observed_metrics:?}"
     );
 }
 

@@ -1,9 +1,10 @@
 use std::collections::HashMap;
-use std::env;
 use std::sync::OnceLock;
-
 use crate::bitgrid::{BitGrid, Coord};
-use crate::cache_policy::{HASHLIFE_GC_MIN_NODES, should_run_active_hashlife_gc};
+use crate::cache_policy::{
+    HASHLIFE_GC_MIN_NODES, HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER,
+    should_run_active_hashlife_gc,
+};
 use crate::flat_table::{FlatKey, FlatTable};
 use crate::hashing::{
     hash_leaf_population, hash_packed_jump_fingerprint, hash_packed_node_fingerprint,
@@ -28,6 +29,7 @@ mod session;
 mod signature;
 mod simd;
 mod snapshot;
+mod stats;
 #[cfg(test)]
 mod test_probes;
 
@@ -37,6 +39,13 @@ pub use snapshot::{
     HashLifeSnapshotError, deserialize_to_grid as deserialize_snapshot_to_grid,
     serialize_grid as serialize_grid_snapshot,
 };
+pub use stats::{
+    HASHLIFE_CHECKPOINT_MAX_BOUNDS_SPAN, HASHLIFE_CHECKPOINT_MAX_POPULATION,
+    HASHLIFE_FULL_GRID_MAX_CHUNKS, HASHLIFE_FULL_GRID_MAX_POPULATION,
+};
+#[cfg(test)]
+pub(crate) use stats::{HashLifeDiagnosticSummary, HashLifeRuntimeStats};
+use stats::*;
 
 type NodeId = u64;
 type PackedTransformId = u32;
@@ -148,7 +157,7 @@ struct TransformCacheKey {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PackedTransformCacheKey {
+struct PackedSymmetryKey {
     packed: PackedNodeKey,
     symmetry: Symmetry,
 }
@@ -177,15 +186,30 @@ struct PackedTransformNode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PackedResultCacheEntry {
-    packed: PackedNodeKey,
-    symmetry: Symmetry,
+struct PackedTransformOrderEntry {
+    structural: CanonicalStructKey,
+    canonical_ref: CanonicalNodeRef,
+    order_fingerprint: u64,
+    order_children: [CanonicalNodeRef; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct OrientedPackedResultKey {
-    packed: PackedNodeKey,
+struct NodeSymmetryMetadata {
+    entries: [PackedTransformOrderEntry; 8],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirectCanonicalParentKey {
+    level: u32,
     symmetry: Symmetry,
+    children: [CanonicalNodeRef; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PackedCanonicalBatchKey {
+    level: u32,
+    symmetry: Symmetry,
+    children: [CanonicalNodeRef; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -272,9 +296,31 @@ impl FlatKey for TransformCacheKey {
     }
 }
 
-impl FlatKey for PackedTransformCacheKey {
+impl FlatKey for PackedSymmetryKey {
     fn fingerprint(&self) -> u64 {
         mix_seed(self.packed.fingerprint() ^ ((self.symmetry as u64) << 48))
+    }
+}
+
+impl FlatKey for DirectCanonicalParentKey {
+    fn fingerprint(&self) -> u64 {
+        let low = hash_u64_words_with_level(self.level, self.children.map(|child| child as u64));
+        let high = hash_u64_words_with_level(
+            self.level ^ 0x6D2B_79F5 ^ (self.symmetry as u32),
+            self.children.map(|child| (child >> 64) as u64),
+        );
+        mix_seed(low ^ high.rotate_left(11))
+    }
+}
+
+impl FlatKey for PackedCanonicalBatchKey {
+    fn fingerprint(&self) -> u64 {
+        let low = hash_u64_words_with_level(self.level, self.children.map(|child| child as u64));
+        let high = hash_u64_words_with_level(
+            self.level ^ 0x51ED_270B ^ (self.symmetry as u32),
+            self.children.map(|child| (child >> 64) as u64),
+        );
+        mix_seed(low ^ high.rotate_left(7) ^ ((self.symmetry as u64) << 48))
     }
 }
 
@@ -287,12 +333,6 @@ impl FlatKey for PackedTransformCompareKey {
 impl FlatKey for PackedTransformShapeKey {
     fn fingerprint(&self) -> u64 {
         hash_u64_words_with_level(self.level, self.children)
-    }
-}
-
-impl FlatKey for OrientedPackedResultKey {
-    fn fingerprint(&self) -> u64 {
-        mix_seed(self.packed.fingerprint() ^ ((self.symmetry as u64) << 48))
     }
 }
 
@@ -417,6 +457,7 @@ struct NodeColumns {
     sws: Vec<NodeId>,
     ses: Vec<NodeId>,
     fingerprints: Vec<u64>,
+    symmetry_metadata: Vec<NodeSymmetryMetadata>,
 }
 
 impl NodeColumns {
@@ -432,6 +473,7 @@ impl NodeColumns {
         ne: NodeId,
         sw: NodeId,
         se: NodeId,
+        symmetry_metadata: NodeSymmetryMetadata,
     ) {
         self.levels.push(level);
         self.populations.push(population);
@@ -444,6 +486,7 @@ impl NodeColumns {
         } else {
             hash_u64_words_with_level(level, [nw, ne, sw, se])
         });
+        self.symmetry_metadata.push(symmetry_metadata);
     }
 
     fn reserve(&mut self, additional: usize) {
@@ -454,6 +497,7 @@ impl NodeColumns {
         self.sws.reserve(additional);
         self.ses.reserve(additional);
         self.fingerprints.reserve(additional);
+        self.symmetry_metadata.reserve(additional);
     }
 
     fn level(&self, node: NodeId) -> u32 {
@@ -476,6 +520,10 @@ impl NodeColumns {
 
     fn fingerprint(&self, node: NodeId) -> u64 {
         self.fingerprints[node as usize]
+    }
+
+    fn symmetry_entry(&self, node: NodeId, symmetry: Symmetry) -> PackedTransformOrderEntry {
+        self.symmetry_metadata[node as usize].entries[symmetry as usize]
     }
 
     pub(super) fn packed_key(&self, node: NodeId) -> PackedNodeKey {
@@ -504,26 +552,37 @@ pub struct HashLifeEngine {
     node_columns: NodeColumns,
     intern: FlatTable<PackedNodeKey, NodeId>,
     empty_by_level: Vec<NodeId>,
-    jump_cache: FlatTable<CanonicalJumpKey, PackedResultCacheEntry>,
-    root_result_cache: FlatTable<CanonicalJumpKey, PackedResultCacheEntry>,
+    jump_cache: FlatTable<CanonicalJumpKey, PackedSymmetryKey>,
+    root_result_cache: FlatTable<CanonicalJumpKey, PackedSymmetryKey>,
     overlap_cache: FlatTable<CanonicalStructKey, [NodeId; 9]>,
     #[cfg(test)]
     transform_cache: FlatTable<TransformCacheKey, NodeId>,
-    canonical_transform_cache: FlatTable<PackedTransformCacheKey, PackedTransformId>,
-    oriented_result_cache: FlatTable<PackedTransformCacheKey, NodeId>,
+    canonical_transform_cache: FlatTable<PackedSymmetryKey, PackedTransformId>,
+    oriented_result_cache: FlatTable<PackedSymmetryKey, NodeId>,
     packed_transform_compare_cache: FlatTable<PackedTransformCompareKey, i8>,
     packed_transform_intern: FlatTable<PackedTransformShapeKey, PackedTransformId>,
     packed_transform_nodes: Vec<PackedTransformNode>,
     packed_transform_materialized: Vec<Option<NodeId>>,
     packed_transform_packed_roots: Vec<Option<PackedNodeKey>>,
     canonical_node_cache: FlatTable<NodeId, CanonicalNodeIdentity>,
+    canonical_packed_cache: FlatTable<PackedNodeKey, CanonicalNodeIdentity>,
+    hot_canonical_packed_cache: FlatTable<PackedNodeKey, CanonicalNodeIdentity>,
+    hot_canonical_packed_budget: usize,
+    canonical_oriented_cache: FlatTable<PackedSymmetryKey, CanonicalNodeIdentity>,
+    hot_canonical_oriented_cache: FlatTable<PackedSymmetryKey, CanonicalNodeIdentity>,
+    hot_canonical_oriented_budget: usize,
+    direct_parent_canonical_cache: FlatTable<DirectCanonicalParentKey, CanonicalNodeIdentity>,
+    hot_direct_parent_canonical_cache: FlatTable<DirectCanonicalParentKey, CanonicalNodeIdentity>,
+    hot_direct_parent_canonical_budget: usize,
+    structural_fast_path_cache: FlatTable<NodeId, CanonicalNodeIdentity>,
+    packed_structural_fast_path_cache: FlatTable<PackedNodeKey, CanonicalNodeIdentity>,
     embed_layout_cache: HashMap<EmbedLayoutCacheKey, Coord>,
     retained_roots: Vec<NodeId>,
     dead_leaf: NodeId,
     live_leaf: NodeId,
     last_gc_nodes: usize,
-    jump_symmetry_max_level: u32,
-    jump_symmetry_max_population: u64,
+    #[cfg(test)]
+    symmetry_gate_override: Option<(u32, u64)>,
     stats: HashLifeStats,
 }
 
@@ -537,375 +596,6 @@ struct EmbeddedJump {
     result_origin_x: Coord,
     result_origin_y: Coord,
 }
-
-#[derive(Clone, Copy, Debug, Default)]
-struct HashLifeStats {
-    jump_presence_avoids: usize,
-    jump_presence_misses: usize,
-    jump_result_cache_lookups: usize,
-    jump_result_cache_hits: usize,
-    symmetric_jump_result_cache_hits: usize,
-    root_result_cache_lookups: usize,
-    root_result_cache_hits: usize,
-    root_result_cache_misses: usize,
-    overlap_cache_hits: usize,
-    overlap_cache_misses: usize,
-    nodes_before_mark: usize,
-    nodes_after_mark: usize,
-    nodes_before_compact: usize,
-    nodes_after_compact: usize,
-    jump_cache_before_clear: usize,
-    gc_runs: usize,
-    gc_skips: usize,
-    gc_reason: &'static str,
-    builder_frames: usize,
-    builder_partitions: usize,
-    builder_max_stack: usize,
-    scheduler_tasks: usize,
-    scheduler_ready_max: usize,
-    simd_disabled_fast_exits: usize,
-    step0_simd_lanes: usize,
-    phase1_simd_lanes: usize,
-    phase2_simd_lanes: usize,
-    step0_simd_batches: usize,
-    phase1_simd_batches: usize,
-    phase2_simd_batches: usize,
-    step0_provisional_records: usize,
-    phase1_provisional_records: usize,
-    phase2_provisional_records: usize,
-    scalar_commit_lanes: usize,
-    join_shortcut_avoided: usize,
-    dependency_stalls: usize,
-    step0_ready_max: usize,
-    phase1_ready_max: usize,
-    phase2_ready_max: usize,
-    canonical_batch_lanes: usize,
-    canonical_batch_batches: usize,
-    overlap_prep_lanes: usize,
-    overlap_prep_batches: usize,
-    recursive_overlap_batch_lanes: usize,
-    recursive_overlap_batch_batches: usize,
-    overlap_local_reuse_lanes: usize,
-    cache_probe_batches: usize,
-    scheduler_probe_batches: usize,
-    symmetry_gate_allowed: usize,
-    symmetry_gate_blocked: usize,
-    canonical_node_cache_hits: usize,
-    canonical_node_cache_misses: usize,
-    jump_presence_probe_batches: usize,
-    jump_presence_probe_lanes: usize,
-    jump_presence_probe_hits: usize,
-    jump_batch_unique_queries: usize,
-    jump_batch_reused_queries: usize,
-    cached_fingerprint_probes: usize,
-    recomputed_fingerprint_probes: usize,
-    gc_mark_batches: usize,
-    gc_remap_batches: usize,
-    packed_d4_canonicalization_misses: usize,
-    packed_inverse_transform_hits: usize,
-    packed_recursive_transform_hits: usize,
-    packed_recursive_transform_misses: usize,
-    packed_overlap_outputs_produced: usize,
-    packed_cache_result_materializations: usize,
-    #[cfg(test)]
-    transformed_node_materializations: usize,
-}
-
-#[derive(Clone, Copy)]
-enum PendingTask {
-    PhaseOne {
-        next_exp: u32,
-        a: NodeId,
-        b: NodeId,
-        c: NodeId,
-        d: NodeId,
-        e: NodeId,
-        f: NodeId,
-        g: NodeId,
-        h: NodeId,
-        i: NodeId,
-    },
-    PhaseTwo {
-        next_exp: u32,
-        nw: NodeId,
-        ne: NodeId,
-        sw: NodeId,
-        se: NodeId,
-    },
-}
-
-#[derive(Clone, Copy)]
-struct TaskRecord {
-    remaining: u8,
-    task: PendingTask,
-}
-
-#[derive(Clone, Copy)]
-struct Step0TaskRecord {
-    remaining: u8,
-    children: [NodeId; 4],
-}
-
-#[derive(Clone, Copy)]
-struct RecursiveParentBatchRecord {
-    discovered: DiscoveredJumpTask,
-    next_exp: u32,
-    canonical_structural: CanonicalStructKey,
-    canonical_fingerprint: u64,
-    overlaps: [NodeId; 9],
-    unique_child_tasks: [DiscoveredJumpTask; 9],
-    unique_child_counts: [u8; 9],
-    unique_child_count: u8,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct DiscoveredJumpTask {
-    key: CanonicalJumpKey,
-    source_node: NodeId,
-    canonical_packed: PackedNodeKey,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Step0LaneDispatch {
-    SimdChild,
-}
-
-#[derive(Clone, Copy)]
-struct SimdProvisionalRecord {
-    cache_key: CanonicalJumpKey,
-    level: u32,
-    inputs: SimdProvisionalInputs,
-    payload: SimdProvisionalPayload,
-}
-
-#[derive(Clone, Copy)]
-struct Phase1ReadyLane {
-    task_id: usize,
-    key: CanonicalJumpKey,
-    next_exp: u32,
-    inputs: [NodeId; 9],
-}
-
-#[derive(Clone, Copy)]
-struct Phase2ReadyLane {
-    key: CanonicalJumpKey,
-    next_exp: u32,
-    inputs: [NodeId; 4],
-}
-
-#[derive(Clone, Copy)]
-struct Phase1CommitLane {
-    provisional: SimdProvisionalRecord,
-    task_id: usize,
-    next_exp: u32,
-    next_children: [NodeId; 4],
-}
-
-#[derive(Clone, Copy)]
-struct Phase2CommitLane {
-    key: CanonicalJumpKey,
-    intent: Option<JoinIntent>,
-    fallback: NodeId,
-    result: NodeId,
-}
-
-#[derive(Clone, Copy)]
-enum SimdProvisionalInputs {
-    Nine {
-        nodes: [NodeId; 9],
-        populations: [u64; 9],
-    },
-    Four {
-        nodes: [NodeId; 4],
-        populations: [u64; 4],
-    },
-}
-
-#[derive(Clone, Copy)]
-enum SimdProvisionalPayload {
-    Step0 {
-        dispatch: Step0LaneDispatch,
-    },
-    PhaseOne {
-        next_exp: u32,
-        source_task_id: usize,
-    },
-    PhaseTwo,
-}
-
-#[derive(Clone, Copy)]
-struct SimdPackedBatch {
-    active_lanes: usize,
-    active_mask: u8,
-    populations: [u64x8; 9],
-}
-
-#[derive(Clone, Copy)]
-struct SimdLaneResult {
-    output_nonzero_mask: u8,
-}
-
-struct SimdBatchResult {
-    lanes: [SimdLaneResult; SIMD_BATCH_LANES],
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct JoinIntent {
-    level: u32,
-    children: [NodeId; 4],
-}
-
-#[derive(Clone, Copy, Debug)]
-struct UniqueJumpQueryRecord {
-    query: JumpQuery,
-    cache_key: CanonicalJumpKey,
-    inverse_symmetry: Symmetry,
-    fingerprint: u64,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct UniqueOrientedResultRecord {
-    packed: PackedNodeKey,
-    symmetry: Symmetry,
-    node: NodeId,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct EmbeddedCell {
-    key: u128,
-}
-
-const NO_DEPENDENT: usize = usize::MAX;
-
-#[derive(Clone, Copy, Debug)]
-struct DependentEdge {
-    task_id: usize,
-    next: usize,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct HashLifeRuntimeStats {
-    pub nodes: usize,
-    pub intern: usize,
-    pub empty_levels: usize,
-    pub jump_cache: usize,
-    pub retained_roots: usize,
-    pub overlap_cache: usize,
-    pub jump_presence_avoids: usize,
-    pub jump_presence_misses: usize,
-    pub jump_result_cache_lookups: usize,
-    pub jump_result_cache_hits: usize,
-    pub symmetric_jump_result_cache_hits: usize,
-    pub root_result_cache_lookups: usize,
-    pub root_result_cache_hits: usize,
-    pub root_result_cache_misses: usize,
-    pub overlap_cache_hits: usize,
-    pub overlap_cache_misses: usize,
-    pub gc_runs: usize,
-    pub gc_skips: usize,
-    pub nodes_before_mark: usize,
-    pub nodes_after_mark: usize,
-    pub nodes_before_compact: usize,
-    pub nodes_after_compact: usize,
-    pub jump_cache_before_clear: usize,
-    pub gc_reason: &'static str,
-    pub builder_frames: usize,
-    pub builder_partitions: usize,
-    pub builder_max_stack: usize,
-    pub scheduler_tasks: usize,
-    pub scheduler_ready_max: usize,
-    pub simd_disabled_fast_exits: usize,
-    pub step0_simd_lanes: usize,
-    pub phase1_simd_lanes: usize,
-    pub phase2_simd_lanes: usize,
-    pub step0_simd_batches: usize,
-    pub phase1_simd_batches: usize,
-    pub phase2_simd_batches: usize,
-    pub step0_provisional_records: usize,
-    pub phase1_provisional_records: usize,
-    pub phase2_provisional_records: usize,
-    pub scalar_commit_lanes: usize,
-    pub join_shortcut_avoided: usize,
-    pub dependency_stalls: usize,
-    pub step0_ready_max: usize,
-    pub phase1_ready_max: usize,
-    pub phase2_ready_max: usize,
-    pub canonical_batch_lanes: usize,
-    pub canonical_batch_batches: usize,
-    pub overlap_prep_lanes: usize,
-    pub overlap_prep_batches: usize,
-    pub recursive_overlap_batch_lanes: usize,
-    pub recursive_overlap_batch_batches: usize,
-    pub overlap_local_reuse_lanes: usize,
-    pub cache_probe_batches: usize,
-    pub scheduler_probe_batches: usize,
-    pub symmetry_gate_allowed: usize,
-    pub symmetry_gate_blocked: usize,
-    pub canonical_node_cache_hits: usize,
-    pub canonical_node_cache_misses: usize,
-    pub jump_presence_probe_batches: usize,
-    pub jump_presence_probe_lanes: usize,
-    pub jump_presence_probe_hits: usize,
-    pub jump_batch_unique_queries: usize,
-    pub jump_batch_reused_queries: usize,
-    pub cached_fingerprint_probes: usize,
-    pub recomputed_fingerprint_probes: usize,
-    pub gc_mark_batches: usize,
-    pub gc_remap_batches: usize,
-    pub packed_d4_canonicalization_misses: usize,
-    pub packed_inverse_transform_hits: usize,
-    pub packed_recursive_transform_hits: usize,
-    pub packed_recursive_transform_misses: usize,
-    pub packed_overlap_outputs_produced: usize,
-    pub packed_cache_result_materializations: usize,
-    #[cfg(test)]
-    pub transformed_node_materializations: usize,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct HashLifeDiagnosticSummary {
-    pub total_nodes: usize,
-    pub retained_roots: usize,
-    pub nodes_match_intern: bool,
-    pub dependency_stalls: usize,
-    pub jump_result_hit_rate: f64,
-    pub root_result_hit_rate: f64,
-    pub jump_presence_hit_rate: f64,
-    pub overlap_hit_rate: f64,
-    pub overlap_local_reuse_rate: f64,
-    pub symmetry_gate_allow_rate: f64,
-    pub canonical_cache_hit_rate: f64,
-    pub symmetry_jump_result_hits: usize,
-    pub simd_lane_coverage: f64,
-    pub scalar_commit_ratio: f64,
-    pub probes_per_scheduler_task: f64,
-    pub recursive_overlap_batch_rate: f64,
-    pub gc_reclaim_ratio: f64,
-    pub gc_compact_ratio: f64,
-    pub gc_reason: &'static str,
-    pub gc_runs: usize,
-    pub gc_skips: usize,
-    pub packed_d4_canonicalization_misses: usize,
-    pub packed_inverse_transform_hits: usize,
-    pub packed_recursive_transform_hits: usize,
-    pub packed_recursive_transform_misses: usize,
-    pub packed_overlap_outputs_produced: usize,
-    pub packed_cache_result_materializations: usize,
-    #[cfg(test)]
-    pub transformed_node_materializations: usize,
-}
-
-const DISCOVER_BATCH: usize = 4;
-const JUMP_SYMMETRY_MAX_LEVEL: u32 = 8;
-const JUMP_SYMMETRY_MAX_POPULATION: u64 = 4_096;
-const HASHLIFE_DEBUG_ITERATION_LOG_INTERVAL: usize = 100_000;
-const HASHLIFE_DEBUG_INITIAL_STACK_LOG_THRESHOLD: usize = 10_000;
-pub const HASHLIFE_FULL_GRID_MAX_POPULATION: u64 = 250_000;
-pub const HASHLIFE_FULL_GRID_MAX_CHUNKS: usize = 100_000;
-pub const HASHLIFE_CHECKPOINT_MAX_POPULATION: u64 = 250_000;
-pub const HASHLIFE_CHECKPOINT_MAX_BOUNDS_SPAN: Coord = 65_536;
 
 impl Default for HashLifeEngine {
     fn default() -> Self {
@@ -926,13 +616,24 @@ impl Default for HashLifeEngine {
             packed_transform_materialized: Vec::new(),
             packed_transform_packed_roots: Vec::new(),
             canonical_node_cache: FlatTable::new(),
+            canonical_packed_cache: FlatTable::new(),
+            hot_canonical_packed_cache: FlatTable::new(),
+            hot_canonical_packed_budget: 0,
+            canonical_oriented_cache: FlatTable::new(),
+            hot_canonical_oriented_cache: FlatTable::new(),
+            hot_canonical_oriented_budget: 0,
+            direct_parent_canonical_cache: FlatTable::new(),
+            hot_direct_parent_canonical_cache: FlatTable::new(),
+            hot_direct_parent_canonical_budget: 0,
+            structural_fast_path_cache: FlatTable::new(),
+            packed_structural_fast_path_cache: FlatTable::new(),
             embed_layout_cache: HashMap::new(),
             retained_roots: Vec::new(),
             dead_leaf: 0,
             live_leaf: 0,
             last_gc_nodes: 0,
-            jump_symmetry_max_level: JUMP_SYMMETRY_MAX_LEVEL,
-            jump_symmetry_max_population: JUMP_SYMMETRY_MAX_POPULATION,
+            #[cfg(test)]
+            symmetry_gate_override: None,
             stats: HashLifeStats::default(),
         };
         oracle.initialize_runtime_state();
@@ -942,16 +643,59 @@ impl Default for HashLifeEngine {
 }
 
 impl HashLifeEngine {
-    #[cfg(test)]
-    pub(crate) fn with_symmetry_gate_for_tests(max_level: u32, max_population: u64) -> Self {
-        let mut oracle = Self {
-            jump_symmetry_max_level: max_level,
-            jump_symmetry_max_population: max_population,
-            ..Self::default()
+    fn build_leaf_symmetry_metadata(alive: bool) -> NodeSymmetryMetadata {
+        let structural = CanonicalStructKey::leaf(alive);
+        let entry = PackedTransformOrderEntry {
+            structural,
+            canonical_ref: canonical_node_ref_from_structural(structural),
+            order_fingerprint: structural.fingerprint(),
+            order_children: structural.children,
         };
-        oracle.clear_transient_state();
-        oracle.stats = HashLifeStats::default();
-        oracle
+        NodeSymmetryMetadata { entries: [entry; 8] }
+    }
+
+    fn build_node_symmetry_metadata(
+        &self,
+        level: u32,
+        children: [NodeId; 4],
+        population: u64,
+    ) -> NodeSymmetryMetadata {
+        if level == 0 {
+            return Self::build_leaf_symmetry_metadata(population != 0);
+        }
+
+        let child_entries = children.map(|child| {
+            Symmetry::ALL.map(|symmetry| self.node_columns.symmetry_entry(child, symmetry))
+        });
+        let mut entries = [PackedTransformOrderEntry {
+            structural: CanonicalStructKey::new(0, [0; 4]),
+            canonical_ref: 0,
+            order_fingerprint: 0,
+            order_children: [0; 4],
+        }; 8];
+
+        let mut symmetry_index = 0;
+        while symmetry_index < Symmetry::ALL.len() {
+            let symmetry = Symmetry::ALL[symmetry_index];
+            let perm = symmetry.quadrant_perm();
+            let transformed_children = [
+                child_entries[perm[0]][symmetry_index],
+                child_entries[perm[1]][symmetry_index],
+                child_entries[perm[2]][symmetry_index],
+                child_entries[perm[3]][symmetry_index],
+            ];
+            let order_children = transformed_children.map(|child| child.canonical_ref);
+            let structural = CanonicalStructKey::new(level, order_children);
+            entries[symmetry_index] = PackedTransformOrderEntry {
+                structural,
+                canonical_ref: canonical_node_ref_from_structural(structural),
+                order_fingerprint: structural.fingerprint(),
+                order_children,
+            };
+            symmetry_index += 1;
+        }
+
+        NodeSymmetryMetadata { entries }
     }
 
     fn record_fingerprint_probe(&mut self, used_cached_fingerprint: bool, count: usize) {
@@ -960,6 +704,17 @@ impl HashLifeEngine {
         } else {
             self.stats.recomputed_fingerprint_probes += count;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_symmetry_gate_for_tests(max_level: u32, max_population: u64) -> Self {
+        let mut oracle = Self {
+            symmetry_gate_override: Some((max_level, max_population)),
+            ..Self::default()
+        };
+        oracle.clear_transient_state(false);
+        oracle.stats = HashLifeStats::default();
+        oracle
     }
 
     fn node_count(&self) -> usize {
@@ -976,7 +731,9 @@ impl HashLifeEngine {
         se: NodeId,
     ) -> NodeId {
         let node_id = self.node_count() as NodeId;
-        self.node_columns.push(level, population, nw, ne, sw, se);
+        let symmetry_metadata = self.build_node_symmetry_metadata(level, [nw, ne, sw, se], population);
+        self.node_columns
+            .push(level, population, nw, ne, sw, se, symmetry_metadata);
         node_id
     }
 
@@ -1001,43 +758,19 @@ impl HashLifeEngine {
             return (grid.clone(), None);
         }
 
-        let debug = hashlife_debug_enabled();
         let mut current = None::<BitGrid>;
         let mut remaining = generations;
         let mut last_root = None;
-
-        if debug {
-            eprintln!(
-                "[hashlife] advance start gens={generations} pop={} bounds={:?}",
-                current.as_ref().unwrap_or(grid).population(),
-                current.as_ref().unwrap_or(grid).bounds()
-            );
-        }
 
         while remaining != 0 {
             let safe_jump = max_hashlife_safe_jump(current.as_ref().unwrap_or(grid));
             let step_limit = remaining.min(safe_jump.max(1));
             let step_exp = 63 - step_limit.leading_zeros();
             let step = 1_u64 << step_exp;
-            if debug {
-                eprintln!(
-                    "[hashlife] segment step={step} step_exp={step_exp} safe_jump={} pop={} bounds={:?}",
-                    safe_jump,
-                    current.as_ref().unwrap_or(grid).population(),
-                    current.as_ref().unwrap_or(grid).bounds()
-                );
-            }
             let (next, root) =
                 self.advance_power_of_two(current.as_ref().unwrap_or(grid), step_exp);
             current = Some(next);
             last_root = Some(root);
-            if debug {
-                eprintln!(
-                    "[hashlife] segment done step={step} pop={} bounds={:?}",
-                    current.as_ref().unwrap_or(grid).population(),
-                    current.as_ref().unwrap_or(grid).bounds()
-                );
-            }
             remaining -= step;
         }
 
@@ -1049,41 +782,12 @@ impl HashLifeEngine {
         previous_root: Option<NodeId>,
         last_root: Option<NodeId>,
     ) {
-        let debug = hashlife_debug_enabled();
-
         if let Some(root) = last_root {
             self.record_retained_root(root);
         }
         self.stats.jump_cache_before_clear = self.jump_cache.len();
         let gc_reason = self.gc_reason(previous_root, last_root);
-        if debug {
-            eprintln!(
-                "[hashlife] gc before nodes={} intern={} retained={} jump_cache={} reason={gc_reason}",
-                self.node_count(),
-                self.intern.len(),
-                self.retained_roots.len(),
-                self.jump_cache.len()
-            );
-        }
         self.maybe_garbage_collect(gc_reason);
-        if debug {
-            eprintln!(
-                "[hashlife] gc after nodes={} intern={} retained={} jump_cache={} jump_presence_avoids={} jump_presence_misses={} root_hits={} root_misses={} overlap_hits={} overlap_misses={} marked={} compacted={}->{}",
-                self.node_count(),
-                self.intern.len(),
-                self.retained_roots.len(),
-                self.jump_cache.len(),
-                self.stats.jump_presence_avoids,
-                self.stats.jump_presence_misses,
-                self.stats.root_result_cache_hits,
-                self.stats.root_result_cache_misses,
-                self.stats.overlap_cache_hits,
-                self.stats.overlap_cache_misses,
-                self.stats.nodes_after_mark,
-                self.stats.nodes_before_compact,
-                self.stats.nodes_after_compact,
-            );
-        }
     }
 
     pub(super) fn maybe_collect_active_run(
@@ -1091,13 +795,18 @@ impl HashLifeEngine {
         current_root: Option<NodeId>,
     ) -> Option<NodeId> {
         let root = current_root?;
-        if !should_run_active_hashlife_gc(self.node_count(), self.last_gc_nodes) {
+        if !should_run_active_hashlife_gc(self.node_count(), self.last_gc_nodes)
+            && self.transient_cache_entries() < HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER
+        {
             return Some(root);
         }
 
         self.record_retained_root(root);
         self.stats.jump_cache_before_clear = self.jump_cache.len();
-        let gc_reason = if self.node_count() >= HASHLIFE_GC_MIN_NODES {
+        let gc_reason = if self.transient_cache_entries() >= HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER
+        {
+            "transient_threshold"
+        } else if self.node_count() >= HASHLIFE_GC_MIN_NODES {
             "node_threshold"
         } else {
             "growth_threshold"
@@ -1123,7 +832,6 @@ impl HashLifeEngine {
         let advanced = if let Some(cached) = self.cached_root_result(cache_key) {
             cached
         } else {
-            self.stats.root_result_cache_misses += 1;
             let result = self.advance_pow2(embedded.root, step_exp);
             self.insert_root_result(cache_key, result);
             result
@@ -1146,7 +854,13 @@ fn max_hashlife_safe_jump(current: &BitGrid) -> u64 {
     };
     let width = (max_x - min_x + 1).max(1);
     let height = (max_y - min_y + 1).max(1);
-    let span = width.max(height);
+    max_hashlife_safe_jump_from_span(width.max(height))
+}
+
+pub(super) fn max_hashlife_safe_jump_from_span(span: Coord) -> u64 {
+    if span <= 0 {
+        return 1;
+    }
     let raw_max_jump = (((Coord::MAX as i128) - (2 * span as i128) - 8) / 4).max(1) as u64;
     let mut jump = 1_u64 << (63 - raw_max_jump.leading_zeros());
     while jump > 1 && required_root_size_for_jump(span as u64, jump) > Coord::MAX as u64 {
@@ -1155,18 +869,11 @@ fn max_hashlife_safe_jump(current: &BitGrid) -> u64 {
     jump
 }
 
-fn required_root_size_for_jump(span: u64, jump: u64) -> u64 {
+pub(super) fn required_root_size_for_jump(span: u64, jump: u64) -> u64 {
     (2 * span + 4 * (jump + 2))
         .max((4 * jump) + 4)
         .max(4)
         .next_power_of_two()
-}
-
-fn hashlife_debug_enabled() -> bool {
-    matches!(
-        env::var("HASHLIFE_DEBUG").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
-    )
 }
 
 fn quadrant_end(

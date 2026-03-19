@@ -10,24 +10,29 @@ use std::collections::HashMap;
 
 impl HashLifeEngine {
     pub(super) fn dense_advance_centered(&mut self, node: NodeId, step_exp: u32) -> NodeId {
+        self.stats.dense_fallback_invocations += 1;
         let level = self.node_columns.level(node);
         debug_assert!(level >= 2);
         let size = 1_i64 << level;
         let result_size = size / 2;
         let center_origin = size / 4;
         let generations = 1_u64 << step_exp;
-        let mut grid = self
-            .node_to_grid(
-                node,
-                0,
-                0,
-                GridExtractionPolicy::FullGridIfUnder {
-                    max_population: u64::MAX,
-                    max_chunks: usize::MAX,
-                    max_bounds_span: Coord::MAX,
-                },
-            )
-            .expect("dense HashLife shortcut extraction should be unrestricted");
+        let mut grid = match self.node_bounds(node, 0, 0) {
+            Some((min_x, min_y, max_x, max_y)) => self
+                .node_to_grid(
+                    node,
+                    0,
+                    0,
+                    GridExtractionPolicy::BoundedRegion {
+                        min_x,
+                        min_y,
+                        max_x,
+                        max_y,
+                    },
+                )
+                .expect("dense HashLife fallback bounded extraction should succeed"),
+            None => BitGrid::empty(),
+        };
         let mut memo = Memo::default();
         for _ in 0..generations {
             grid = step_grid_with_changes_and_memo(&grid, &mut memo).0;
@@ -153,7 +158,7 @@ impl HashLifeEngine {
     }
 
     pub(super) fn node_checkpoint(
-        &self,
+        &mut self,
         node: NodeId,
         origin_x: Coord,
         origin_y: Coord,
@@ -169,6 +174,7 @@ impl HashLifeEngine {
         {
             return None;
         }
+        self.stats.checkpoint_cell_materializations += 1;
         let size = 1_i64 << self.node_columns.level(node);
         let mut cells = Vec::with_capacity(
             usize::try_from(population).expect("hashlife population exceeded usize"),

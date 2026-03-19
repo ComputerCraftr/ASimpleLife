@@ -1,6 +1,6 @@
 use super::{
     EmbedLayoutCacheKey, EmbeddedCell, EmbeddedJump, GridExtractionPolicy, HashLifeEngine, NodeId,
-    hashlife_debug_enabled, quadrant_end,
+    quadrant_end,
 };
 use crate::bitgrid::{BitGrid, Coord};
 use crate::hashing::morton_interleave_u64_batch;
@@ -110,11 +110,6 @@ impl HashLifeEngine {
             .or_insert_with(|| Self::required_root_size(span, jump));
         let size_u64 = u64::try_from(size).expect("hashlife root size became negative");
         let level = size_u64.trailing_zeros();
-        if hashlife_debug_enabled() {
-            eprintln!(
-                "[hashlife] embed jump={jump} width={width} height={height} span={span} size={size} level={level}"
-            );
-        }
         let root_size = size;
         let shift_x = (root_size - width) / 2 - min_x;
         let shift_y = (root_size - height) / 2 - min_y;
@@ -132,7 +127,7 @@ impl HashLifeEngine {
     }
 
     pub(super) fn extract_embedded_result(
-        &self,
+        &mut self,
         embedded: EmbeddedJump,
         result: NodeId,
     ) -> BitGrid {
@@ -149,17 +144,24 @@ impl HashLifeEngine {
             embedded.result_origin_y,
             embedded.root_size / 4 - embedded.world_to_root_y
         );
-        self.node_to_grid(
-            result,
-            embedded.result_origin_x,
-            embedded.result_origin_y,
-            GridExtractionPolicy::FullGridIfUnder {
-                max_population: u64::MAX,
-                max_chunks: usize::MAX,
-                max_bounds_span: Coord::MAX,
-            },
-        )
-        .expect("embedded HashLife result extraction should be unrestricted")
+        match self.node_bounds(result, embedded.result_origin_x, embedded.result_origin_y) {
+            Some((min_x, min_y, max_x, max_y)) => {
+                self.stats.embedded_result_bounded_extractions += 1;
+                self.node_to_grid(
+                    result,
+                    embedded.result_origin_x,
+                    embedded.result_origin_y,
+                    GridExtractionPolicy::BoundedRegion {
+                        min_x,
+                        min_y,
+                        max_x,
+                        max_y,
+                    },
+                )
+                .expect("embedded HashLife bounded result extraction should succeed")
+            }
+            None => BitGrid::empty(),
+        }
     }
 
     pub(super) fn build_node_from_cells_iterative(

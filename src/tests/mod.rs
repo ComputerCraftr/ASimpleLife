@@ -1,5 +1,9 @@
 mod correctness;
 mod correctness_bench;
-mod hashlife;
+mod hashlife_cache;
+mod hashlife_correctness;
+mod hashlife_diagnostics;
+mod hashlife_scheduler;
+mod hashlife_support;
 mod main_tests;
 mod oracle;

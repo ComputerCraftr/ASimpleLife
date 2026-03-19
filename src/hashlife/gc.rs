@@ -1,9 +1,123 @@
-use super::{FlatTable, HashLifeEngine, NodeColumns, NodeId};
-use crate::cache_policy::{HASHLIFE_GC_MIN_NODES, HASHLIFE_GC_MIN_RECLAIM, hashlife_gc_reason};
+use super::{
+    CanonicalNodeIdentity, DirectCanonicalParentKey, FlatTable, HashLifeEngine, NodeColumns,
+    NodeId, PackedNodeKey, PackedSymmetryKey,
+};
+use crate::cache_policy::{
+    HASHLIFE_GC_MIN_NODES, HASHLIFE_GC_MIN_RECLAIM, HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER,
+    hashlife_gc_reason,
+};
 
 const HASHLIFE_MAX_RETAINED_ROOTS: usize = 1;
 
 impl HashLifeEngine {
+    fn remap_packed_node_key(remap: &[NodeId], packed: PackedNodeKey) -> Option<PackedNodeKey> {
+        if packed.level == 0 {
+            Some(packed)
+        } else {
+            let mut remapped_children = [0; 4];
+            for (index, child) in packed.children.into_iter().enumerate() {
+                let child_index = child as usize;
+                if child_index >= remap.len() {
+                    return None;
+                }
+                let remapped = remap[child_index];
+                if remapped == NodeId::MAX {
+                    return None;
+                }
+                remapped_children[index] = remapped;
+            }
+            Some(PackedNodeKey::new(packed.level, remapped_children))
+        }
+    }
+
+    fn remap_canonical_node_identity(
+        remap: &[NodeId],
+        canonical: CanonicalNodeIdentity,
+    ) -> Option<CanonicalNodeIdentity> {
+        Some(CanonicalNodeIdentity {
+            packed: Self::remap_packed_node_key(remap, canonical.packed)?,
+            ..canonical
+        })
+    }
+
+    fn dynamic_total_hot_budget(&self) -> usize {
+        let canonical_entries = self.canonical_cache_entries().max(1);
+        let transient_entries = self.transient_cache_entries().max(canonical_entries);
+        let observed_before = self
+            .stats
+            .gc_canonical_cache_entries_before
+            .max(canonical_entries);
+        let min_budget = (HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER / 1024).max(64);
+        let max_budget = (HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER / 4).max(min_budget);
+        (observed_before / 4 + transient_entries / 16).clamp(min_budget, max_budget)
+    }
+
+    pub(super) fn rebalance_hot_canonical_budgets(&mut self) {
+        let total_budget = self.dynamic_total_hot_budget();
+        let packed_weight = self.stats.canonical_packed_cache_hits.max(1);
+        let oriented_weight = self.stats.canonical_oriented_cache_hits.max(1);
+        let direct_parent_weight = (self.stats.direct_parent_cached_result_hits
+            + self.stats.direct_parent_winner_hits)
+            .max(1);
+        let total_weight = packed_weight + oriented_weight + direct_parent_weight;
+
+        self.hot_canonical_packed_budget = (total_budget * packed_weight / total_weight).max(1);
+        self.hot_canonical_oriented_budget =
+            (total_budget * oriented_weight / total_weight).max(1);
+        self.hot_direct_parent_canonical_budget =
+            (total_budget * direct_parent_weight / total_weight).max(1);
+
+        let assigned = self.hot_canonical_packed_budget
+            + self.hot_canonical_oriented_budget
+            + self.hot_direct_parent_canonical_budget;
+        if assigned < total_budget {
+            self.hot_direct_parent_canonical_budget += total_budget - assigned;
+        }
+
+        self.trim_hot_canonical_caches_to_budget();
+    }
+
+    fn trim_hot_canonical_caches_to_budget(&mut self) {
+        if self.hot_canonical_packed_cache.len() > self.hot_canonical_packed_budget {
+            self.hot_canonical_packed_cache.clear();
+        }
+        if self.hot_canonical_oriented_cache.len() > self.hot_canonical_oriented_budget {
+            self.hot_canonical_oriented_cache.clear();
+        }
+        if self.hot_direct_parent_canonical_cache.len() > self.hot_direct_parent_canonical_budget {
+            self.hot_direct_parent_canonical_cache.clear();
+        }
+    }
+
+    pub(super) fn canonical_cache_entries(&self) -> usize {
+        self.canonical_packed_cache.len()
+            + self.hot_canonical_packed_cache.len()
+            + self.canonical_oriented_cache.len()
+            + self.hot_canonical_oriented_cache.len()
+            + self.direct_parent_canonical_cache.len()
+            + self.hot_direct_parent_canonical_cache.len()
+            + self.structural_fast_path_cache.len()
+            + self.packed_structural_fast_path_cache.len()
+    }
+
+    pub(super) fn transient_cache_entries(&self) -> usize {
+        self.jump_cache.len()
+            + self.root_result_cache.len()
+            + self.overlap_cache.len()
+            + self.oriented_result_cache.len()
+            + self.canonical_packed_cache.len()
+            + self.hot_canonical_packed_cache.len()
+            + self.canonical_oriented_cache.len()
+            + self.hot_canonical_oriented_cache.len()
+            + self.direct_parent_canonical_cache.len()
+            + self.hot_direct_parent_canonical_cache.len()
+            + self.structural_fast_path_cache.len()
+            + self.packed_structural_fast_path_cache.len()
+            + self.canonical_transform_cache.len()
+            + self.packed_transform_compare_cache.len()
+            + self.packed_transform_intern.len()
+    }
+
     pub(super) fn initialize_runtime_state(&mut self) {
         self.dead_leaf = self.intern_leaf(false);
         self.live_leaf = self.intern_leaf(true);
@@ -11,7 +125,8 @@ impl HashLifeEngine {
         self.reset_packed_transform_state();
     }
 
-    pub(super) fn clear_transient_state(&mut self) {
+    pub(super) fn clear_transient_state(&mut self, preserve_hot_canonical: bool) {
+        self.rebalance_hot_canonical_budgets();
         self.jump_cache.clear();
         self.root_result_cache.clear();
         self.overlap_cache.clear();
@@ -19,9 +134,18 @@ impl HashLifeEngine {
         self.transform_cache.clear();
         self.canonical_transform_cache.clear();
         self.oriented_result_cache.clear();
-        self.packed_transform_compare_cache.clear();
         self.reset_packed_transform_state();
         self.canonical_node_cache.clear();
+        self.canonical_packed_cache.clear();
+        self.canonical_oriented_cache.clear();
+        self.direct_parent_canonical_cache.clear();
+        if !preserve_hot_canonical {
+            self.hot_canonical_packed_cache.clear();
+            self.hot_canonical_oriented_cache.clear();
+            self.hot_direct_parent_canonical_cache.clear();
+        }
+        self.structural_fast_path_cache.clear();
+        self.packed_structural_fast_path_cache.clear();
     }
 
     pub(super) fn gc_reason(
@@ -40,18 +164,24 @@ impl HashLifeEngine {
         if reason == "skip" {
             self.stats.gc_reason = "skip";
             self.stats.gc_skips += 1;
-            self.clear_transient_state();
+            if self.transient_cache_entries() >= HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER {
+                self.stats.gc_skipped_with_transient_growth += 1;
+            }
+            self.clear_transient_state(true);
             return;
         }
 
         self.stats.gc_runs += 1;
+        self.stats.gc_transient_entries_before = self.transient_cache_entries();
+        self.stats.gc_canonical_cache_entries_before = self.canonical_cache_entries();
         let (marked, live_nodes) = self.mark_live_nodes();
         self.stats.nodes_before_mark = self.node_count();
         self.stats.nodes_after_mark = live_nodes;
         let reclaimable = self.node_count().saturating_sub(live_nodes);
-        let should_compact = self.node_count() >= HASHLIFE_GC_MIN_NODES
+        let should_compact = (self.node_count() >= HASHLIFE_GC_MIN_NODES
             && reclaimable >= HASHLIFE_GC_MIN_RECLAIM
-            && (reclaimable * 4 >= self.node_count() || reason != "skip");
+            && (reclaimable * 4 >= self.node_count() || reason != "skip"))
+            || self.transient_cache_entries() >= HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER;
 
         if should_compact {
             self.stats.gc_reason = "compacted";
@@ -59,7 +189,7 @@ impl HashLifeEngine {
             self.compact_marked_nodes(marked);
             self.stats.nodes_after_compact = self.node_count();
             self.last_gc_nodes = self.node_count();
-            self.clear_transient_state();
+            self.clear_transient_state(true);
         } else {
             self.stats.gc_reason = if reason == "root_changed" {
                 "root_changed_mark_only"
@@ -90,6 +220,9 @@ impl HashLifeEngine {
             }
             for &node_id in &batch[..batch_len] {
                 let idx = node_id as usize;
+                if node_id == NodeId::MAX || idx >= self.node_count() {
+                    continue;
+                }
                 let word = idx / 64;
                 let bit = 1_u64 << (idx % 64);
                 if (marked[word] & bit) != 0 {
@@ -124,6 +257,13 @@ impl HashLifeEngine {
     }
 
     pub(super) fn compact_marked_nodes(&mut self, marked: Vec<u64>) {
+        let old_hot_canonical_packed = self.hot_canonical_packed_cache.iter().collect::<Vec<_>>();
+        let old_hot_canonical_oriented =
+            self.hot_canonical_oriented_cache.iter().collect::<Vec<_>>();
+        let old_hot_direct_parent = self
+            .hot_direct_parent_canonical_cache
+            .iter()
+            .collect::<Vec<_>>();
         let old_len = self.node_count();
         let old_levels = self.node_columns.levels.clone();
         let old_populations = self.node_columns.populations.clone();
@@ -154,6 +294,7 @@ impl HashLifeEngine {
                     old_nes[current_idx],
                     old_sws[current_idx],
                     old_ses[current_idx],
+                    self.node_columns.symmetry_metadata[current_idx],
                 );
             }
             old_idx = batch_end;
@@ -195,14 +336,86 @@ impl HashLifeEngine {
                 node_id,
             );
         }
+        self.retained_roots.retain_mut(|root| {
+            let index = *root as usize;
+            if index >= remap.len() {
+                return false;
+            }
+            let remapped = remap[index];
+            if remapped == NodeId::MAX {
+                return false;
+            }
+            *root = remapped;
+            true
+        });
+        self.empty_by_level.retain_mut(|empty| {
+            let index = *empty as usize;
+            if index >= remap.len() {
+                return false;
+            }
+            let remapped = remap[index];
+            if remapped == NodeId::MAX {
+                return false;
+            }
+            *empty = remapped;
+            true
+        });
+        self.dead_leaf = remap
+            .get(self.dead_leaf as usize)
+            .copied()
+            .filter(|&node| node != NodeId::MAX)
+            .expect("dead leaf must survive compaction");
+        self.live_leaf = remap
+            .get(self.live_leaf as usize)
+            .copied()
+            .filter(|&node| node != NodeId::MAX)
+            .expect("live leaf must survive compaction");
 
-        for root in &mut self.retained_roots {
-            *root = remap[*root as usize];
+        self.hot_canonical_packed_cache =
+            FlatTable::with_capacity(old_hot_canonical_packed.len().saturating_mul(2).max(16));
+        for (key, value) in old_hot_canonical_packed {
+            let (Some(remapped_key), Some(remapped_value)) = (
+                Self::remap_packed_node_key(&remap, key),
+                Self::remap_canonical_node_identity(&remap, value),
+            ) else {
+                continue;
+            };
+            self.hot_canonical_packed_cache
+                .insert(remapped_key, remapped_value);
         }
-        for empty in &mut self.empty_by_level {
-            *empty = remap[*empty as usize];
+
+        self.hot_canonical_oriented_cache =
+            FlatTable::with_capacity(old_hot_canonical_oriented.len().saturating_mul(2).max(16));
+        for (key, value) in old_hot_canonical_oriented {
+            let (Some(remapped_packed), Some(remapped_value)) = (
+                Self::remap_packed_node_key(&remap, key.packed),
+                Self::remap_canonical_node_identity(&remap, value),
+            ) else {
+                continue;
+            };
+            self.hot_canonical_oriented_cache.insert(
+                PackedSymmetryKey {
+                    packed: remapped_packed,
+                    symmetry: key.symmetry,
+                },
+                remapped_value,
+            );
         }
-        self.dead_leaf = remap[self.dead_leaf as usize];
-        self.live_leaf = remap[self.live_leaf as usize];
+
+        self.hot_direct_parent_canonical_cache =
+            FlatTable::with_capacity(old_hot_direct_parent.len().saturating_mul(2).max(16));
+        for (key, value) in old_hot_direct_parent {
+            let Some(remapped_value) = Self::remap_canonical_node_identity(&remap, value) else {
+                continue;
+            };
+            self.hot_direct_parent_canonical_cache.insert(
+                DirectCanonicalParentKey {
+                    level: key.level,
+                    symmetry: key.symmetry,
+                    children: key.children,
+                },
+                remapped_value,
+            );
+        }
     }
 }
