@@ -1,14 +1,43 @@
 #include <inttypes.h>
+#include <stdatomic.h>
 #include <stdckdint.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 
-static uint64_t bf_bits_mask(unsigned bits) {
+/* @BF_CONFIG */
+
+#ifndef BF_TEMPLATE_TAPE_LEN
+#define BF_TEMPLATE_TAPE_LEN 30000
+#endif
+
+#ifndef BF_TEMPLATE_CELL_BITS
+#define BF_TEMPLATE_CELL_BITS 8
+#endif
+
+#ifndef BF_TEMPLATE_SIGNED_CELLS
+#define BF_TEMPLATE_SIGNED_CELLS 1
+#endif
+
+#ifndef BF_TEMPLATE_CELL_MASK
+#define BF_TEMPLATE_CELL_MASK UINT64_C(255)
+#endif
+
+#ifndef BF_TEMPLATE_INPUT_MASK
+#define BF_TEMPLATE_INPUT_MASK UINT64_C(255)
+#endif
+
+#ifndef BF_TEMPLATE_OUTPUT_MASK
+#define BF_TEMPLATE_OUTPUT_MASK UINT64_C(255)
+#endif
+
+#define BF_MAYBE_UNUSED [[maybe_unused]]
+
+BF_MAYBE_UNUSED static uint64_t bf_bits_mask(unsigned bits) {
     return bits == 0 ? UINT64_C(0) : ((UINT64_C(1) << bits) - 1);
 }
 
-static int64_t bf_wrap_from_u64_signed(uint64_t raw, unsigned bits) {
+BF_MAYBE_UNUSED static int64_t bf_wrap_from_u64_signed(uint64_t raw, unsigned bits) {
     if (bits == 0)
         return 0;
     raw &= bf_bits_mask(bits);
@@ -27,19 +56,19 @@ static int64_t bf_wrap_from_u64_signed(uint64_t raw, unsigned bits) {
     return (int64_t)raw - (int64_t)(UINT64_C(1) << bits);
 }
 
-static int64_t bf_wrap_from_u64_unsigned(uint64_t raw, unsigned bits) {
+BF_MAYBE_UNUSED static int64_t bf_wrap_from_u64_unsigned(uint64_t raw, unsigned bits) {
     if (bits == 0)
         return 0;
     return (int64_t)(raw & bf_bits_mask(bits));
 }
 
-static uint64_t bf_wrap_to_u64(int64_t value, unsigned bits) {
+BF_MAYBE_UNUSED static uint64_t bf_wrap_to_u64(int64_t value, unsigned bits) {
     if (bits == 0)
         return UINT64_C(0);
     return ((uint64_t)value) & bf_bits_mask(bits);
 }
 
-static int64_t bf_wrap_add_i64_signed(int64_t a, int64_t b, unsigned bits) {
+BF_MAYBE_UNUSED static int64_t bf_wrap_add_i64_signed(int64_t a, int64_t b, unsigned bits) {
     uint64_t ua = bf_wrap_to_u64(a, bits);
     uint64_t ub = bf_wrap_to_u64(b, bits);
     uint64_t out = 0;
@@ -49,7 +78,7 @@ static int64_t bf_wrap_add_i64_signed(int64_t a, int64_t b, unsigned bits) {
     return bf_wrap_from_u64_signed(out, bits);
 }
 
-static int64_t bf_wrap_sub_i64_signed(int64_t a, int64_t b, unsigned bits) {
+BF_MAYBE_UNUSED static int64_t bf_wrap_sub_i64_signed(int64_t a, int64_t b, unsigned bits) {
     uint64_t ua = bf_wrap_to_u64(a, bits);
     uint64_t ub = bf_wrap_to_u64(b, bits);
     uint64_t out = 0;
@@ -59,7 +88,7 @@ static int64_t bf_wrap_sub_i64_signed(int64_t a, int64_t b, unsigned bits) {
     return bf_wrap_from_u64_signed(out, bits);
 }
 
-static int64_t bf_wrap_mul_i64_signed(int64_t a, int64_t b, unsigned bits) {
+BF_MAYBE_UNUSED static int64_t bf_wrap_mul_i64_signed(int64_t a, int64_t b, unsigned bits) {
     uint64_t ua = bf_wrap_to_u64(a, bits);
     uint64_t ub = bf_wrap_to_u64(b, bits);
     uint64_t out = 0;
@@ -69,7 +98,7 @@ static int64_t bf_wrap_mul_i64_signed(int64_t a, int64_t b, unsigned bits) {
     return bf_wrap_from_u64_signed(out, bits);
 }
 
-static int64_t bf_wrap_add_i64_unsigned(int64_t a, int64_t b, unsigned bits) {
+BF_MAYBE_UNUSED static int64_t bf_wrap_add_i64_unsigned(int64_t a, int64_t b, unsigned bits) {
     uint64_t ua = bf_wrap_to_u64(a, bits);
     uint64_t ub = bf_wrap_to_u64(b, bits);
     uint64_t out = 0;
@@ -79,7 +108,7 @@ static int64_t bf_wrap_add_i64_unsigned(int64_t a, int64_t b, unsigned bits) {
     return bf_wrap_from_u64_unsigned(out, bits);
 }
 
-static int64_t bf_wrap_sub_i64_unsigned(int64_t a, int64_t b, unsigned bits) {
+BF_MAYBE_UNUSED static int64_t bf_wrap_sub_i64_unsigned(int64_t a, int64_t b, unsigned bits) {
     uint64_t ua = bf_wrap_to_u64(a, bits);
     uint64_t ub = bf_wrap_to_u64(b, bits);
     uint64_t out = 0;
@@ -89,7 +118,7 @@ static int64_t bf_wrap_sub_i64_unsigned(int64_t a, int64_t b, unsigned bits) {
     return bf_wrap_from_u64_unsigned(out, bits);
 }
 
-static int64_t bf_wrap_mul_i64_unsigned(int64_t a, int64_t b, unsigned bits) {
+BF_MAYBE_UNUSED static int64_t bf_wrap_mul_i64_unsigned(int64_t a, int64_t b, unsigned bits) {
     uint64_t ua = bf_wrap_to_u64(a, bits);
     uint64_t ub = bf_wrap_to_u64(b, bits);
     uint64_t out = 0;
@@ -99,15 +128,14 @@ static int64_t bf_wrap_mul_i64_unsigned(int64_t a, int64_t b, unsigned bits) {
     return bf_wrap_from_u64_unsigned(out, bits);
 }
 
-static _Noreturn void bf_diverge_forever(void) {
-    static volatile int bf_diverge_sink = 0;
+BF_MAYBE_UNUSED static _Noreturn void bf_diverge_forever(void) {
     for (;;) {
-        bf_diverge_sink = 1;
+        atomic_signal_fence(memory_order_seq_cst);
     }
 }
 
 /* @BF_WRAP_PTR_BEGIN */
-static ptrdiff_t bf_wrap_ptr(ptrdiff_t ptr, ptrdiff_t delta, ptrdiff_t len) {
+BF_MAYBE_UNUSED static ptrdiff_t bf_wrap_ptr(ptrdiff_t ptr, ptrdiff_t delta, ptrdiff_t len) {
     if (len <= 0)
         return 0;
     ptr %= len;
@@ -122,19 +150,21 @@ static ptrdiff_t bf_wrap_ptr(ptrdiff_t ptr, ptrdiff_t delta, ptrdiff_t len) {
 
 int main(void) {
     enum {
-        BF_TAPE_LEN = /* @BF_TAPE_LEN */,
-        BF_CELL_BITS = /* @BF_CELL_BITS */,
-        BF_SIGNED_CELLS = /* @BF_SIGNED_CELLS */,
-        /* @BF_CELL_MASK_BEGIN */
-        BF_CELL_MASK = /* @BF_CELL_MASK */,
-        /* @BF_CELL_MASK_END */
-        /* @BF_INPUT_MASK_BEGIN */
-        BF_INPUT_MASK = /* @BF_INPUT_MASK */,
-        /* @BF_INPUT_MASK_END */
-        BF_OUTPUT_MASK = /* @BF_OUTPUT_MASK */
+        BF_TAPE_LEN = BF_TEMPLATE_TAPE_LEN,
+        BF_CELL_BITS = BF_TEMPLATE_CELL_BITS,
+        BF_SIGNED_CELLS = BF_TEMPLATE_SIGNED_CELLS
     };
+    /* @BF_CELL_MASK_BEGIN */
+    BF_MAYBE_UNUSED static const uint64_t BF_CELL_MASK = BF_TEMPLATE_CELL_MASK;
+    /* @BF_CELL_MASK_END */
+    /* @BF_INPUT_MASK_BEGIN */
+    BF_MAYBE_UNUSED static const uint64_t BF_INPUT_MASK = BF_TEMPLATE_INPUT_MASK;
+    /* @BF_INPUT_MASK_END */
+    BF_MAYBE_UNUSED static const uint64_t BF_OUTPUT_MASK = BF_TEMPLATE_OUTPUT_MASK;
     int64_t tape[BF_TAPE_LEN] = {};
     ptrdiff_t ptr = 0;
+    (void)tape;
+    (void)ptr;
 
     /* @BF_PROGRAM */
     return 0;

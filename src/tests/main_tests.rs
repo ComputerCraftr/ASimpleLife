@@ -1,4 +1,5 @@
 use crate::app::initial_grid;
+use crate::bf::{CodegenOpts, compile_to_life_circuit};
 use crate::cli::Config;
 use crate::engine::{
     SimulationBackend, SimulationSession, select_backend, should_use_exact_simd_repeat_skip,
@@ -206,4 +207,71 @@ fn exact_simd_repeat_skip_matches_million_generation_glider() {
     assert_eq!(stats.backend, SimulationBackend::SimdChunk);
     assert_eq!(stats.simd_generations, target);
     assert_eq!(normalize(&advanced).0, normalize(&expected).0);
+}
+
+#[test]
+fn simulation_session_grid_hashlife_snapshot_roundtrip_preserves_loaded_grid() {
+    let grid = crate::generators::pattern_by_name("gosper_glider_gun")
+        .unwrap()
+        .translated(37, -19);
+
+    let mut session = SimulationSession::new();
+    session.load_hashlife_state(&grid);
+    let snapshot = session
+        .export_hashlife_snapshot()
+        .expect("loaded grid should export a HashLife snapshot");
+
+    let mut restored = SimulationSession::new();
+    restored
+        .load_hashlife_snapshot(&snapshot)
+        .expect("exported snapshot should reload");
+    let restored_grid = restored
+        .sample_hashlife_state_grid(GridExtractionPolicy::FullGridIfUnder {
+            max_population: u64::MAX,
+            max_chunks: usize::MAX,
+            max_bounds_span: i64::MAX,
+        })
+        .expect("restored snapshot should materialize to a grid");
+
+    assert_eq!(restored_grid, grid);
+}
+
+#[test]
+fn bf_life_circuit_grid_hashlife_snapshot_roundtrip_preserves_compiled_grid() {
+    let opts = CodegenOpts {
+        io_mode: crate::bf::IoMode::Char,
+        cell_bits: 32,
+        input_bits: None,
+        output_bits: None,
+        cell_sign: crate::bf::CellSign::Unsigned,
+    };
+    let mut circuit = compile_to_life_circuit(
+        &crate::bf::optimize(crate::bf::Parser::new("+.>++.>+++.").parse().unwrap()),
+        opts,
+    )
+    .expect("BF circuit should compile");
+    circuit
+        .run_to_completion()
+        .expect("BF circuit should run to completion");
+    let grid = circuit.to_initial_grid();
+
+    let mut session = SimulationSession::new();
+    session.load_hashlife_state(&grid);
+    let snapshot = session
+        .export_hashlife_snapshot()
+        .expect("compiled BF circuit grid should export as a HashLife snapshot");
+
+    let mut restored = SimulationSession::new();
+    restored
+        .load_hashlife_snapshot(&snapshot)
+        .expect("BF circuit snapshot should reload");
+    let restored_grid = restored
+        .sample_hashlife_state_grid(GridExtractionPolicy::FullGridIfUnder {
+            max_population: u64::MAX,
+            max_chunks: usize::MAX,
+            max_bounds_span: i64::MAX,
+        })
+        .expect("restored BF circuit snapshot should materialize to a grid");
+
+    assert_eq!(restored_grid, grid);
 }

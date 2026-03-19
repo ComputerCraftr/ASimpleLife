@@ -1,30 +1,37 @@
 use std::io::{self, Read};
 
-use super::codegen::{emit_c, format_ir, serialize_legacy_life_grid, serialize_life_grid};
+use super::c_backend::{emit_c, format_ir};
 use super::ir::Parser;
+use super::life_backend::{
+    compile_to_life_circuit, serialize_life_circuit, serialize_life_circuit_hashlife,
+};
 use super::optimizer::{CellSign, CodegenOpts, IoMode, optimize};
+use super::c_super_backend::emit_c_super;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutputMode {
+pub(super) enum OutputMode {
     DumpIr,
     EmitC,
+    EmitCSuper,
     EmitLife,
-    EmitLifeGridLegacy,
+    EmitLifeHashLife,
 }
 
 pub fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         eprintln!(
-            "usage: bf_life [--dump-ir|--emit-c|--emit-life|--emit-life-grid] [opts] [-- <src> | <file> | <src>]"
+            "usage: bf_life [--dump-ir|--emit-ir|--emit-c|--emit-c-super|--emit-life|--emit-life-hashlife] [opts] [-- <src> | <file> | <src>]"
         );
         eprintln!("  --dump-ir      print parsed and optimized IR (default)");
+        eprintln!("  --emit-ir      alias for --dump-ir");
         eprintln!("  --emit-c       emit a C translation");
+        eprintln!("  --emit-c-super emit the symbolic-memo C backend");
         eprintln!(
-            "  --emit-life    emit a compact HashLife snapshot for unsigned, terminating programs"
+            "  --emit-life    emit the BF Life circuit as a standard life-grid export"
         );
         eprintln!(
-            "  --emit-life-grid emit the legacy life grid cell-list format for unsigned, terminating programs"
+            "  --emit-life-hashlife emit the BF Life circuit as a HashLife snapshot export"
         );
         eprintln!("opts: --cell-bits N  --io char|number  --signed-cells  --unsigned-cells");
         return;
@@ -57,26 +64,27 @@ pub fn run() {
         OutputMode::EmitC => {
             print!("{}", emit_c(&optimize(parsed), opts));
         }
-        OutputMode::EmitLife => match serialize_life_grid(&optimize(parsed), opts) {
-            Ok(output) => print!("{output}"),
+        OutputMode::EmitCSuper => {
+            print!("{}", emit_c_super(&optimize(parsed), opts));
+        }
+        OutputMode::EmitLife => match compile_to_life_circuit(&optimize(parsed), opts) {
+            Ok(circuit) => print!("{}", serialize_life_circuit(&circuit)),
             Err(err) => {
                 eprintln!("error: {err}");
                 std::process::exit(1);
             }
         },
-        OutputMode::EmitLifeGridLegacy => {
-            match serialize_legacy_life_grid(&optimize(parsed), opts) {
-                Ok(output) => print!("{output}"),
-                Err(err) => {
-                    eprintln!("error: {err}");
-                    std::process::exit(1);
-                }
+        OutputMode::EmitLifeHashLife => match compile_to_life_circuit(&optimize(parsed), opts) {
+            Ok(circuit) => print!("{}", serialize_life_circuit_hashlife(&circuit)),
+            Err(err) => {
+                eprintln!("error: {err}");
+                std::process::exit(1);
             }
-        }
+        },
     }
 }
 
-fn read_input(args: &[String]) -> Result<(OutputMode, CodegenOpts, String), String> {
+pub(super) fn read_input(args: &[String]) -> Result<(OutputMode, CodegenOpts, String), String> {
     let mut mode = OutputMode::DumpIr;
     let mut rest = args;
 
@@ -86,7 +94,15 @@ fn read_input(args: &[String]) -> Result<(OutputMode, CodegenOpts, String), Stri
                 mode = OutputMode::EmitC;
                 rest = &rest[1..];
             }
+            "--emit-c-super" => {
+                mode = OutputMode::EmitCSuper;
+                rest = &rest[1..];
+            }
             "--dump-ir" => {
+                mode = OutputMode::DumpIr;
+                rest = &rest[1..];
+            }
+            "--emit-ir" => {
                 mode = OutputMode::DumpIr;
                 rest = &rest[1..];
             }
@@ -94,8 +110,8 @@ fn read_input(args: &[String]) -> Result<(OutputMode, CodegenOpts, String), Stri
                 mode = OutputMode::EmitLife;
                 rest = &rest[1..];
             }
-            "--emit-life-grid" => {
-                mode = OutputMode::EmitLifeGridLegacy;
+            "--emit-life-hashlife" => {
+                mode = OutputMode::EmitLifeHashLife;
                 rest = &rest[1..];
             }
             _ => {}

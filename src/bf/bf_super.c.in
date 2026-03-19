@@ -1,0 +1,285 @@
+#include <inttypes.h>
+#include <stdatomic.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+/* @BF_CONFIG */
+
+#ifndef BF_TEMPLATE_TAPE_LEN
+#define BF_TEMPLATE_TAPE_LEN 30000
+#endif
+
+#ifndef BF_TEMPLATE_CELL_BITS
+#define BF_TEMPLATE_CELL_BITS 8
+#endif
+
+#ifndef BF_TEMPLATE_SIGNED_CELLS
+#define BF_TEMPLATE_SIGNED_CELLS 1
+#endif
+
+#ifndef BF_TEMPLATE_MEMO_CAPACITY
+#define BF_TEMPLATE_MEMO_CAPACITY 64
+#endif
+
+#ifndef BF_TEMPLATE_MEMO_WINDOW_MAX
+#define BF_TEMPLATE_MEMO_WINDOW_MAX 8
+#endif
+
+#ifndef BF_TEMPLATE_MAX_NODES
+#define BF_TEMPLATE_MAX_NODES 1
+#endif
+
+#ifndef BF_TEMPLATE_INPUT_MASK
+#define BF_TEMPLATE_INPUT_MASK UINT64_C(255)
+#endif
+
+#ifndef BF_TEMPLATE_OUTPUT_MASK
+#define BF_TEMPLATE_OUTPUT_MASK UINT64_C(255)
+#endif
+
+#ifndef BF_TEMPLATE_ROOT_NODE
+#define BF_TEMPLATE_ROOT_NODE 0
+#endif
+
+#define BF_MAYBE_UNUSED [[maybe_unused]]
+
+enum {
+    BF_TAPE_LEN = BF_TEMPLATE_TAPE_LEN,
+    BF_CELL_BITS = BF_TEMPLATE_CELL_BITS,
+    BF_SIGNED_CELLS = BF_TEMPLATE_SIGNED_CELLS,
+    BF_MEMO_CAPACITY = BF_TEMPLATE_MEMO_CAPACITY,
+    BF_MEMO_WINDOW_MAX = BF_TEMPLATE_MEMO_WINDOW_MAX,
+    MAX_NODES = BF_TEMPLATE_MAX_NODES
+};
+
+BF_MAYBE_UNUSED static const uint64_t BF_INPUT_MASK = BF_TEMPLATE_INPUT_MASK;
+BF_MAYBE_UNUSED static const uint64_t BF_OUTPUT_MASK = BF_TEMPLATE_OUTPUT_MASK;
+
+typedef struct {
+    uint32_t node_id;
+    int8_t window_start;
+    uint8_t window_len;
+    int64_t window[8];
+} MemoKey;
+
+typedef struct {
+    uint32_t node_id;
+    int8_t window_start;
+    uint8_t window_len;
+    int64_t window[8];
+} MemoVal;
+
+typedef struct {
+    uint8_t occupied;
+    uint64_t stamp;
+    MemoKey key;
+    MemoVal value;
+} MemoSlot;
+
+static MemoSlot bf_memo[BF_MEMO_CAPACITY];
+static uint64_t memo_epoch = 0;
+static uint64_t memo_hits = 0;
+static uint64_t memo_misses = 0;
+static uint64_t memo_evictions = 0;
+static uint64_t memo_lookup_max_probe = 0;
+static uint64_t memo_store_max_probe = 0;
+static uint64_t node_hits[MAX_NODES] = {0};
+static uint64_t node_misses[MAX_NODES] = {0};
+
+BF_MAYBE_UNUSED static uint64_t bf_bits_mask(unsigned bits) {
+    return bits == 0 ? UINT64_C(0)
+                     : (bits >= 63 ? ((UINT64_C(1) << 63) - 1)
+                                   : ((UINT64_C(1) << bits) - 1));
+}
+
+BF_MAYBE_UNUSED static int64_t bf_wrap_from_u64(uint64_t raw, unsigned bits, int signed_cells) {
+    if (bits == 0)
+        return 0;
+    raw &= bf_bits_mask(bits);
+    if (!signed_cells)
+        return (int64_t)raw;
+    if (bits == 63) {
+        uint64_t sign = UINT64_C(1) << 62;
+        if ((raw & sign) == 0)
+            return (int64_t)raw;
+        uint64_t mag = raw - sign;
+        return (int64_t)mag - (int64_t)sign;
+    }
+    uint64_t sign = UINT64_C(1) << (bits - 1);
+    if ((raw & sign) == 0)
+        return (int64_t)raw;
+    return (int64_t)raw - (int64_t)(UINT64_C(1) << bits);
+}
+
+BF_MAYBE_UNUSED static uint64_t bf_wrap_to_u64(int64_t value, unsigned bits) {
+    if (bits == 0)
+        return UINT64_C(0);
+    return ((uint64_t)value) & bf_bits_mask(bits);
+}
+
+BF_MAYBE_UNUSED static int64_t bf_wrap_add(int64_t a, int64_t b, unsigned bits, int signed_cells) {
+    return bf_wrap_from_u64(bf_wrap_to_u64(a, bits) + bf_wrap_to_u64(b, bits), bits, signed_cells);
+}
+
+BF_MAYBE_UNUSED static int64_t bf_wrap_sub(int64_t a, int64_t b, unsigned bits, int signed_cells) {
+    return bf_wrap_from_u64(bf_wrap_to_u64(a, bits) - bf_wrap_to_u64(b, bits), bits, signed_cells);
+}
+
+BF_MAYBE_UNUSED static int64_t bf_wrap_mul(int64_t a, int64_t b, unsigned bits, int signed_cells) {
+    return bf_wrap_from_u64(bf_wrap_to_u64(a, bits) * bf_wrap_to_u64(b, bits), bits, signed_cells);
+}
+
+BF_MAYBE_UNUSED static ptrdiff_t bf_wrap_ptr(ptrdiff_t ptr, ptrdiff_t delta, ptrdiff_t len) {
+    if (len <= 0)
+        return 0;
+    ptr %= len;
+    if (ptr < 0)
+        ptr += len;
+    delta %= len;
+    if (delta < 0)
+        delta += len;
+    return (ptr + delta) % len;
+}
+
+BF_MAYBE_UNUSED static _Noreturn void bf_diverge_forever(void) {
+    for (;;) {
+        atomic_signal_fence(memory_order_seq_cst);
+    }
+}
+
+BF_MAYBE_UNUSED static uint64_t bf_hash_memo_key(const MemoKey *key) {
+    uint64_t h = UINT64_C(1469598103934665603) ^ key->node_id;
+    h ^= (uint8_t)key->window_start;
+    h *= UINT64_C(1099511628211);
+    h ^= key->window_len;
+    h *= UINT64_C(1099511628211);
+    for (uint8_t i = 0; i < key->window_len; ++i) {
+        h ^= bf_wrap_to_u64(key->window[i], BF_CELL_BITS);
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+BF_MAYBE_UNUSED static int bf_same_memo_key(const MemoKey *a, const MemoKey *b) {
+    return a->node_id == b->node_id && a->window_start == b->window_start &&
+           a->window_len == b->window_len &&
+           memcmp(a->window, b->window, sizeof(a->window)) == 0;
+}
+
+BF_MAYBE_UNUSED static uint64_t bf_next_memo_stamp(void) {
+    if (memo_epoch == UINT64_MAX) {
+        for (size_t i = 0; i < BF_MEMO_CAPACITY; ++i) {
+            if (bf_memo[i].occupied) {
+                bf_memo[i].stamp = (bf_memo[i].stamp >> 1) | UINT64_C(1);
+            }
+        }
+        memo_epoch = UINT64_C(1) << 62;
+    }
+    memo_epoch++;
+    return memo_epoch;
+}
+
+BF_MAYBE_UNUSED static size_t bf_memo_probe_limit(void) {
+    return BF_MEMO_CAPACITY < 16 ? BF_MEMO_CAPACITY : 16;
+}
+
+BF_MAYBE_UNUSED static int bf_memo_lookup(const MemoKey *key, MemoVal *out) {
+    uint64_t hash = bf_hash_memo_key(key);
+    size_t probe_limit = bf_memo_probe_limit();
+    for (size_t probe = 0; probe < probe_limit; ++probe) {
+        size_t slot = (size_t)((hash + probe) % BF_MEMO_CAPACITY);
+        if (!bf_memo[slot].occupied) {
+            memo_misses++;
+            if (probe + 1 > memo_lookup_max_probe)
+                memo_lookup_max_probe = probe + 1;
+            if (key->node_id < MAX_NODES)
+                node_misses[key->node_id]++;
+            return 0;
+        }
+        if (bf_same_memo_key(&bf_memo[slot].key, key)) {
+            memo_hits++;
+            bf_memo[slot].stamp = bf_next_memo_stamp();
+            if (probe + 1 > memo_lookup_max_probe)
+                memo_lookup_max_probe = probe + 1;
+            if (key->node_id < MAX_NODES)
+                node_hits[key->node_id]++;
+            *out = bf_memo[slot].value;
+            return 1;
+        }
+    }
+    memo_misses++;
+    if (probe_limit > memo_lookup_max_probe)
+        memo_lookup_max_probe = probe_limit;
+    if (key->node_id < MAX_NODES)
+        node_misses[key->node_id]++;
+    return 0;
+}
+
+BF_MAYBE_UNUSED static void bf_memo_store(const MemoKey *key, const MemoVal *value) {
+    uint64_t hash = bf_hash_memo_key(key);
+    size_t probe_limit = bf_memo_probe_limit();
+    size_t oldest_slot = 0;
+    uint64_t oldest_stamp = UINT64_MAX;
+    for (size_t probe = 0; probe < probe_limit; ++probe) {
+        size_t slot = (size_t)((hash + probe) % BF_MEMO_CAPACITY);
+        if (bf_memo[slot].occupied && bf_memo[slot].stamp <= oldest_stamp) {
+            oldest_stamp = bf_memo[slot].stamp;
+            oldest_slot = slot;
+        }
+        if (!bf_memo[slot].occupied || bf_same_memo_key(&bf_memo[slot].key, key)) {
+            bf_memo[slot].occupied = 1;
+            bf_memo[slot].stamp = bf_next_memo_stamp();
+            bf_memo[slot].key = *key;
+            bf_memo[slot].value = *value;
+            if (probe + 1 > memo_store_max_probe)
+                memo_store_max_probe = probe + 1;
+            return;
+        }
+    }
+    bf_memo[oldest_slot].occupied = 1;
+    bf_memo[oldest_slot].stamp = bf_next_memo_stamp();
+    bf_memo[oldest_slot].key = *key;
+    bf_memo[oldest_slot].value = *value;
+    memo_evictions++;
+    if (probe_limit > memo_store_max_probe)
+        memo_store_max_probe = probe_limit;
+}
+
+static void print_memo_stats(void) {
+    printf("memo hits:   %llu\n", (unsigned long long)memo_hits);
+    printf("memo misses: %llu\n", (unsigned long long)memo_misses);
+    printf("memo evictions: %llu\n", (unsigned long long)memo_evictions);
+    printf("memo lookup max probe: %llu\n", (unsigned long long)memo_lookup_max_probe);
+    printf("memo store max probe:  %llu\n", (unsigned long long)memo_store_max_probe);
+    printf("\nper-node stats:\n");
+    for (int i = 0; i < MAX_NODES; ++i) {
+        if (node_hits[i] || node_misses[i]) {
+            printf("node %d: hits=%llu misses=%llu\n",
+                   i,
+                   (unsigned long long)node_hits[i],
+                   (unsigned long long)node_misses[i]);
+        }
+    }
+}
+
+/* @BF_FUNCTIONS */
+
+#ifndef BF_TEMPLATE_HAS_FUNCTIONS
+static void exec_node_0(int64_t tape[BF_TAPE_LEN], ptrdiff_t *ptr_ref) {
+    (void)tape;
+    (void)ptr_ref;
+}
+#endif
+
+#define BF_EXEC_NODE_NAME2(id) exec_node_##id
+#define BF_EXEC_NODE_NAME(id) BF_EXEC_NODE_NAME2(id)
+
+int main(void) {
+    int64_t tape[BF_TAPE_LEN] = {0};
+    ptrdiff_t ptr = 0;
+    BF_EXEC_NODE_NAME(BF_TEMPLATE_ROOT_NODE)(tape, &ptr);
+    print_memo_stats();
+    return 0;
+}
