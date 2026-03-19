@@ -243,28 +243,79 @@ impl HashLifeEngine {
 
         let before = (
             self.stats.packed_cache_result_materializations,
-            self.stats.packed_inverse_transform_hits,
+            self.stats.oriented_transform_root_reconstructions,
         );
         let first =
             self.materialize_oriented_packed_result(packed, Symmetry::Identity, Symmetry::Rotate90);
         let first_delta = (
             self.stats.packed_cache_result_materializations - before.0,
-            self.stats.packed_inverse_transform_hits - before.1,
+            self.stats.oriented_transform_root_reconstructions - before.1,
         );
 
         let before = (
             self.stats.packed_cache_result_materializations,
-            self.stats.packed_inverse_transform_hits,
+            self.stats.oriented_transform_root_reconstructions,
         );
         let second =
             self.materialize_oriented_packed_result(packed, Symmetry::Identity, Symmetry::Rotate90);
         let second_delta = (
             self.stats.packed_cache_result_materializations - before.0,
-            self.stats.packed_inverse_transform_hits - before.1,
+            self.stats.oriented_transform_root_reconstructions - before.1,
         );
 
         assert_eq!(first, second);
         (first_delta, second_delta)
+    }
+
+    pub(crate) fn oriented_result_cache_survives_skip_gc(
+        &mut self,
+        grid: &BitGrid,
+    ) -> ((usize, usize), usize, (usize, usize)) {
+        let (root, _, _) = self.embed_grid_state(grid);
+        let packed = self.node_columns.packed_key(root);
+
+        let before = (
+            self.stats.packed_cache_result_materializations,
+            self.stats.oriented_transform_root_reconstructions,
+        );
+        let first =
+            self.materialize_oriented_packed_result(packed, Symmetry::Identity, Symmetry::Rotate90);
+        let populate_delta = (
+            self.stats.packed_cache_result_materializations - before.0,
+            self.stats.oriented_transform_root_reconstructions - before.1,
+        );
+
+        let before = (
+            self.stats.packed_cache_result_materializations,
+            self.stats.oriented_transform_root_reconstructions,
+        );
+        let warm =
+            self.materialize_oriented_packed_result(packed, Symmetry::Identity, Symmetry::Rotate90);
+        let warm_delta = (
+            self.stats.packed_cache_result_materializations - before.0,
+            self.stats.oriented_transform_root_reconstructions - before.1,
+        );
+
+        self.maybe_garbage_collect("skip");
+        let protected_entries = self.oriented_result_cache.len();
+
+        let before = (
+            self.stats.packed_cache_result_materializations,
+            self.stats.oriented_transform_root_reconstructions,
+        );
+        let second =
+            self.materialize_oriented_packed_result(packed, Symmetry::Identity, Symmetry::Rotate90);
+        let retained_delta = (
+            self.stats.packed_cache_result_materializations - before.0,
+            self.stats.oriented_transform_root_reconstructions - before.1,
+        );
+
+        assert_eq!(first, warm);
+        assert_eq!(first, second);
+        assert_eq!(warm_delta.0, 0);
+        assert_eq!(warm_delta.1, 0);
+
+        (populate_delta, protected_entries, retained_delta)
     }
 
     pub(crate) fn repeated_canonical_packed_cache_stats(
@@ -532,6 +583,62 @@ impl HashLifeEngine {
 
         assert_eq!(first, second);
         (first_delta, second_delta)
+    }
+
+    pub(crate) fn direct_parent_cache_survives_skip_gc(
+        &mut self,
+        grid: &BitGrid,
+    ) -> ((usize, usize, usize), usize, (usize, usize, usize)) {
+        let (root, _, _) = self.embed_grid_state(grid);
+        let packed = self.node_columns.packed_key(root);
+
+        let before = (
+            self.stats.direct_parent_cached_result_hits,
+            self.stats.canonical_transform_root_reconstructions,
+            self.stats.direct_parent_winner_fallbacks,
+        );
+        let first = self.canonicalize_packed_direct_for_tests(packed, Symmetry::Identity);
+        let populate_delta = (
+            self.stats.direct_parent_cached_result_hits - before.0,
+            self.stats.canonical_transform_root_reconstructions - before.1,
+            self.stats.direct_parent_winner_fallbacks - before.2,
+        );
+
+        let before = (
+            self.stats.direct_parent_cached_result_hits,
+            self.stats.canonical_transform_root_reconstructions,
+            self.stats.direct_parent_winner_fallbacks,
+        );
+        let warm = self.canonicalize_packed_direct_for_tests(packed, Symmetry::Identity);
+        let warm_delta = (
+            self.stats.direct_parent_cached_result_hits - before.0,
+            self.stats.canonical_transform_root_reconstructions - before.1,
+            self.stats.direct_parent_winner_fallbacks - before.2,
+        );
+
+        self.maybe_garbage_collect("skip");
+        let protected_entries =
+            self.direct_parent_canonical_cache.len() + self.hot_direct_parent_canonical_cache.len();
+
+        let before = (
+            self.stats.direct_parent_cached_result_hits,
+            self.stats.canonical_transform_root_reconstructions,
+            self.stats.direct_parent_winner_fallbacks,
+        );
+        let second = self.canonicalize_packed_direct_for_tests(packed, Symmetry::Identity);
+        let retained_delta = (
+            self.stats.direct_parent_cached_result_hits - before.0,
+            self.stats.canonical_transform_root_reconstructions - before.1,
+            self.stats.direct_parent_winner_fallbacks - before.2,
+        );
+
+        assert_eq!(first, warm);
+        assert_eq!(first, second);
+        assert!(warm_delta.0 > 0);
+        assert_eq!(warm_delta.1, 0);
+        assert_eq!(warm_delta.2, 0);
+
+        (populate_delta, protected_entries, retained_delta)
     }
 
     pub(crate) fn direct_parent_cache_respects_symmetry_mode(
@@ -805,8 +912,6 @@ impl HashLifeEngine {
             symmetry_scan_fallbacks: self.stats.symmetry_scan_fallbacks,
             canonical_phase2_fallbacks: self.stats.canonical_phase2_fallbacks,
             canonical_result_batch_fallbacks: self.stats.canonical_result_batch_fallbacks,
-            canonical_blocked_structural_fallbacks: self.stats
-                .canonical_blocked_structural_fallbacks,
             jump_presence_probe_batches: self.stats.jump_presence_probe_batches,
             jump_presence_probe_lanes: self.stats.jump_presence_probe_lanes,
             jump_presence_probe_hits: self.stats.jump_presence_probe_hits,
@@ -816,7 +921,7 @@ impl HashLifeEngine {
             recomputed_fingerprint_probes: self.stats.recomputed_fingerprint_probes,
             gc_mark_batches: self.stats.gc_mark_batches,
             gc_remap_batches: self.stats.gc_remap_batches,
-            gc_transient_entries_before: self.stats.gc_transient_entries_before,
+            gc_transient_pressure_entries_before: self.stats.gc_transient_pressure_entries_before,
             gc_canonical_cache_entries_before: self.stats.gc_canonical_cache_entries_before,
             gc_skipped_with_transient_growth: self.stats.gc_skipped_with_transient_growth,
             packed_d4_canonicalization_misses: self.stats.packed_d4_canonicalization_misses,
@@ -826,7 +931,6 @@ impl HashLifeEngine {
             packed_overlap_outputs_produced: self.stats.packed_overlap_outputs_produced,
             packed_cache_result_materializations: self.stats.packed_cache_result_materializations,
             session_full_grid_materializations: self.stats.session_full_grid_materializations,
-            session_bounded_grid_extractions: self.stats.session_bounded_grid_extractions,
             embedded_result_bounded_extractions: self.stats.embedded_result_bounded_extractions,
             clipped_viewport_extractions: self.stats.clipped_viewport_extractions,
             checkpoint_cell_materializations: self.stats.checkpoint_cell_materializations,
@@ -884,7 +988,7 @@ impl HashLifeEngine {
             symmetry_gate_canonical_cache_bypasses: stats.symmetry_gate_canonical_cache_bypasses,
             structural_fast_path_hit_rate: stats.structural_fast_path_hits as f64
                 / structural_fast_path_total.max(1) as f64,
-            canonical_cache_hit_rate: stats.canonical_node_cache_hits as f64
+            canonical_node_cache_hit_rate: stats.canonical_node_cache_hits as f64
                 / canonical_cache_total.max(1) as f64,
             canonical_packed_cache_hit_rate: stats.canonical_packed_cache_hits as f64
                 / canonical_packed_total.max(1) as f64,
@@ -894,7 +998,9 @@ impl HashLifeEngine {
                 / direct_parent_total.max(1) as f64,
             direct_parent_cached_result_hits: stats.direct_parent_cached_result_hits,
             direct_parent_winner_fallbacks: stats.direct_parent_winner_fallbacks,
-            symmetry_scan_fallbacks: stats.symmetry_scan_fallbacks,
+            blocked_symmetry_scan_fallbacks: 0,
+            admitted_symmetry_scan_fallbacks: stats.symmetry_scan_fallbacks,
+            total_symmetry_scan_fallbacks: stats.symmetry_scan_fallbacks,
             symmetry_jump_result_hits: stats.symmetric_jump_result_cache_hits,
             simd_lane_coverage: total_simd_lanes as f64 / total_provisionals.max(1) as f64,
             scalar_commit_ratio: stats.scalar_commit_lanes as f64
@@ -914,7 +1020,7 @@ impl HashLifeEngine {
             gc_reason: stats.gc_reason,
             gc_runs: stats.gc_runs,
             gc_skips: stats.gc_skips,
-            gc_transient_entries_before: stats.gc_transient_entries_before,
+            gc_transient_pressure_entries_before: stats.gc_transient_pressure_entries_before,
             gc_canonical_cache_entries_before: stats.gc_canonical_cache_entries_before,
             gc_skipped_with_transient_growth: stats.gc_skipped_with_transient_growth,
             canonical_packed_cache_entries: stats.canonical_packed_cache_entries,
@@ -931,7 +1037,6 @@ impl HashLifeEngine {
             packed_overlap_outputs_produced: stats.packed_overlap_outputs_produced,
             packed_cache_result_materializations: stats.packed_cache_result_materializations,
             session_full_grid_materializations: stats.session_full_grid_materializations,
-            session_bounded_grid_extractions: stats.session_bounded_grid_extractions,
             embedded_result_bounded_extractions: stats.embedded_result_bounded_extractions,
             clipped_viewport_extractions: stats.clipped_viewport_extractions,
             checkpoint_cell_materializations: stats.checkpoint_cell_materializations,

@@ -651,7 +651,16 @@ fn random_seed_420_billion_target_runtime_classification_avoids_full_materializa
     };
     let outcome = OracleSession::new(grid, 0, Default::default(), &mut simulation)
         .advance_runtime_target(1_000_000_000, Some(&mut callback));
-
+    let advance_profile = simulation.hashlife_advance_profile();
+    let hashlife_steps = planned_steps
+        .iter()
+        .filter(|(_, _, backend)| matches!(backend, SimulationBackend::HashLife))
+        .count();
+    let hashlife_generations = planned_steps
+        .iter()
+        .filter(|(_, _, backend)| matches!(backend, SimulationBackend::HashLife))
+        .map(|(_, step_span, _)| *step_span)
+        .sum::<u64>();
     assert_eq!(outcome.final_generation, 1_000_000_000);
     assert_eq!(
         simulation.hashlife_sample_materializations(),
@@ -662,11 +671,23 @@ fn random_seed_420_billion_target_runtime_classification_avoids_full_materializa
         !planned_steps.is_empty(),
         "expected billion-generation runtime target to plan at least one step"
     );
+    assert_eq!(
+        hashlife_generations, 1_000_000_000,
+        "expected billion-generation runtime target to stay entirely on HashLife once planned"
+    );
+    assert_eq!(
+        advance_profile.advance_root_extract_reembed_calls, 0,
+        "expected runtime-target HashLife continuation to avoid extract/re-embed fallback"
+    );
     assert!(
         planned_steps
             .iter()
             .any(|(_, step_span, backend)| matches!(backend, SimulationBackend::HashLife) && *step_span >= (1 << 20)),
         "expected billion-generation runtime target to use at least one large HashLife jump, got {planned_steps:?}"
+    );
+    assert!(
+        hashlife_steps >= 2,
+        "expected runtime-target planner to peel at least one non-power-of-two tail segment before the final large jump, got {planned_steps:?}"
     );
     assert!(
         observed_metrics

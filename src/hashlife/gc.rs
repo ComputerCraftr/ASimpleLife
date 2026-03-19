@@ -118,6 +118,21 @@ impl HashLifeEngine {
             + self.packed_transform_intern.len()
     }
 
+    pub(super) fn transient_cache_pressure_entries(&self) -> usize {
+        self.jump_cache.len()
+            + self.root_result_cache.len()
+            + self.overlap_cache.len()
+            + self.oriented_result_cache.len()
+            + self.canonical_packed_cache.len()
+            + self.canonical_oriented_cache.len()
+            + self.direct_parent_canonical_cache.len()
+            + self.structural_fast_path_cache.len()
+            + self.packed_structural_fast_path_cache.len()
+            + self.canonical_transform_cache.len()
+            + self.packed_transform_compare_cache.len()
+            + self.packed_transform_intern.len()
+    }
+
     pub(super) fn initialize_runtime_state(&mut self) {
         self.dead_leaf = self.intern_leaf(false);
         self.live_leaf = self.intern_leaf(true);
@@ -133,7 +148,10 @@ impl HashLifeEngine {
         #[cfg(test)]
         self.transform_cache.clear();
         self.canonical_transform_cache.clear();
-        self.oriented_result_cache.clear();
+        if !preserve_hot_canonical {
+            self.oriented_result_cache.clear();
+            self.materialized_packed_result_cache.clear();
+        }
         self.reset_packed_transform_state();
         self.canonical_node_cache.clear();
         self.canonical_packed_cache.clear();
@@ -164,7 +182,7 @@ impl HashLifeEngine {
         if reason == "skip" {
             self.stats.gc_reason = "skip";
             self.stats.gc_skips += 1;
-            if self.transient_cache_entries() >= HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER {
+            if self.transient_cache_pressure_entries() >= HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER {
                 self.stats.gc_skipped_with_transient_growth += 1;
             }
             self.clear_transient_state(true);
@@ -172,7 +190,7 @@ impl HashLifeEngine {
         }
 
         self.stats.gc_runs += 1;
-        self.stats.gc_transient_entries_before = self.transient_cache_entries();
+        self.stats.gc_transient_pressure_entries_before = self.transient_cache_pressure_entries();
         self.stats.gc_canonical_cache_entries_before = self.canonical_cache_entries();
         let (marked, live_nodes) = self.mark_live_nodes();
         self.stats.nodes_before_mark = self.node_count();
@@ -181,7 +199,7 @@ impl HashLifeEngine {
         let should_compact = (self.node_count() >= HASHLIFE_GC_MIN_NODES
             && reclaimable >= HASHLIFE_GC_MIN_RECLAIM
             && (reclaimable * 4 >= self.node_count() || reason != "skip"))
-            || self.transient_cache_entries() >= HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER;
+            || self.transient_cache_pressure_entries() >= HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER;
 
         if should_compact {
             self.stats.gc_reason = "compacted";
@@ -262,6 +280,11 @@ impl HashLifeEngine {
             self.hot_canonical_oriented_cache.iter().collect::<Vec<_>>();
         let old_hot_direct_parent = self
             .hot_direct_parent_canonical_cache
+            .iter()
+            .collect::<Vec<_>>();
+        let old_oriented_result_cache = self.oriented_result_cache.iter().collect::<Vec<_>>();
+        let old_materialized_packed_result_cache = self
+            .materialized_packed_result_cache
             .iter()
             .collect::<Vec<_>>();
         let old_len = self.node_count();
@@ -416,6 +439,46 @@ impl HashLifeEngine {
                 },
                 remapped_value,
             );
+        }
+
+        self.oriented_result_cache =
+            FlatTable::with_capacity(old_oriented_result_cache.len().saturating_mul(2).max(16));
+        for (key, value) in old_oriented_result_cache {
+            let (Some(remapped_packed), Some(remapped_value)) = (
+                Self::remap_packed_node_key(&remap, key.packed),
+                Self::remap_packed_node_key(&remap, value),
+            ) else {
+                continue;
+            };
+            self.oriented_result_cache.insert(
+                PackedSymmetryKey {
+                    packed: remapped_packed,
+                    symmetry: key.symmetry,
+                },
+                remapped_value,
+            );
+        }
+
+        self.materialized_packed_result_cache = FlatTable::with_capacity(
+            old_materialized_packed_result_cache
+                .len()
+                .saturating_mul(2)
+                .max(16),
+        );
+        for (key, value) in old_materialized_packed_result_cache {
+            let Some(remapped_key) = Self::remap_packed_node_key(&remap, key) else {
+                continue;
+            };
+            let value_index = value as usize;
+            if value_index >= remap.len() {
+                continue;
+            }
+            let remapped_value = remap[value_index];
+            if remapped_value == NodeId::MAX {
+                continue;
+            }
+            self.materialized_packed_result_cache
+                .insert(remapped_key, remapped_value);
         }
     }
 }

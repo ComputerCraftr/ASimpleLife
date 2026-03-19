@@ -179,6 +179,7 @@ impl HashLifeEngine {
             let parent_child_start = child_arena.len();
             let next_exp = parent_records[lane].next_exp;
             let mut parent_query_indices = [u16::MAX; 9];
+            let mut parent_arena_offsets = [u8::MAX; 9];
             let mut parent_unique_count = 0usize;
 
             for overlap_index in REVERSED_OVERLAP_INDEX {
@@ -198,20 +199,17 @@ impl HashLifeEngine {
                     inserted
                 } as u16;
 
-                let mut reused_parent_slot = None;
-                for local_index in 0..parent_unique_count {
-                    if parent_query_indices[local_index] == query_index {
-                        reused_parent_slot = Some(local_index);
-                        break;
-                    }
-                }
-
-                if let Some(local_index) = reused_parent_slot {
-                    let arena_index = parent_child_start + local_index;
+                if let Some(local_index) = parent_query_indices[..parent_unique_count]
+                    .iter()
+                    .position(|&existing| existing == query_index)
+                {
+                    let arena_index =
+                        parent_child_start + usize::from(parent_arena_offsets[local_index]);
                     child_arena[arena_index].duplicate_count =
                         child_arena[arena_index].duplicate_count.saturating_add(1);
                 } else {
                     parent_query_indices[parent_unique_count] = query_index;
+                    parent_arena_offsets[parent_unique_count] = parent_unique_count as u8;
                     parent_unique_count += 1;
                     child_arena.push(RecursiveParentChildRef {
                         query_index,

@@ -1,6 +1,18 @@
 use super::*;
 
+const ORACLE_HASHLIFE_EARLY_LOWBIT_MAX_STEP: u64 = 1 << 19;
+const ORACLE_HASHLIFE_EARLY_LOWBIT_REORDER_MAX_GENERATIONS: u64 = 1 << 31;
+
 impl<'a> OracleSession<'a> {
+    pub(super) fn runtime_hashlife_lowbit_step(&self, remaining: u64) -> Option<u64> {
+        let lowest_set_bit = remaining & remaining.wrapping_neg();
+        (lowest_set_bit > 0
+            && remaining <= ORACLE_HASHLIFE_EARLY_LOWBIT_REORDER_MAX_GENERATIONS
+            && lowest_set_bit <= ORACLE_HASHLIFE_EARLY_LOWBIT_MAX_STEP
+            && remaining > ORACLE_HASHLIFE_EARLY_LOWBIT_MAX_STEP)
+            .then_some(lowest_set_bit)
+    }
+
     pub(super) fn plan_step(
         &mut self,
         generation_limit: u64,
@@ -57,6 +69,21 @@ impl<'a> OracleSession<'a> {
             generation: self.generation,
             step_span,
             backend: self.planned_backend_for_shape(step_span),
+        }
+    }
+
+    pub(super) fn plan_runtime_hashlife_step(&mut self, remaining: u64) -> OracleStepPlan {
+        let shape = self.current_state_shape();
+        let safe_hashlife_jump = max_hashlife_safe_jump_from_span(shape.bounds_span).max(1);
+        let step_span = if let Some(lowbit) = self.runtime_hashlife_lowbit_step(remaining) {
+            lowbit
+        } else {
+            remaining.min(safe_hashlife_jump).max(1)
+        };
+        OracleStepPlan {
+            generation: self.generation,
+            step_span,
+            backend: SimulationBackend::HashLife,
         }
     }
 

@@ -174,8 +174,7 @@ impl HashLifeEngine {
                 )
             } else {
                 let (packed, fingerprint) = self.node_columns.packed_key_and_fingerprint(node);
-                let transform_id = self.transform_packed_node_key(packed, Symmetry::Identity);
-                let structural = self.structural_key_from_transform_id(transform_id);
+                let structural = self.node_columns.symmetry_entry(node, Symmetry::Identity).structural;
                 (packed, structural, Symmetry::Identity, fingerprint, true)
             };
         self.record_fingerprint_probe(used_cached_fingerprint, 1);
@@ -239,8 +238,10 @@ impl HashLifeEngine {
                 } else {
                     let (packed, fingerprint) =
                         self.node_columns.packed_key_and_fingerprint(nodes[lane]);
-                    let transform_id = self.transform_packed_node_key(packed, Symmetry::Identity);
-                    let structural = self.structural_key_from_transform_id(transform_id);
+                    let structural = self
+                        .node_columns
+                        .symmetry_entry(nodes[lane], Symmetry::Identity)
+                        .structural;
                     (packed, structural, Symmetry::Identity, fingerprint, true)
                 };
             self.record_fingerprint_probe(used_cached_fingerprint, 1);

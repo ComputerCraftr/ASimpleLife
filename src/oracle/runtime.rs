@@ -364,15 +364,22 @@ impl<'a> OracleSession<'a> {
             }
 
             let remaining = target_generation.saturating_sub(self.generation);
-            let plan = if self.generation < cycle_probe_limit {
+            let mut plan = if self.generation < cycle_probe_limit {
                 OracleStepPlan {
                     generation: self.generation,
                     step_span: 1,
                     backend: SimulationBackend::SimdChunk,
                 }
+            } else if self.is_hashlife_phase() || self.simulation.hashlife_loaded() {
+                self.plan_runtime_hashlife_step(remaining)
             } else {
                 self.plan_target_step(remaining)
             };
+            if matches!(plan.backend, SimulationBackend::HashLife)
+                && let Some(lowbit) = self.runtime_hashlife_lowbit_step(remaining)
+            {
+                plan.step_span = lowbit;
+            }
             let plan = OracleStepPlan {
                 step_span: plan.step_span.min(remaining),
                 ..plan

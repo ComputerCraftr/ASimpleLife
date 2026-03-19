@@ -180,11 +180,11 @@ fn hashlife_oriented_result_cache_reuses_materialized_output() {
     );
     assert!(
         first_delta.1 > 0,
-        "first oriented result batch should perform inverse transform work"
+        "first oriented result batch should reconstruct the oriented packed root once"
     );
     assert_eq!(
         second_delta.1, 0,
-        "second identical oriented batch should hit oriented-result cache"
+        "second identical oriented batch should not reconstruct the oriented packed root"
     );
 }
 
@@ -239,6 +239,78 @@ fn hashlife_hot_canonical_cache_survives_skip_gc() {
     assert!(
         retained_delta.0 > 0,
         "protected canonical cache should hit after skip GC"
+    );
+}
+
+#[test]
+fn hashlife_oriented_result_cache_survives_skip_gc() {
+    let grid = random_soup(
+        LARGE_SOUP_DIM,
+        LARGE_SOUP_DIM,
+        SMALL_SOUP_FILL,
+        SEED_ORIENTED_RESULT_CACHE,
+    );
+    let mut oracle = HashLifeEngine::default();
+    let (populate_delta, protected_entries, retained_delta) =
+        oracle.oriented_result_cache_survives_skip_gc(&grid);
+
+    assert!(
+        populate_delta.0 > 0,
+        "first oriented result should materialize once"
+    );
+    assert!(
+        populate_delta.1 > 0,
+        "first oriented result should reconstruct the oriented packed root once"
+    );
+    assert!(
+        protected_entries > 0,
+        "skip GC should preserve at least one oriented result cache entry"
+    );
+    assert_eq!(
+        retained_delta.1, 0,
+        "protected oriented result cache should avoid post-skip-GC transform-root reconstruction"
+    );
+    assert_eq!(
+        retained_delta.0, 0,
+        "protected oriented result cache should avoid post-skip-GC packed-result rematerialization"
+    );
+}
+
+#[test]
+fn hashlife_direct_parent_cache_survives_skip_gc() {
+    let grid = random_soup(
+        LARGE_SOUP_DIM,
+        LARGE_SOUP_DIM,
+        SMALL_SOUP_FILL,
+        SEED_DIRECT_PARENT_WINNER,
+    );
+    let mut oracle = HashLifeEngine::default();
+    let (populate_delta, protected_entries, retained_delta) =
+        oracle.direct_parent_cache_survives_skip_gc(&grid);
+
+    assert!(
+        populate_delta.1 > 0,
+        "first direct-parent canonicalization should reconstruct the canonical root once"
+    );
+    assert!(
+        populate_delta.2 > 0,
+        "first direct-parent canonicalization should pay winner fallback once"
+    );
+    assert!(
+        protected_entries > 0,
+        "skip GC should preserve at least one direct-parent cache entry"
+    );
+    assert!(
+        retained_delta.0 > 0,
+        "protected direct-parent cache should hit after skip GC"
+    );
+    assert_eq!(
+        retained_delta.1, 0,
+        "protected direct-parent cache should avoid post-skip-GC canonical root reconstruction"
+    );
+    assert_eq!(
+        retained_delta.2, 0,
+        "protected direct-parent cache should avoid post-skip-GC winner fallback"
     );
 }
 
@@ -479,7 +551,8 @@ fn hashlife_summary_tracks_symmetry_reuse_invariants() {
         "{summary:?}"
     );
     assert!(
-        summary.canonical_cache_hit_rate >= 0.0 && summary.canonical_cache_hit_rate <= 1.0,
+        summary.canonical_node_cache_hit_rate >= 0.0
+            && summary.canonical_node_cache_hit_rate <= 1.0,
         "{summary:?}"
     );
     assert!(
@@ -519,6 +592,6 @@ fn hashlife_wider_structured_workload_triggers_gc_before_runaway_cache_growth() 
     assert!(summary.nodes_match_intern, "{summary:?}");
     assert_eq!(summary.dependency_stalls, 0, "{summary:?}");
     assert!(summary.gc_runs > 0, "{summary:?}");
-    assert!(summary.gc_transient_entries_before > 0, "{summary:?}");
+    assert!(summary.gc_transient_pressure_entries_before > 0, "{summary:?}");
     assert!(summary.gc_canonical_cache_entries_before > 0, "{summary:?}");
 }

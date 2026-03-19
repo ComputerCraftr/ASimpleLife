@@ -34,6 +34,8 @@ mod stats;
 mod test_probes;
 
 pub use session::HashLifeSession;
+#[cfg(test)]
+pub(crate) use session::HashLifeSessionAdvanceProfile;
 pub use signature::{HashLifeCheckpoint, HashLifeCheckpointKey, HashLifeCheckpointSignature};
 pub use snapshot::{
     HashLifeSnapshotError, deserialize_to_grid as deserialize_snapshot_to_grid,
@@ -206,13 +208,6 @@ struct DirectCanonicalParentKey {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PackedCanonicalBatchKey {
-    level: u32,
-    symmetry: Symmetry,
-    children: [CanonicalNodeRef; 4],
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct JumpQuery {
     node: NodeId,
     step_exp: u32,
@@ -310,17 +305,6 @@ impl FlatKey for DirectCanonicalParentKey {
             self.children.map(|child| (child >> 64) as u64),
         );
         mix_seed(low ^ high.rotate_left(11))
-    }
-}
-
-impl FlatKey for PackedCanonicalBatchKey {
-    fn fingerprint(&self) -> u64 {
-        let low = hash_u64_words_with_level(self.level, self.children.map(|child| child as u64));
-        let high = hash_u64_words_with_level(
-            self.level ^ 0x51ED_270B ^ (self.symmetry as u32),
-            self.children.map(|child| (child >> 64) as u64),
-        );
-        mix_seed(low ^ high.rotate_left(7) ^ ((self.symmetry as u64) << 48))
     }
 }
 
@@ -558,7 +542,8 @@ pub struct HashLifeEngine {
     #[cfg(test)]
     transform_cache: FlatTable<TransformCacheKey, NodeId>,
     canonical_transform_cache: FlatTable<PackedSymmetryKey, PackedTransformId>,
-    oriented_result_cache: FlatTable<PackedSymmetryKey, NodeId>,
+    oriented_result_cache: FlatTable<PackedSymmetryKey, PackedNodeKey>,
+    materialized_packed_result_cache: FlatTable<PackedNodeKey, NodeId>,
     packed_transform_compare_cache: FlatTable<PackedTransformCompareKey, i8>,
     packed_transform_intern: FlatTable<PackedTransformShapeKey, PackedTransformId>,
     packed_transform_nodes: Vec<PackedTransformNode>,
@@ -610,6 +595,7 @@ impl Default for HashLifeEngine {
             transform_cache: FlatTable::new(),
             canonical_transform_cache: FlatTable::new(),
             oriented_result_cache: FlatTable::new(),
+            materialized_packed_result_cache: FlatTable::new(),
             packed_transform_compare_cache: FlatTable::new(),
             packed_transform_intern: FlatTable::new(),
             packed_transform_nodes: Vec::new(),
@@ -795,18 +781,22 @@ impl HashLifeEngine {
         current_root: Option<NodeId>,
     ) -> Option<NodeId> {
         let root = current_root?;
-        if !should_run_active_hashlife_gc(self.node_count(), self.last_gc_nodes)
-            && self.transient_cache_entries() < HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER
-        {
+        let active_gc_needed = should_run_active_hashlife_gc(self.node_count(), self.last_gc_nodes);
+        let transient_pressure_high =
+            self.transient_cache_pressure_entries() >= HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER;
+        if !active_gc_needed && !transient_pressure_high {
             return Some(root);
         }
 
         self.record_retained_root(root);
         self.stats.jump_cache_before_clear = self.jump_cache.len();
-        let gc_reason = if self.transient_cache_entries() >= HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER
-        {
-            "transient_threshold"
-        } else if self.node_count() >= HASHLIFE_GC_MIN_NODES {
+        if transient_pressure_high && !active_gc_needed {
+            self.stats.gc_reason = "transient_deferred";
+            self.stats.gc_skips += 1;
+            self.stats.gc_skipped_with_transient_growth += 1;
+            return Some(root);
+        }
+        let gc_reason = if self.node_count() >= HASHLIFE_GC_MIN_NODES {
             "node_threshold"
         } else {
             "growth_threshold"

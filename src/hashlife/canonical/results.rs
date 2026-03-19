@@ -4,9 +4,41 @@ use super::*;
 struct PackedCanonicalInputRecord {
     input: PackedSymmetryKey,
     input_children: [CanonicalNodeRef; 4],
+    canonical_entry: PackedSymmetryKey,
 }
 
 impl HashLifeEngine {
+    #[inline]
+    fn oriented_packed_result(
+        &mut self,
+        packed: PackedNodeKey,
+        cached_result_symmetry: Symmetry,
+        output_symmetry: Symmetry,
+    ) -> PackedNodeKey {
+        let combined = cached_result_symmetry.inverse().then(output_symmetry);
+        if combined == Symmetry::Identity {
+            packed
+        } else {
+            let cache_key = PackedSymmetryKey {
+                packed,
+                symmetry: combined,
+            };
+            self.stats.oriented_result_cache_lookups += 1;
+            if let Some(oriented_packed) = self.oriented_result_cache.get(&cache_key) {
+                self.stats.oriented_result_cache_hits += 1;
+                oriented_packed
+            } else {
+                self.stats.oriented_result_cache_misses += 1;
+                self.stats.packed_inverse_transform_hits += 1;
+                self.stats.oriented_transform_root_reconstructions += 1;
+                let transformed = self.transform_packed_node_key(packed, combined);
+                let oriented_packed = self.packed_root_from_transform_id(transformed);
+                self.oriented_result_cache.insert(cache_key, oriented_packed);
+                oriented_packed
+            }
+        }
+    }
+
     #[inline]
     pub(in crate::hashlife) fn materialize_oriented_packed_result(
         &mut self,
@@ -14,29 +46,9 @@ impl HashLifeEngine {
         cached_result_symmetry: Symmetry,
         output_symmetry: Symmetry,
     ) -> NodeId {
-        let combined = cached_result_symmetry.inverse().then(output_symmetry);
-        if combined == Symmetry::Identity {
-            self.materialize_packed_node_key(packed)
-        } else {
-            let cache_key = PackedSymmetryKey {
-                packed,
-                symmetry: combined,
-            };
-            self.stats.oriented_result_cache_lookups += 1;
-            if let Some(oriented) = self.oriented_result_cache.get(&cache_key) {
-                self.stats.oriented_result_cache_hits += 1;
-                oriented
-            } else {
-                self.stats.oriented_result_cache_misses += 1;
-                self.stats.packed_inverse_transform_hits += 1;
-                self.stats.oriented_transform_root_reconstructions += 1;
-                let transformed = self.transform_packed_node_key(packed, combined);
-                let oriented_packed = self.packed_root_from_transform_id(transformed);
-                let oriented = self.materialize_packed_node_key(oriented_packed);
-                self.oriented_result_cache.insert(cache_key, oriented);
-                oriented
-            }
-        }
+        let oriented_packed =
+            self.oriented_packed_result(packed, cached_result_symmetry, output_symmetry);
+        self.materialize_packed_node_key(oriented_packed)
     }
 
     fn canonicalize_result_under_input_symmetry(
@@ -73,48 +85,64 @@ impl HashLifeEngine {
 
     fn canonical_packed_result_entries_for_unique_inputs(
         &mut self,
-        unique_inputs: &[PackedCanonicalInputRecord],
-        unique_entries: &mut [PackedSymmetryKey],
+        unique_inputs: &mut [PackedCanonicalInputRecord],
     ) {
         if unique_inputs.is_empty() {
             return;
         }
 
-        let mut parent_shape_lookup =
-            FlatTable::<PackedCanonicalBatchKey, usize>::with_capacity(unique_inputs.len().max(4));
-        let mut parent_shape_entries = Vec::<PackedSymmetryKey>::with_capacity(unique_inputs.len());
-
-        for (unique_index, record) in unique_inputs.iter().enumerate() {
+        for unique_index in 0..unique_inputs.len() {
+            let record = unique_inputs[unique_index];
             let input = record.input;
             if input.packed.level == 0 {
-                unique_entries[unique_index] = self.canonical_packed_result_entry(input);
+                unique_inputs[unique_index].canonical_entry =
+                    self.canonical_packed_result_entry(input);
                 continue;
             }
 
-            if input.symmetry == Symmetry::Identity {
-                if let Some(cached) = self.lookup_canonical_packed_identity(input.packed) {
-                    unique_entries[unique_index] = PackedSymmetryKey {
-                        packed: cached.packed,
-                        symmetry: cached.symmetry,
-                    };
-                    continue;
+            if let Some(cached) = self.lookup_direct_parent_identity(
+                input.packed.level,
+                input.symmetry,
+                record.input_children,
+            ) {
+                self.stats.direct_parent_cached_result_hits += 1;
+                if input.symmetry == Symmetry::Identity {
+                    self.cache_canonical_packed_identity(input.packed, cached);
+                } else {
+                    self.cache_canonical_oriented_identity(input, cached);
                 }
-            } else if let Some(cached) = self.lookup_canonical_oriented_identity(input) {
-                unique_entries[unique_index] = PackedSymmetryKey {
+                unique_inputs[unique_index].canonical_entry = PackedSymmetryKey {
                     packed: cached.packed,
                     symmetry: cached.symmetry,
                 };
                 continue;
             }
 
-            let batch_key = PackedCanonicalBatchKey {
-                level: input.packed.level,
-                symmetry: input.symmetry,
-                children: record.input_children,
-            };
-            if let Some(parent_index) = parent_shape_lookup.get(&batch_key) {
-                unique_entries[unique_index] = parent_shape_entries[parent_index];
-                self.stats.canonical_result_batch_local_reuses += 1;
+            if input.symmetry == Symmetry::Identity {
+                if let Some(cached) = self.lookup_canonical_packed_identity(input.packed) {
+                    self.backfill_direct_parent_identity(
+                        input.packed,
+                        input.symmetry,
+                        record.input_children,
+                        cached,
+                    );
+                    unique_inputs[unique_index].canonical_entry = PackedSymmetryKey {
+                        packed: cached.packed,
+                        symmetry: cached.symmetry,
+                    };
+                    continue;
+                }
+            } else if let Some(cached) = self.lookup_canonical_oriented_identity(input) {
+                self.backfill_direct_parent_identity(
+                    input.packed,
+                    input.symmetry,
+                    record.input_children,
+                    cached,
+                );
+                unique_inputs[unique_index].canonical_entry = PackedSymmetryKey {
+                    packed: cached.packed,
+                    symmetry: cached.symmetry,
+                };
                 continue;
             }
 
@@ -130,14 +158,12 @@ impl HashLifeEngine {
                 packed: canonical.node.packed,
                 symmetry: canonical.node.symmetry,
             };
-            parent_shape_lookup.insert(batch_key, parent_shape_entries.len());
-            parent_shape_entries.push(entry);
             if input.symmetry == Symmetry::Identity {
                 self.cache_canonical_packed_identity(input.packed, canonical.node);
             } else {
                 self.cache_canonical_oriented_identity(input, canonical.node);
             }
-            unique_entries[unique_index] = entry;
+            unique_inputs[unique_index].canonical_entry = entry;
         }
     }
 
@@ -150,6 +176,10 @@ impl HashLifeEngine {
         }
         let mut unique_lookup =
             FlatTable::<PackedSymmetryKey, usize>::with_capacity(lanes.len().max(4));
+        let empty_entry = PackedSymmetryKey {
+            packed: PackedNodeKey::new(0, [0; 4]),
+            symmetry: Symmetry::Identity,
+        };
         let mut unique_inputs = Vec::<PackedCanonicalInputRecord>::with_capacity(lanes.len());
         for lane in lanes.iter_mut() {
             let packed_input = lane.packed_input;
@@ -169,24 +199,18 @@ impl HashLifeEngine {
                             packed_input.symmetry,
                         )
                     },
+                    canonical_entry: empty_entry,
                 });
             }
         }
         self.stats.canonical_result_unique_inputs += unique_inputs.len();
 
-        let mut unique_entries = vec![
-            PackedSymmetryKey {
-                packed: PackedNodeKey::new(0, [0; 4]),
-                symmetry: Symmetry::Identity,
-            };
-            unique_inputs.len()
-        ];
         let phase2_fallbacks_before = self.stats.canonical_result_batch_fallbacks;
-        self.canonical_packed_result_entries_for_unique_inputs(&unique_inputs, &mut unique_entries);
+        self.canonical_packed_result_entries_for_unique_inputs(&mut unique_inputs);
         self.stats.canonical_phase2_fallbacks +=
             self.stats.canonical_result_batch_fallbacks - phase2_fallbacks_before;
         for lane in lanes.iter_mut() {
-            lane.canonical_entry = unique_entries[lane.unique_input_index];
+            lane.canonical_entry = unique_inputs[lane.unique_input_index].canonical_entry;
         }
     }
 

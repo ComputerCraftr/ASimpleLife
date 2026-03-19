@@ -3,6 +3,8 @@ use crate::hashlife::{
     GridExtractionError, GridExtractionPolicy, HashLifeCheckpoint, HashLifeSession,
     HashLifeSnapshotError,
 };
+#[cfg(test)]
+use crate::hashlife::HashLifeSessionAdvanceProfile;
 use crate::life::step_grid_with_changes_and_memo;
 use crate::memo::Memo;
 use crate::normalize::{NormalizedGridSignature, normalize};
@@ -245,6 +247,11 @@ impl SimulationSession {
     #[cfg(test)]
     pub(crate) fn hashlife_sample_materializations(&self) -> usize {
         self.hashlife_session.sample_materializations()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hashlife_advance_profile(&self) -> HashLifeSessionAdvanceProfile {
+        self.hashlife_session.advance_profile()
     }
 
     pub fn planned_backend_from_metrics(

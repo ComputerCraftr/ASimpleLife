@@ -5,7 +5,6 @@ mod results;
 impl HashLifeEngine {
     pub(super) fn reset_packed_transform_state(&mut self) {
         self.canonical_transform_cache.clear();
-        self.oriented_result_cache.clear();
         self.packed_transform_compare_cache.clear();
         self.packed_transform_intern.clear();
         self.packed_transform_nodes.clear();
@@ -79,15 +78,6 @@ impl HashLifeEngine {
         self.packed_transform_packed_roots.push(None);
         self.packed_transform_intern.insert(shape, id);
         id
-    }
-
-    #[inline]
-    #[cfg(test)]
-    pub(super) fn structural_key_from_transform_id(
-        &self,
-        id: PackedTransformId,
-    ) -> CanonicalStructKey {
-        self.packed_transform_nodes[id as usize].structural
     }
 
     pub(super) fn transform_packed_node_key(
@@ -417,21 +407,7 @@ impl HashLifeEngine {
             };
         }
         self.stats.structural_fast_path_misses += 1;
-        let structural = if packed.level == 0 {
-            CanonicalStructKey::leaf(packed.children[0] != 0)
-        } else {
-            let input_children = self.direct_parent_input_children(packed, Symmetry::Identity);
-            if let Some(canonical) =
-                self.lookup_direct_parent_identity(packed.level, Symmetry::Identity, input_children)
-            {
-                canonical.structural
-            } else {
-                self.stats.canonical_blocked_structural_fallbacks += 1;
-                self.stats.symmetry_scan_fallbacks += 1;
-                self.transformed_order_entry(packed, Symmetry::Identity)
-                    .structural
-            }
-        };
+        let structural = self.node_columns.symmetry_entry(node, Symmetry::Identity).structural;
         let canonical = CanonicalNodeProbe {
             node: CanonicalNodeIdentity {
                 packed,
@@ -484,6 +460,7 @@ impl HashLifeEngine {
         base_symmetry: Symmetry,
         record_miss: bool,
     ) -> (PackedTransformId, Symmetry, CanonicalStructKey) {
+        self.stats.direct_parent_winner_fallbacks += 1;
         let (canonical_symmetry, canonical_entry) =
             self.scan_canonical_transform_winner(packed, base_symmetry, record_miss);
         let canonical_id =
@@ -546,7 +523,6 @@ impl HashLifeEngine {
             return Some(cached);
         }
         self.stats.direct_parent_winner_misses += 1;
-        self.stats.direct_parent_winner_fallbacks += 1;
         None
     }
 
@@ -559,6 +535,27 @@ impl HashLifeEngine {
     ) {
         let cache_key = self.direct_parent_cache_key(level, base_symmetry, input_children);
         self.direct_parent_canonical_cache.insert(cache_key, canonical);
+    }
+
+    #[inline]
+    fn backfill_direct_parent_identity(
+        &mut self,
+        packed: PackedNodeKey,
+        base_symmetry: Symmetry,
+        input_children: [CanonicalNodeRef; 4],
+        canonical: CanonicalNodeIdentity,
+    ) {
+        if packed.level == 0 {
+            return;
+        }
+        let cache_key = self.direct_parent_cache_key(packed.level, base_symmetry, input_children);
+        if self.hot_direct_parent_canonical_cache.get(&cache_key).is_some()
+            || self.direct_parent_canonical_cache.get(&cache_key).is_some()
+        {
+            return;
+        }
+        self.direct_parent_canonical_cache.insert(cache_key, canonical);
+        self.maybe_promote_hot_direct_parent_identity(cache_key, canonical);
     }
 
     #[inline]
@@ -764,6 +761,13 @@ impl HashLifeEngine {
             };
         }
         if let Some(cached) = self.lookup_canonical_packed_identity(packed) {
+            let input_children = self.direct_parent_input_children(packed, Symmetry::Identity);
+            self.backfill_direct_parent_identity(
+                packed,
+                Symmetry::Identity,
+                input_children,
+                cached,
+            );
             return CanonicalNodeProbe {
                 node: cached,
                 fingerprint: if cached.symmetry == Symmetry::Identity {
@@ -804,6 +808,8 @@ impl HashLifeEngine {
             symmetry: base_symmetry,
         };
         if let Some(cached) = self.lookup_canonical_oriented_identity(cache_key) {
+            let input_children = self.direct_parent_input_children(packed, base_symmetry);
+            self.backfill_direct_parent_identity(packed, base_symmetry, input_children, cached);
             return CanonicalNodeProbe {
                 node: cached,
                 fingerprint: cached.packed.fingerprint(),
@@ -1049,8 +1055,13 @@ impl HashLifeEngine {
     }
 
     pub(super) fn materialize_packed_node_key(&mut self, packed: PackedNodeKey) -> NodeId {
+        if let Some(node) = self.materialized_packed_result_cache.get(&packed) {
+            return node;
+        }
         self.stats.packed_cache_result_materializations += 1;
-        self.materialize_packed_node_key_internal(packed)
+        let node = self.materialize_packed_node_key_internal(packed);
+        self.materialized_packed_result_cache.insert(packed, node);
+        node
     }
 
     pub(super) fn canonicalize_packed_node(&mut self, node: NodeId) -> CanonicalNodeProbe {
