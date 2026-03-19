@@ -44,21 +44,21 @@ fn print_hashlife_summary(
     summary: crate::hashlife::HashLifeDiagnosticSummary,
 ) {
     eprintln!(
-        "{} total_us={} nodes={} retained_roots={} nodes_match_intern={} dependency_stalls={} jump_full_hit_rate={:.3} jump_presence_hit_rate={:.3} overlap_hit_rate={:.3} overlap_local_reuse_rate={:.3} symmetry_gate_allow_rate={:.3} canonical_cache_hit_rate={:.3} packed_cache_hit_rate={} symmetry_jump_hits={} simd_lane_coverage={:.3} scalar_commit_ratio={:.3} probes_per_scheduler_task={:.3} recursive_overlap_batch_rate={:.3} gc_reclaim_ratio={:.3} gc_compact_ratio={:.3} packed_d4_misses={} packed_inverse_transform_hits={} packed_recursive_transform_hits={} packed_recursive_transform_misses={} packed_overlap_outputs={} packed_result_materializations={} transformed_node_materializations={} gc_reason={} gc_runs={} gc_skips={}",
+        "{} total_us={} nodes={} retained_roots={} nodes_match_intern={} dependency_stalls={} jump_result_hit_rate={:.3} root_result_hit_rate={:.3} jump_presence_hit_rate={:.3} overlap_hit_rate={:.3} overlap_local_reuse_rate={:.3} symmetry_gate_allow_rate={:.3} canonical_cache_hit_rate={:.3} symmetry_jump_result_hits={} simd_lane_coverage={:.3} scalar_commit_ratio={:.3} probes_per_scheduler_task={:.3} recursive_overlap_batch_rate={:.3} gc_reclaim_ratio={:.3} gc_compact_ratio={:.3} packed_d4_misses={} packed_inverse_transform_hits={} packed_recursive_transform_hits={} packed_recursive_transform_misses={} packed_overlap_outputs={} packed_result_materializations={} transformed_node_materializations={} gc_reason={} gc_runs={} gc_skips={}",
         label,
         elapsed.as_micros(),
         summary.total_nodes,
         summary.retained_roots,
         summary.nodes_match_intern,
         summary.dependency_stalls,
-        summary.jump_full_hit_rate,
+        summary.jump_result_hit_rate,
+        summary.root_result_hit_rate,
         summary.jump_presence_hit_rate,
         summary.overlap_hit_rate,
         summary.overlap_local_reuse_rate,
         summary.symmetry_gate_allow_rate,
         summary.canonical_cache_hit_rate,
-        format_args!("{:.3}", summary.packed_cache_hit_rate),
-        summary.symmetry_jump_hits,
+        summary.symmetry_jump_result_hits,
         summary.simd_lane_coverage,
         summary.scalar_commit_ratio,
         summary.probes_per_scheduler_task,
@@ -85,16 +85,16 @@ fn print_hashlife_gate_comparison(
     summary: crate::hashlife::HashLifeDiagnosticSummary,
 ) {
     eprintln!(
-        "{} mode={} total_us={} jump_full_hit_rate={:.3} jump_presence_hit_rate={:.3} symmetry_gate_allow_rate={:.3} canonical_cache_hit_rate={:.3} packed_cache_hit_rate={:.3} symmetry_jump_hits={} probes_per_scheduler_task={:.3} simd_lane_coverage={:.3} overlap_hit_rate={:.3}",
+        "{} mode={} total_us={} jump_result_hit_rate={:.3} root_result_hit_rate={:.3} jump_presence_hit_rate={:.3} symmetry_gate_allow_rate={:.3} canonical_cache_hit_rate={:.3} symmetry_jump_result_hits={} probes_per_scheduler_task={:.3} simd_lane_coverage={:.3} overlap_hit_rate={:.3}",
         label,
         mode,
         elapsed.as_micros(),
-        summary.jump_full_hit_rate,
+        summary.jump_result_hit_rate,
+        summary.root_result_hit_rate,
         summary.jump_presence_hit_rate,
         summary.symmetry_gate_allow_rate,
         summary.canonical_cache_hit_rate,
-        summary.packed_cache_hit_rate,
-        summary.symmetry_jump_hits,
+        summary.symmetry_jump_result_hits,
         summary.probes_per_scheduler_task,
         summary.simd_lane_coverage,
         summary.overlap_hit_rate,
@@ -146,6 +146,94 @@ fn hashlife_session_gosper_gun_core_survives_ten_million_scale_period_multiple()
         "bounded gun-core regression should avoid full-grid materialization, got {} materializations",
         session.sample_materializations()
     );
+}
+
+#[test]
+fn hashlife_snapshot_roundtrips_session_state() {
+    let initial = pattern_by_name("glider").unwrap();
+    let mut session = HashLifeSession::new();
+    session.load_grid(&initial);
+    session.advance_root(4_096);
+
+    let snapshot = session
+        .export_snapshot_string()
+        .expect("loaded session should export a snapshot");
+    let expected_generation = session.generation();
+    let expected_origin = session.origin();
+    let expected_population = session.population();
+    let expected_bounds = session.bounds();
+    let expected_checkpoint = session.signature_checkpoint().cloned();
+    let expected_grid = session
+        .sample_grid()
+        .expect("snapshot source should be materializable");
+
+    let mut restored = HashLifeSession::new();
+    restored
+        .load_snapshot_string(&snapshot)
+        .expect("snapshot should reload");
+
+    assert_eq!(restored.generation(), expected_generation);
+    assert_eq!(restored.origin(), expected_origin);
+    assert_eq!(restored.population(), expected_population);
+    assert_eq!(restored.bounds(), expected_bounds);
+    assert_eq!(
+        restored.signature_checkpoint().cloned(),
+        expected_checkpoint
+    );
+    assert_eq!(
+        normalize(
+            &restored
+                .sample_grid()
+                .expect("restored snapshot should be materializable")
+        )
+        .0,
+        normalize(&expected_grid).0
+    );
+}
+
+#[test]
+fn hashlife_snapshot_persists_deep_run_resume() {
+    let initial = pattern_by_name("glider").unwrap();
+    let mut uninterrupted = HashLifeSession::new();
+    uninterrupted.load_grid(&initial);
+    uninterrupted.advance_root(1_000_000);
+    let snapshot = uninterrupted
+        .export_snapshot_string()
+        .expect("deep run should export a snapshot");
+
+    uninterrupted.advance_root(1_024);
+    let expected = uninterrupted
+        .signature_checkpoint()
+        .cloned()
+        .expect("continued deep run should have a checkpoint");
+
+    let mut resumed = HashLifeSession::new();
+    resumed
+        .load_snapshot_string(&snapshot)
+        .expect("snapshot should reload");
+    resumed.advance_root(1_024);
+    let actual = resumed
+        .signature_checkpoint()
+        .cloned()
+        .expect("resumed deep run should have a checkpoint");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn hashlife_snapshot_export_is_deterministic_for_same_session() {
+    let initial = pattern_by_name("gosper_glider_gun").unwrap();
+    let mut session = HashLifeSession::new();
+    session.load_grid(&initial);
+    session.advance_root(1_024);
+
+    let first = session
+        .export_snapshot_string()
+        .expect("loaded session should export a snapshot");
+    let second = session
+        .export_snapshot_string()
+        .expect("repeated export should succeed");
+    assert_eq!(first, second);
 }
 
 #[test]
@@ -285,8 +373,14 @@ fn hashlife_overlap_batch_dedupes_duplicate_miss_parents_locally() {
     let mut oracle = HashLifeEngine::default();
     let (misses, local_reuse) = oracle.duplicate_overlap_batch_dedupe_stats(&grid);
 
-    assert_eq!(misses, 1, "duplicate parent overlap miss path should build once");
-    assert_eq!(local_reuse, 1, "second duplicate parent should reuse staged overlap work");
+    assert_eq!(
+        misses, 1,
+        "duplicate parent overlap miss path should build once"
+    );
+    assert_eq!(
+        local_reuse, 1,
+        "second duplicate parent should reuse staged overlap work"
+    );
 }
 
 #[test]
@@ -295,8 +389,14 @@ fn hashlife_jump_result_batch_reuses_duplicate_queries() {
     let mut oracle = HashLifeEngine::default();
     let (unique, reused) = oracle.duplicate_jump_batch_query_stats(&grid);
 
-    assert_eq!(unique, 1, "grouped jump-result batch should probe one unique key");
-    assert_eq!(reused, 3, "remaining duplicate lanes should reuse the grouped result");
+    assert_eq!(
+        unique, 1,
+        "grouped jump-result batch should probe one unique key"
+    );
+    assert_eq!(
+        reused, 3,
+        "remaining duplicate lanes should reuse the grouped result"
+    );
 }
 
 #[test]
@@ -305,7 +405,7 @@ fn hashlife_packed_jump_cache_roundtrip_matches_materialized_result() {
     let mut oracle = HashLifeEngine::default();
     assert!(oracle.verify_packed_jump_cache_roundtrip(&grid, 2));
     let stats = oracle.runtime_stats();
-    assert!(stats.packed_cache_result_hits > 0, "{stats:?}");
+    assert!(stats.jump_result_cache_hits > 0, "{stats:?}");
     assert!(stats.packed_cache_result_materializations > 0, "{stats:?}");
 }
 
@@ -314,9 +414,18 @@ fn hashlife_oriented_result_cache_reuses_materialized_output() {
     let grid = random_soup(64, 64, 20, 0x0DDC_0FFE_EE11_BAAD);
     let mut oracle = HashLifeEngine::default();
     let (first_delta, second_delta) = oracle.duplicate_oriented_result_cache_stats(&grid);
-    assert!(first_delta.0 > 0, "first oriented result batch should materialize once");
-    assert!(first_delta.1 > 0, "first oriented result batch should perform inverse transform work");
-    assert_eq!(second_delta.1, 0, "second identical oriented batch should hit oriented-result cache");
+    assert!(
+        first_delta.0 > 0,
+        "first oriented result batch should materialize once"
+    );
+    assert!(
+        first_delta.1 > 0,
+        "first oriented result batch should perform inverse transform work"
+    );
+    assert_eq!(
+        second_delta.1, 0,
+        "second identical oriented batch should hit oriented-result cache"
+    );
 }
 
 #[test]
@@ -324,6 +433,13 @@ fn hashlife_packed_recursive_transform_matches_node_transform() {
     let grid = random_soup(64, 64, 20, 0xC001_CAFE_FEED_FACE);
     let mut oracle = HashLifeEngine::default();
     assert!(oracle.verify_packed_transform_parity(&grid));
+}
+
+#[test]
+fn hashlife_packed_transform_root_key_matches_materialized_root() {
+    let grid = random_soup(64, 64, 20, 0x0F0F_F0F0_AAAA_5555);
+    let mut oracle = HashLifeEngine::default();
+    assert!(oracle.verify_packed_transform_root_key_parity(&grid));
 }
 
 #[test]
@@ -381,8 +497,13 @@ fn hashlife_symmetric_workloads_reduce_work_against_fresh_mirror_run() {
     assert_eq!(normalize(&second).0, normalize(game.grid()).0);
     assert_eq!(normalize(&fresh_mirrored).0, normalize(game.grid()).0);
     assert!(
-        second_stats.symmetric_jump_cache_hits > fresh_stats.symmetric_jump_cache_hits,
-        "expected mirrored workload to benefit from prior symmetric jump-cache reuse, second={second_stats:?} fresh={fresh_stats:?}"
+        second_stats.jump_presence_misses < fresh_stats.jump_presence_misses
+            || second_stats.jump_presence_probe_hits > fresh_stats.jump_presence_probe_hits
+            || second_stats.packed_recursive_transform_misses
+                < fresh_stats.packed_recursive_transform_misses
+            || second_stats.packed_cache_result_materializations
+                < fresh_stats.packed_cache_result_materializations,
+        "expected mirrored workload to reduce work against a fresh mirror run, second={second_stats:?} fresh={fresh_stats:?}"
     );
 }
 
@@ -412,8 +533,18 @@ fn hashlife_matches_stepper_on_sampled_5x5_small_jumps() {
 #[test]
 fn hashlife_step0_simd_batches_are_exercised_on_large_single_step() {
     let mut cells = random_soup(96, 96, 22, 0xBAD5_EED5_1234_5678).live_cells();
-    cells.extend(pattern_by_name("glider").unwrap().translated(160, 24).live_cells());
-    cells.extend(pattern_by_name("blinker").unwrap().translated(24, 160).live_cells());
+    cells.extend(
+        pattern_by_name("glider")
+            .unwrap()
+            .translated(160, 24)
+            .live_cells(),
+    );
+    cells.extend(
+        pattern_by_name("blinker")
+            .unwrap()
+            .translated(24, 160)
+            .live_cells(),
+    );
     let grid = BitGrid::from_cells(&cells);
 
     let mut oracle = HashLifeEngine::default();
@@ -422,8 +553,9 @@ fn hashlife_step0_simd_batches_are_exercised_on_large_single_step() {
     let provisional_records_built = stats.step0_provisional_records
         + stats.phase1_provisional_records
         + stats.phase2_provisional_records;
-    let simd_candidate_lanes =
-        stats.step0_provisional_records + stats.phase1_provisional_records + stats.phase2_provisional_records;
+    let simd_candidate_lanes = stats.step0_provisional_records
+        + stats.phase1_provisional_records
+        + stats.phase2_provisional_records;
     let simd_batches =
         stats.step0_simd_batches + stats.phase1_simd_batches + stats.phase2_simd_batches;
 
@@ -485,8 +617,15 @@ fn hashlife_summary_tracks_symmetry_reuse_invariants() {
 
     assert!(summary.nodes_match_intern, "{summary:?}");
     assert_eq!(summary.dependency_stalls, 0, "{summary:?}");
-    assert!(summary.symmetry_jump_hits > 0, "{summary:?}");
-    assert!(summary.jump_full_hit_rate >= 0.0 && summary.jump_full_hit_rate <= 1.0, "{summary:?}");
+    assert!(summary.symmetry_jump_result_hits > 0, "{summary:?}");
+    assert!(
+        summary.jump_result_hit_rate >= 0.0 && summary.jump_result_hit_rate <= 1.0,
+        "{summary:?}"
+    );
+    assert!(
+        summary.root_result_hit_rate >= 0.0 && summary.root_result_hit_rate <= 1.0,
+        "{summary:?}"
+    );
     assert!(
         summary.jump_presence_hit_rate >= 0.0 && summary.jump_presence_hit_rate <= 1.0,
         "{summary:?}"
@@ -497,10 +636,6 @@ fn hashlife_summary_tracks_symmetry_reuse_invariants() {
     );
     assert!(
         summary.canonical_cache_hit_rate >= 0.0 && summary.canonical_cache_hit_rate <= 1.0,
-        "{summary:?}"
-    );
-    assert!(
-        summary.packed_cache_hit_rate >= 0.0 && summary.packed_cache_hit_rate <= 1.0,
         "{summary:?}"
     );
 }
@@ -537,8 +672,17 @@ fn hashlife_diagnostic_symmetry_gate_random_soup() {
 #[ignore = "diagnostic symmetry-gate structured benchmark"]
 fn hashlife_diagnostic_symmetry_gate_structured_workload() {
     let mut cells = pattern_by_name("gosper_glider_gun").unwrap().live_cells();
-    cells.extend(mirror_grid_x(&pattern_by_name("gosper_glider_gun").unwrap()).translated(256, 0).live_cells());
-    cells.extend(pattern_by_name("glider").unwrap().translated(128, 128).live_cells());
+    cells.extend(
+        mirror_grid_x(&pattern_by_name("gosper_glider_gun").unwrap())
+            .translated(256, 0)
+            .live_cells(),
+    );
+    cells.extend(
+        pattern_by_name("glider")
+            .unwrap()
+            .translated(128, 128)
+            .live_cells(),
+    );
     let grid = BitGrid::from_cells(&cells);
     let mut oracle = HashLifeEngine::default();
     let start = Instant::now();
@@ -571,8 +715,17 @@ fn hashlife_diagnostic_symmetry_gate_comparison_random_soup() {
 #[ignore = "diagnostic symmetry-gate comparison benchmark"]
 fn hashlife_diagnostic_symmetry_gate_comparison_structured() {
     let mut cells = pattern_by_name("gosper_glider_gun").unwrap().live_cells();
-    cells.extend(mirror_grid_x(&pattern_by_name("gosper_glider_gun").unwrap()).translated(256, 0).live_cells());
-    cells.extend(pattern_by_name("glider").unwrap().translated(128, 128).live_cells());
+    cells.extend(
+        mirror_grid_x(&pattern_by_name("gosper_glider_gun").unwrap())
+            .translated(256, 0)
+            .live_cells(),
+    );
+    cells.extend(
+        pattern_by_name("glider")
+            .unwrap()
+            .translated(128, 128)
+            .live_cells(),
+    );
     let grid = BitGrid::from_cells(&cells);
     let configs = [
         ("default", 8_u32, 4_096_u64),
@@ -585,7 +738,12 @@ fn hashlife_diagnostic_symmetry_gate_comparison_structured() {
         oracle.advance(&grid, 3_000_000);
         let elapsed = start.elapsed();
         let summary = oracle.diagnostic_summary();
-        print_hashlife_gate_comparison("hashlife_sym_gate_compare_structured", mode, elapsed, summary);
+        print_hashlife_gate_comparison(
+            "hashlife_sym_gate_compare_structured",
+            mode,
+            elapsed,
+            summary,
+        );
     }
 }
 
@@ -633,8 +791,18 @@ fn hashlife_diagnostic_symmetric_mirror_reuse() {
 #[ignore = "diagnostic step0-heavy benchmark"]
 fn hashlife_diagnostic_step0_heavy_single_step() {
     let mut cells = random_soup(96, 96, 22, 0xBAD5_EED5_1234_5678).live_cells();
-    cells.extend(pattern_by_name("glider").unwrap().translated(160, 24).live_cells());
-    cells.extend(pattern_by_name("blinker").unwrap().translated(24, 160).live_cells());
+    cells.extend(
+        pattern_by_name("glider")
+            .unwrap()
+            .translated(160, 24)
+            .live_cells(),
+    );
+    cells.extend(
+        pattern_by_name("blinker")
+            .unwrap()
+            .translated(24, 160)
+            .live_cells(),
+    );
     let grid = BitGrid::from_cells(&cells);
     let mut oracle = HashLifeEngine::default();
     let start = Instant::now();

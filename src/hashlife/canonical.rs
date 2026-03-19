@@ -5,23 +5,27 @@ impl HashLifeEngine {
         self.canonical_transform_cache.clear();
         self.oriented_result_cache.clear();
         self.packed_transform_compare_cache.clear();
-        self.packed_symmetry_children_cache.clear();
         self.packed_transform_intern.clear();
         self.packed_transform_nodes.clear();
         self.packed_transform_materialized.clear();
-        self.packed_transform_packed_keys.clear();
+        self.packed_transform_packed_roots.clear();
 
         for alive in [false, true] {
             let leaf_id = self.packed_transform_nodes.len() as PackedTransformId;
             let population = u64::from(alive);
+            let structural = CanonicalStructKey::leaf(alive);
             self.packed_transform_nodes.push(PackedTransformNode {
                 level: 0,
                 leaf_population: population,
                 children: [0; 4],
+                structural,
+                canonical_ref: canonical_node_ref_from_structural(structural),
+                order_fingerprint: structural.fingerprint(),
+                order_children: structural.children,
             });
             self.packed_transform_materialized
                 .push(Some(if alive { self.live_leaf } else { self.dead_leaf }));
-            self.packed_transform_packed_keys
+            self.packed_transform_packed_roots
                 .push(Some(PackedNodeKey::new(0, [population, 0, 0, 0])));
             self.packed_transform_intern.insert(
                 PackedTransformShapeKey {
@@ -51,15 +55,29 @@ impl HashLifeEngine {
             return existing;
         }
         let id = self.packed_transform_nodes.len() as PackedTransformId;
+        let structural = CanonicalStructKey::new(
+            level,
+            children.map(|child| self.packed_transform_nodes[child as usize].canonical_ref),
+        );
+        let order_children = children.map(|child| self.packed_transform_nodes[child as usize].canonical_ref);
         self.packed_transform_nodes.push(PackedTransformNode {
             level,
             leaf_population: 0,
             children,
+            structural,
+            canonical_ref: canonical_node_ref_from_structural(structural),
+            order_fingerprint: structural.fingerprint(),
+            order_children,
         });
         self.packed_transform_materialized.push(None);
-        self.packed_transform_packed_keys.push(None);
+        self.packed_transform_packed_roots.push(None);
         self.packed_transform_intern.insert(shape, id);
         id
+    }
+
+    #[inline]
+    pub(super) fn structural_key_from_transform_id(&self, id: PackedTransformId) -> CanonicalStructKey {
+        self.packed_transform_nodes[id as usize].structural
     }
 
     pub(super) fn transform_packed_node_key(
@@ -76,32 +94,17 @@ impl HashLifeEngine {
             return transformed;
         }
         self.stats.packed_recursive_transform_misses += 1;
-        let transformed_children = if let Some(entry) = self.packed_symmetry_children_cache.get(&packed) {
-            entry.children[symmetry as usize]
-        } else {
-            let child_keys = packed.children.map(|child| self.node_columns.packed_key(child));
-            let mut children_by_symmetry = [[0_u32; 4]; 8];
-            for candidate in Symmetry::ALL {
-                let perm = candidate.quadrant_perm();
-                let child_ids = child_keys.map(|child| self.transform_packed_node_key(child, candidate));
-                children_by_symmetry[candidate as usize] = [
-                    child_ids[perm[0]],
-                    child_ids[perm[1]],
-                    child_ids[perm[2]],
-                    child_ids[perm[3]],
-                ];
-            }
-            self.packed_symmetry_children_cache.insert(
-                packed,
-                PackedSymmetryChildrenCacheEntry {
-                    children: children_by_symmetry,
-                },
-            );
-            children_by_symmetry[symmetry as usize]
-        };
+        let child_keys = packed.children.map(|child| self.node_columns.packed_key(child));
+        let perm = symmetry.quadrant_perm();
+        let child_ids = child_keys.map(|child| self.transform_packed_node_key(child, symmetry));
         let transformed = self.intern_packed_transform_node(
             packed.level,
-            transformed_children,
+            [
+                child_ids[perm[0]],
+                child_ids[perm[1]],
+                child_ids[perm[2]],
+                child_ids[perm[3]],
+            ],
         );
         self.canonical_transform_cache.insert(cache_key, transformed);
         transformed
@@ -154,6 +157,29 @@ impl HashLifeEngine {
         ordering
     }
 
+    #[inline]
+    fn compare_packed_transform_order(
+        &mut self,
+        left: PackedTransformId,
+        right: PackedTransformId,
+    ) -> std::cmp::Ordering {
+        if left == right {
+            return std::cmp::Ordering::Equal;
+        }
+        let left_node = self.packed_transform_nodes[left as usize];
+        let right_node = self.packed_transform_nodes[right as usize];
+        let ordering = left_node
+            .level
+            .cmp(&right_node.level)
+            .then_with(|| left_node.order_fingerprint.cmp(&right_node.order_fingerprint))
+            .then_with(|| left_node.order_children.cmp(&right_node.order_children));
+        if ordering == std::cmp::Ordering::Equal {
+            self.compare_packed_transform_ids(left, right)
+        } else {
+            ordering
+        }
+    }
+
     fn materialize_packed_transform_node_internal(&mut self, id: PackedTransformId) -> NodeId {
         if let Some(node) = self.packed_transform_materialized[id as usize] {
             return node;
@@ -165,25 +191,54 @@ impl HashLifeEngine {
             .map(|child| self.materialize_packed_transform_node_internal(child));
         let node = self.join(children[0], children[1], children[2], children[3]);
         self.packed_transform_materialized[id as usize] = Some(node);
-        self.packed_transform_packed_keys[id as usize] =
-            Some(PackedNodeKey::new(transform_node.level, children));
         node
     }
 
-    fn packed_key_from_transform_id(&mut self, id: PackedTransformId) -> PackedNodeKey {
-        if let Some(packed) = self.packed_transform_packed_keys[id as usize] {
+    fn packed_root_from_transform_id(&mut self, id: PackedTransformId) -> PackedNodeKey {
+        if let Some(packed) = self.packed_transform_packed_roots[id as usize] {
             return packed;
         }
         let transform_node = self.packed_transform_nodes[id as usize];
-        if transform_node.level == 0 {
-            return PackedNodeKey::new(0, [transform_node.leaf_population, 0, 0, 0]);
-        }
-        let children = transform_node
+        debug_assert!(transform_node.level != 0);
+        let child_roots = transform_node
             .children
-            .map(|child| self.materialize_packed_transform_node_internal(child));
-        let packed = PackedNodeKey::new(transform_node.level, children);
-        self.packed_transform_packed_keys[id as usize] = Some(packed);
+            .map(|child| self.packed_root_from_transform_id(child));
+        let packed = PackedNodeKey::new(
+            transform_node.level,
+            child_roots.map(|child| self.materialize_packed_node_key_internal(child)),
+        );
+        self.packed_transform_packed_roots[id as usize] = Some(packed);
         packed
+    }
+
+    pub(super) fn materialize_winning_packed_transform_root(
+        &mut self,
+        id: PackedTransformId,
+    ) -> PackedNodeKey {
+        self.packed_root_from_transform_id(id)
+    }
+
+    fn canonical_transform_winner(
+        &mut self,
+        packed: PackedNodeKey,
+        base_symmetry: Symmetry,
+        record_miss: bool,
+    ) -> (PackedTransformId, Symmetry, CanonicalStructKey) {
+        let mut canonical_symmetry = Symmetry::Identity;
+        let mut canonical_id = self.transform_packed_node_key(packed, base_symmetry.then(Symmetry::Identity));
+        let mut canonical_structural = self.structural_key_from_transform_id(canonical_id);
+        if record_miss {
+            self.stats.packed_d4_canonicalization_misses += 1;
+        }
+        for symmetry in Symmetry::ALL.into_iter().skip(1) {
+            let candidate_id = self.transform_packed_node_key(packed, base_symmetry.then(symmetry));
+            if self.compare_packed_transform_order(candidate_id, canonical_id) == std::cmp::Ordering::Less {
+                canonical_symmetry = symmetry;
+                canonical_id = candidate_id;
+                canonical_structural = self.structural_key_from_transform_id(candidate_id);
+            }
+        }
+        (canonical_id, canonical_symmetry, canonical_structural)
     }
 
     pub(super) fn materialize_packed_transform_root(&mut self, id: PackedTransformId) -> NodeId {
@@ -192,32 +247,41 @@ impl HashLifeEngine {
     }
 
     #[inline]
-    pub(super) fn canonical_cache_key_packed_only(
+    pub(super) fn canonical_jump_probe(
         &mut self,
         key: (NodeId, u32),
-    ) -> (PackedJumpCacheKey, Symmetry, u64, bool) {
-        let (packed, symmetry, packed_fingerprint, used_cached_fingerprint) =
+    ) -> CanonicalJumpProbe {
+        let (node, _packed_fingerprint, used_cached_fingerprint) =
             if self.record_symmetry_gate_decision(key.0) {
                 let canonical = self.canonicalize_packed_node(key.0);
                 (
-                    canonical.packed,
-                    canonical.symmetry,
+                    canonical.node,
                     canonical.fingerprint,
                     canonical.used_cached_fingerprint,
                 )
             } else {
                 let (packed, fingerprint) = self.node_columns.packed_key_and_fingerprint(key.0);
-                (packed, Symmetry::Identity, fingerprint, true)
+                let transform_id = self.transform_packed_node_key(packed, Symmetry::Identity);
+                let structural = self.structural_key_from_transform_id(transform_id);
+                (
+                    CanonicalNodeIdentity {
+                        packed,
+                        structural,
+                        symmetry: Symmetry::Identity,
+                    },
+                    fingerprint,
+                    true,
+                )
             };
-        (
-            PackedJumpCacheKey {
-                packed,
+        CanonicalJumpProbe {
+            key: CanonicalJumpKey {
+                structural: node.structural,
                 step_exp: key.1,
             },
-            symmetry,
-            hash_packed_jump_fingerprint(packed_fingerprint, key.1),
+            node,
+            fingerprint: hash_packed_jump_fingerprint(node.structural.fingerprint(), key.1),
             used_cached_fingerprint,
-        )
+        }
     }
 
     #[inline]
@@ -285,44 +349,53 @@ impl HashLifeEngine {
         transformed
     }
 
-    fn canonicalize_packed_key_uncached(&mut self, packed: PackedNodeKey) -> CanonicalPackedNode {
+    fn canonicalize_packed_key_uncached(&mut self, packed: PackedNodeKey) -> CanonicalNodeProbe {
         if packed.level == 0 {
-            return CanonicalPackedNode {
-                symmetry: Symmetry::Identity,
-                packed,
+            let structural = CanonicalStructKey::leaf(packed.children[0] != 0);
+            return CanonicalNodeProbe {
+                node: CanonicalNodeIdentity {
+                    packed,
+                    structural,
+                    symmetry: Symmetry::Identity,
+                },
                 fingerprint: packed.fingerprint(),
                 used_cached_fingerprint: true,
             };
         }
 
-        let mut canonical_symmetry = Symmetry::Identity;
-        let mut canonical_packed = packed;
-        self.stats.packed_d4_canonicalization_misses += 1;
-        for symmetry in Symmetry::ALL.into_iter().skip(1) {
-            let candidate_id = self.transform_packed_node_key(packed, symmetry);
-            let candidate_packed = self.packed_key_from_transform_id(candidate_id);
-            if candidate_packed < canonical_packed {
-                canonical_symmetry = symmetry;
-                canonical_packed = candidate_packed;
-            }
-        }
+        let (canonical_id, canonical_symmetry, canonical_structural) =
+            self.canonical_transform_winner(packed, Symmetry::Identity, true);
+        let canonical_packed = self.materialize_winning_packed_transform_root(canonical_id);
 
-        CanonicalPackedNode {
-            symmetry: canonical_symmetry,
-            packed: canonical_packed,
+        CanonicalNodeProbe {
+            node: CanonicalNodeIdentity {
+                packed: canonical_packed,
+                structural: canonical_structural,
+                symmetry: canonical_symmetry,
+            },
             fingerprint: canonical_packed.fingerprint(),
             used_cached_fingerprint: canonical_symmetry == Symmetry::Identity,
         }
+    }
+
+    pub(super) fn canonicalize_packed_key_for_snapshot(
+        &mut self,
+        packed: PackedNodeKey,
+    ) -> CanonicalNodeProbe {
+        self.canonicalize_packed_key_uncached(packed)
     }
 
     pub(super) fn canonicalize_packed_nodes_batch<const N: usize>(
         &mut self,
         nodes: &[NodeId; N],
         active_lanes: usize,
-    ) -> [CanonicalPackedNode; N] {
-        let mut canonical = [CanonicalPackedNode {
-            symmetry: Symmetry::Identity,
-            packed: PackedNodeKey::new(0, [0; 4]),
+    ) -> [CanonicalNodeProbe; N] {
+        let mut canonical = [CanonicalNodeProbe {
+            node: CanonicalNodeIdentity {
+                packed: PackedNodeKey::new(0, [0; 4]),
+                structural: CanonicalStructKey::new(0, [0; 4]),
+                symmetry: Symmetry::Identity,
+            },
             fingerprint: 0,
             used_cached_fingerprint: true,
         }; N];
@@ -337,9 +410,12 @@ impl HashLifeEngine {
             let node = nodes[lane];
             if self.node_columns.level(node) == 0 {
                 let (packed, fingerprint) = self.node_columns.packed_key_and_fingerprint(node);
-                canonical[lane] = CanonicalPackedNode {
-                    symmetry: Symmetry::Identity,
-                    packed,
+                canonical[lane] = CanonicalNodeProbe {
+                    node: CanonicalNodeIdentity {
+                        packed,
+                        structural: CanonicalStructKey::leaf(packed.children[0] != 0),
+                        symmetry: Symmetry::Identity,
+                    },
                     fingerprint,
                     used_cached_fingerprint: true,
                 };
@@ -348,9 +424,8 @@ impl HashLifeEngine {
             if let Some(cached) = self.canonical_node_cache.get(&node) {
                 self.stats.canonical_node_cache_hits += 1;
                 let used_cached_fingerprint = cached.symmetry == Symmetry::Identity;
-                canonical[lane] = CanonicalPackedNode {
-                    symmetry: cached.symmetry,
-                    packed: cached.packed,
+                canonical[lane] = CanonicalNodeProbe {
+                    node: cached,
                     fingerprint: if used_cached_fingerprint {
                         self.node_columns.fingerprint(node)
                     } else {
@@ -362,9 +437,12 @@ impl HashLifeEngine {
             }
             self.stats.canonical_node_cache_misses += 1;
             let (packed, fingerprint) = self.node_columns.packed_key_and_fingerprint(node);
-            canonical[lane] = CanonicalPackedNode {
-                symmetry: Symmetry::Identity,
-                packed,
+            canonical[lane] = CanonicalNodeProbe {
+                node: CanonicalNodeIdentity {
+                    packed,
+                    structural: CanonicalStructKey::new(packed.level, [0; 4]),
+                    symmetry: Symmetry::Identity,
+                },
                 fingerprint,
                 used_cached_fingerprint: true,
             };
@@ -377,21 +455,14 @@ impl HashLifeEngine {
             for compact_index in 0..miss_count {
                 let lane = miss_indices[compact_index];
                 canonical[lane] = self.canonicalize_packed_key_uncached(miss_packed[compact_index]);
-                self.canonical_node_cache.insert(
-                    nodes[lane],
-                    CanonicalNodeCacheEntry {
-                        symmetry: canonical[lane].symmetry,
-                        packed: canonical[lane].packed,
-                    },
-                );
+                self.canonical_node_cache.insert(nodes[lane], canonical[lane].node);
             }
         }
 
         canonical
     }
 
-    pub(super) fn materialize_packed_node_key(&mut self, packed: PackedNodeKey) -> NodeId {
-        self.stats.packed_cache_result_materializations += 1;
+    fn materialize_packed_node_key_internal(&mut self, packed: PackedNodeKey) -> NodeId {
         if packed.level == 0 {
             return if packed.children[0] == 0 {
                 self.dead_leaf
@@ -405,6 +476,11 @@ impl HashLifeEngine {
             packed.children[2],
             packed.children[3],
         )
+    }
+
+    pub(super) fn materialize_packed_node_key(&mut self, packed: PackedNodeKey) -> NodeId {
+        self.stats.packed_cache_result_materializations += 1;
+        self.materialize_packed_node_key_internal(packed)
     }
 
     #[inline]
@@ -437,23 +513,8 @@ impl HashLifeEngine {
         }
     }
 
-    pub(super) fn canonicalize_packed_node(&mut self, node: NodeId) -> CanonicalPackedNode {
+    pub(super) fn canonicalize_packed_node(&mut self, node: NodeId) -> CanonicalNodeProbe {
         self.canonicalize_packed_nodes_batch(&[node], 1)[0]
-    }
-
-    pub(super) fn canonical_jump_key_packed(
-        &mut self,
-        key: (NodeId, u32),
-    ) -> (CanonicalJumpKey, Symmetry) {
-        let (cache_key, symmetry, _fingerprint, _used_cached_fingerprint) =
-            self.canonical_cache_key_packed_only(key);
-        (
-            CanonicalJumpKey {
-                packed: cache_key.packed,
-                step_exp: key.1,
-            },
-            symmetry,
-        )
     }
 
     pub(super) fn should_symmetry_canonicalize_jump_node(&self, node: NodeId) -> bool {
@@ -462,17 +523,16 @@ impl HashLifeEngine {
     }
 
     pub(super) fn cached_jump_result(&mut self, key: (NodeId, u32)) -> Option<NodeId> {
-        let (canonical_key, symmetry, fingerprint, used_cached_fingerprint) =
-            self.canonical_cache_key_packed_only(key);
-        self.record_fingerprint_probe(used_cached_fingerprint, 1);
-        let inverse = symmetry.inverse();
-        self.stats.packed_cache_result_lookups += 1;
+        let jump_probe = self.canonical_jump_probe(key);
+        self.record_fingerprint_probe(jump_probe.used_cached_fingerprint, 1);
+        let inverse = jump_probe.node.symmetry.inverse();
+        self.stats.jump_result_cache_lookups += 1;
         let result = self
             .jump_cache
-            .get_with_fingerprint(&canonical_key, fingerprint)?;
-        self.stats.packed_cache_result_hits += 1;
-        if symmetry != Symmetry::Identity {
-            self.stats.symmetric_jump_cache_hits += 1;
+            .get_with_fingerprint(&jump_probe.key, jump_probe.fingerprint)?;
+        self.stats.jump_result_cache_hits += 1;
+        if jump_probe.node.symmetry != Symmetry::Identity {
+            self.stats.symmetric_jump_result_cache_hits += 1;
         }
         Some(self.materialize_oriented_packed_result(
             result.packed,
@@ -482,19 +542,18 @@ impl HashLifeEngine {
     }
 
     pub(super) fn insert_jump_result(&mut self, key: (NodeId, u32), result: NodeId) {
-        let (canonical_key, symmetry, fingerprint, used_cached_fingerprint) =
-            self.canonical_cache_key_packed_only(key);
-        self.record_fingerprint_probe(used_cached_fingerprint, 1);
-        let transformed_result =
-            self.transform_packed_node_key(self.node_columns.packed_key(result), symmetry);
-        let canonical_input_result = self.packed_key_from_transform_id(transformed_result);
-        let canonical_result = self.canonicalize_packed_key_uncached(canonical_input_result);
+        let jump_probe = self.canonical_jump_probe(key);
+        self.record_fingerprint_probe(jump_probe.used_cached_fingerprint, 1);
+        let result_packed = self.node_columns.packed_key(result);
+        let (canonical_id, canonical_symmetry, _) =
+            self.canonical_transform_winner(result_packed, jump_probe.node.symmetry, false);
+        let canonical_packed = self.materialize_winning_packed_transform_root(canonical_id);
         self.jump_cache.insert_with_fingerprint(
-            canonical_key,
-            fingerprint,
+            jump_probe.key,
+            jump_probe.fingerprint,
             PackedResultCacheEntry {
-                packed: canonical_result.packed,
-                symmetry: canonical_result.symmetry,
+                packed: canonical_packed,
+                symmetry: canonical_symmetry,
             },
         );
     }
@@ -504,20 +563,54 @@ impl HashLifeEngine {
         key: CanonicalJumpKey,
         result: NodeId,
     ) {
-        let packed = key.packed;
-        let fingerprint = hash_packed_jump_fingerprint(packed.fingerprint(), key.step_exp);
-        let canonical_result = self.canonicalize_packed_key_uncached(self.node_columns.packed_key(result));
-        self.jump_cache.insert_with_fingerprint(
-            PackedJumpCacheKey {
-                packed,
-                step_exp: key.step_exp,
-            },
-            fingerprint,
-            PackedResultCacheEntry {
-                packed: canonical_result.packed,
-                symmetry: canonical_result.symmetry,
-            },
-        );
+        self.insert_canonical_jump_results_batch(&[key], &[result], 1);
+    }
+
+    pub(super) fn insert_canonical_jump_results_batch<const N: usize>(
+        &mut self,
+        keys: &[CanonicalJumpKey; N],
+        results: &[NodeId; N],
+        active_lanes: usize,
+    ) {
+        if active_lanes == 0 {
+            return;
+        }
+        let mut unique_lookup = FlatTable::<NodeId, usize>::with_capacity(active_lanes.max(4));
+        let mut unique_nodes = [0_u64; N];
+        let mut lane_to_unique = [usize::MAX; N];
+        let mut unique_count = 0;
+        for lane in 0..active_lanes {
+            let result = results[lane];
+            if let Some(index) = unique_lookup.get(&result) {
+                lane_to_unique[lane] = index;
+            } else {
+                unique_nodes[unique_count] = result;
+                lane_to_unique[lane] = unique_count;
+                unique_lookup.insert(result, unique_count);
+                unique_count += 1;
+            }
+        }
+        let mut unique_entries = [PackedResultCacheEntry {
+            packed: PackedNodeKey::new(0, [0; 4]),
+            symmetry: Symmetry::Identity,
+        }; N];
+        for unique in 0..unique_count {
+            let canonical_result =
+                self.canonicalize_packed_key_uncached(self.node_columns.packed_key(unique_nodes[unique]));
+            unique_entries[unique] = PackedResultCacheEntry {
+                packed: canonical_result.node.packed,
+                symmetry: canonical_result.node.symmetry,
+            };
+        }
+        for lane in 0..active_lanes {
+            let fingerprint =
+                hash_packed_jump_fingerprint(keys[lane].structural.fingerprint(), keys[lane].step_exp);
+            self.jump_cache.insert_with_fingerprint(
+                keys[lane],
+                fingerprint,
+                unique_entries[lane_to_unique[lane]],
+            );
+        }
     }
 
     pub(super) fn jump_result(&mut self, key: (NodeId, u32)) -> NodeId {
@@ -526,35 +619,33 @@ impl HashLifeEngine {
     }
 
     pub(super) fn cached_root_result(&mut self, key: (NodeId, u32)) -> Option<NodeId> {
-        let (cache_key, symmetry, fingerprint, used_cached_fingerprint) =
-            self.canonical_cache_key_packed_only(key);
-        self.record_fingerprint_probe(used_cached_fingerprint, 1);
-        self.stats.packed_cache_result_lookups += 1;
+        let jump_probe = self.canonical_jump_probe(key);
+        self.record_fingerprint_probe(jump_probe.used_cached_fingerprint, 1);
+        self.stats.root_result_cache_lookups += 1;
         let result = self
             .root_result_cache
-            .get_with_fingerprint(&cache_key, fingerprint)?;
-        self.stats.packed_cache_result_hits += 1;
+            .get_with_fingerprint(&jump_probe.key, jump_probe.fingerprint)?;
+        self.stats.root_result_cache_hits += 1;
         Some(self.materialize_oriented_packed_result(
             result.packed,
             result.symmetry,
-            symmetry.inverse(),
+            jump_probe.node.symmetry.inverse(),
         ))
     }
 
     pub(super) fn insert_root_result(&mut self, key: (NodeId, u32), result: NodeId) {
-        let (cache_key, symmetry, fingerprint, used_cached_fingerprint) =
-            self.canonical_cache_key_packed_only(key);
-        self.record_fingerprint_probe(used_cached_fingerprint, 1);
-        let transformed_result =
-            self.transform_packed_node_key(self.node_columns.packed_key(result), symmetry);
-        let canonical_input_result = self.packed_key_from_transform_id(transformed_result);
-        let canonical_result = self.canonicalize_packed_key_uncached(canonical_input_result);
+        let jump_probe = self.canonical_jump_probe(key);
+        self.record_fingerprint_probe(jump_probe.used_cached_fingerprint, 1);
+        let result_packed = self.node_columns.packed_key(result);
+        let (canonical_id, canonical_symmetry, _) =
+            self.canonical_transform_winner(result_packed, jump_probe.node.symmetry, false);
+        let canonical_packed = self.materialize_winning_packed_transform_root(canonical_id);
         self.root_result_cache.insert_with_fingerprint(
-            cache_key,
-            fingerprint,
+            jump_probe.key,
+            jump_probe.fingerprint,
             PackedResultCacheEntry {
-                packed: canonical_result.packed,
-                symmetry: canonical_result.symmetry,
+                packed: canonical_packed,
+                symmetry: canonical_symmetry,
             },
         );
     }

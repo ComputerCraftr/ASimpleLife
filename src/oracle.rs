@@ -7,7 +7,7 @@ use crate::engine::{SimulationBackend, SimulationSession};
 use crate::generators::pattern_by_name;
 use crate::hashlife::{
     GridExtractionPolicy, HASHLIFE_FULL_GRID_MAX_CHUNKS, HASHLIFE_FULL_GRID_MAX_POPULATION,
-    HashLifeCheckpointKey,
+    HashLifeCheckpoint, HashLifeCheckpointKey,
 };
 use crate::life::step_grid_with_changes_and_memo;
 use crate::memo::Memo;
@@ -589,46 +589,24 @@ impl<'a> OracleSession<'a> {
 
         let checkpoint_key = checkpoint.signature.key();
         if self.checkpoints.contains_key(&checkpoint_key) {
-            let (confirmed_signature, confirmed_origin) = self.confirm_current_exact_signature()?;
-            if !checkpoint
-                .signature
-                .matches_normalized(&confirmed_signature)
-                || checkpoint.origin != confirmed_origin
+            if let Some(cycle) =
+                self.observe_repeated_hashlife_checkpoint(&checkpoint, checkpoint_key)
             {
-                return None;
-            }
-            if let Some(candidate) = self.checkpoint_cycle_candidate.as_ref()
-                && candidate.key == checkpoint_key
-                && candidate.signature == confirmed_signature
-            {
-                let period = self.generation - candidate.generation;
-                let dx = confirmed_origin.0 - candidate.origin.0;
-                let dy = confirmed_origin.1 - candidate.origin.1;
-                self.confirmed_cycle = Some(ConfirmedCycle {
-                    period,
-                    first_seen: candidate.generation,
-                    delta: (dx, dy),
-                });
-                return Some(if dx == 0 && dy == 0 {
+                self.confirmed_cycle = Some(cycle);
+                return Some(if cycle.delta == (0, 0) {
                     Classification::Repeats {
-                        period,
-                        first_seen: candidate.generation,
+                        period: cycle.period,
+                        first_seen: cycle.first_seen,
                     }
                 } else {
                     Classification::Spaceship {
-                        period,
-                        first_seen: candidate.generation,
-                        delta: (dx, dy),
+                        period: cycle.period,
+                        first_seen: cycle.first_seen,
+                        delta: cycle.delta,
                         detected_at: self.generation,
                     }
                 });
             }
-            self.checkpoint_cycle_candidate = Some(CheckpointCycleCandidate {
-                key: checkpoint_key,
-                generation: self.generation,
-                origin: confirmed_origin,
-                signature: confirmed_signature,
-            });
             return None;
         }
 
@@ -659,36 +637,12 @@ impl<'a> OracleSession<'a> {
             let checkpoint = self.simulation.hashlife_checkpoint().cloned()?;
             let checkpoint_key = checkpoint.signature.key();
             if self.checkpoints.contains_key(&checkpoint_key) {
-                let (confirmed_signature, confirmed_origin) =
-                    self.confirm_current_exact_signature()?;
-                if !checkpoint
-                    .signature
-                    .matches_normalized(&confirmed_signature)
-                    || checkpoint.origin != confirmed_origin
+                if let Some(cycle) =
+                    self.observe_repeated_hashlife_checkpoint(&checkpoint, checkpoint_key)
                 {
-                    return None;
-                }
-                if let Some(candidate) = self.checkpoint_cycle_candidate.as_ref()
-                    && candidate.key == checkpoint_key
-                    && candidate.signature == confirmed_signature
-                {
-                    let period = self.generation - candidate.generation;
-                    let dx = confirmed_origin.0 - candidate.origin.0;
-                    let dy = confirmed_origin.1 - candidate.origin.1;
-                    let cycle = ConfirmedCycle {
-                        period,
-                        first_seen: candidate.generation,
-                        delta: (dx, dy),
-                    };
                     self.confirmed_cycle = Some(cycle);
                     return Some(self.land_confirmed_cycle_to_target(target_generation, cycle));
                 }
-                self.checkpoint_cycle_candidate = Some(CheckpointCycleCandidate {
-                    key: checkpoint_key,
-                    generation: self.generation,
-                    origin: confirmed_origin,
-                    signature: confirmed_signature,
-                });
                 return None;
             }
 
@@ -837,34 +791,11 @@ impl<'a> OracleSession<'a> {
                     if let Some(checkpoint) = self.simulation.hashlife_checkpoint().cloned() {
                         let checkpoint_key = checkpoint.signature.key();
                         if self.checkpoints.contains_key(&checkpoint_key) {
-                            let (confirmed_signature, confirmed_origin) = self
-                                .confirm_current_exact_signature()
-                                .expect("runtime repeat confirmation should succeed");
-                            if checkpoint
-                                .signature
-                                .matches_normalized(&confirmed_signature)
-                                && checkpoint.origin == confirmed_origin
+                            if let Some(cycle) = self
+                                .observe_repeated_hashlife_checkpoint(&checkpoint, checkpoint_key)
                             {
-                                if let Some(candidate) = self.checkpoint_cycle_candidate.as_ref()
-                                    && candidate.key == checkpoint_key
-                                    && candidate.signature == confirmed_signature
-                                {
-                                    let period = self.generation - candidate.generation;
-                                    let dx = confirmed_origin.0 - candidate.origin.0;
-                                    let dy = confirmed_origin.1 - candidate.origin.1;
-                                    self.confirmed_cycle = Some(ConfirmedCycle {
-                                        period,
-                                        first_seen: candidate.generation,
-                                        delta: (dx, dy),
-                                    });
-                                    continue;
-                                }
-                                self.checkpoint_cycle_candidate = Some(CheckpointCycleCandidate {
-                                    key: checkpoint_key,
-                                    generation: self.generation,
-                                    origin: confirmed_origin,
-                                    signature: confirmed_signature,
-                                });
+                                self.confirmed_cycle = Some(cycle);
+                                continue;
                             }
                         }
                         self.checkpoints
@@ -937,5 +868,57 @@ impl<'a> OracleSession<'a> {
             population: metrics.population,
             bounds_span: metrics.bounds_span,
         }
+    }
+
+    fn observe_repeated_hashlife_checkpoint(
+        &mut self,
+        checkpoint: &HashLifeCheckpoint,
+        checkpoint_key: HashLifeCheckpointKey,
+    ) -> Option<ConfirmedCycle> {
+        let (confirmed_signature, confirmed_origin) = self.confirm_current_exact_signature()?;
+        if !checkpoint
+            .signature
+            .matches_normalized(&confirmed_signature)
+            || checkpoint.origin != confirmed_origin
+        {
+            return None;
+        }
+
+        if let Some(cycle) = self.confirm_checkpoint_cycle_candidate(
+            checkpoint_key,
+            &confirmed_signature,
+            confirmed_origin,
+        ) {
+            return Some(cycle);
+        }
+
+        self.checkpoint_cycle_candidate = Some(CheckpointCycleCandidate {
+            key: checkpoint_key,
+            generation: self.generation,
+            origin: confirmed_origin,
+            signature: confirmed_signature,
+        });
+        None
+    }
+
+    fn confirm_checkpoint_cycle_candidate(
+        &self,
+        checkpoint_key: HashLifeCheckpointKey,
+        confirmed_signature: &NormalizedGridSignature,
+        confirmed_origin: Cell,
+    ) -> Option<ConfirmedCycle> {
+        let candidate = self.checkpoint_cycle_candidate.as_ref()?;
+        if candidate.key != checkpoint_key || candidate.signature != *confirmed_signature {
+            return None;
+        }
+
+        Some(ConfirmedCycle {
+            period: self.generation - candidate.generation,
+            first_seen: candidate.generation,
+            delta: (
+                confirmed_origin.0 - candidate.origin.0,
+                confirmed_origin.1 - candidate.origin.1,
+            ),
+        })
     }
 }

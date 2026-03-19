@@ -23,58 +23,106 @@ pub struct CodegenOpts {
     pub cell_sign: CellSign,
 }
 
-pub(super) enum CanonResult {
-    Summary(BfIr),
-    Loop(Vec<BfIr>),
-}
-
-enum CanonFrame {
-    Seq {
-        input: std::vec::IntoIter<BfIr>,
-        out: Vec<BfIr>,
-    },
-    LoopFinalize,
-}
-
 pub fn optimize(program: Vec<BfIr>) -> Vec<BfIr> {
-    optimize_sequence(program)
+    let program = rewrite_ir_bottom_up(program, &canonicalize_loop_body);
+    cleanup_lowering_ir(program)
 }
 
 // --- Pass 1: normalize_sequence ---
 
-fn merge_adjacent(nodes: &mut Vec<BfIr>) {
+fn normalize_distribute_targets(targets: &[(isize, i32)]) -> BfIr {
+    let mut merged = BTreeMap::<isize, i32>::new();
+    for &(offset, coeff) in targets {
+        if offset == 0 || coeff == 0 {
+            continue;
+        }
+        *merged.entry(offset).or_insert(0) += coeff;
+    }
+    let targets = merged
+        .into_iter()
+        .filter_map(|(offset, coeff)| (coeff != 0).then_some((offset, coeff)))
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        BfIr::Clear
+    } else {
+        BfIr::Distribute { targets }
+    }
+}
+
+fn normalize_flat_node(node: BfIr) -> Option<BfIr> {
+    match node {
+        BfIr::Add(0) | BfIr::MovePtr(0) => None,
+        BfIr::Distribute { targets } => Some(normalize_distribute_targets(&targets)),
+        other => Some(other),
+    }
+}
+
+fn push_normalized_node(out: &mut Vec<BfIr>, node: BfIr) {
+    match node {
+        BfIr::Add(0) | BfIr::MovePtr(0) => {}
+        BfIr::Add(delta) => match out.last_mut() {
+            Some(BfIr::Add(prev)) => {
+                *prev += delta;
+                if *prev == 0 {
+                    out.pop();
+                }
+            }
+            Some(BfIr::Clear) if delta != 0 => {
+                out.pop();
+                out.push(BfIr::Add(delta));
+            }
+            Some(BfIr::Clear) => {}
+            _ => out.push(BfIr::Add(delta)),
+        },
+        BfIr::MovePtr(delta) => match out.last_mut() {
+            Some(BfIr::MovePtr(prev)) => {
+                *prev += delta;
+                if *prev == 0 {
+                    out.pop();
+                }
+            }
+            _ => out.push(BfIr::MovePtr(delta)),
+        },
+        BfIr::Clear => match out.last() {
+            Some(BfIr::Add(_)) | Some(BfIr::Clear) => {
+                out.pop();
+                out.push(BfIr::Clear);
+            }
+            Some(BfIr::Distribute { .. }) => {}
+            _ => out.push(BfIr::Clear),
+        },
+        BfIr::Distribute { targets } => match out.last() {
+            Some(BfIr::Clear) | Some(BfIr::Distribute { .. }) => {}
+            _ => out.push(BfIr::Distribute { targets }),
+        },
+        other => out.push(other),
+    }
+}
+
+fn normalize_sequence_once(nodes: &mut Vec<BfIr>) -> bool {
+    let before = nodes.clone();
     let mut merged = Vec::with_capacity(nodes.len());
     for node in nodes.drain(..) {
-        match (merged.last_mut(), node) {
-            (Some(BfIr::Add(a)), BfIr::Add(b)) => {
-                *a += b;
-                if *a == 0 {
-                    merged.pop();
-                }
-            }
-            (Some(BfIr::MovePtr(a)), BfIr::MovePtr(b)) => {
-                *a += b;
-                if *a == 0 {
-                    merged.pop();
-                }
-            }
-            (_, BfIr::Add(0)) | (_, BfIr::MovePtr(0)) => {}
-            (_, n) => merged.push(n),
+        if let Some(node) = normalize_flat_node(node) {
+            push_normalized_node(&mut merged, node);
         }
     }
+    let changed = before != merged;
     *nodes = merged;
+    changed
+}
+
+fn normalize_sequence(nodes: &mut Vec<BfIr>) {
+    while normalize_sequence_once(nodes) {}
 }
 
 // --- Pass 2: try_summarize ---
 
-fn summarize_loop(body: &[BfIr]) -> Option<BfIr> {
+fn try_summarize_clear_like_loop(body: &[BfIr]) -> Option<BfIr> {
     match body {
         [BfIr::Clear] => Some(BfIr::Clear),
-        [BfIr::Distribute { targets }] => Some(BfIr::Distribute {
-            targets: targets.clone(),
-        }),
         [BfIr::Add(delta)] if *delta == -1 || *delta == 1 => Some(BfIr::Clear),
-        _ => recognize_affine_loop(body),
+        _ => None,
     }
 }
 
@@ -104,12 +152,19 @@ fn summarize_simple_loop(body: &[BfIr]) -> Option<LoopSummary> {
     })
 }
 
-fn recognize_affine_loop(body: &[BfIr]) -> Option<BfIr> {
+fn try_summarize_affine_transfer_loop(body: &[BfIr]) -> Option<BfIr> {
+    if let [BfIr::Distribute { targets }] = body {
+        return Some(normalize_distribute_targets(targets));
+    }
+
     let summary = summarize_simple_loop(body)?;
     if summary.ptr_end != 0 {
         return None;
     }
 
+    // This summary is intentionally conservative. We only fold loops whose
+    // source cell changes by exactly +/-1 per iteration, which is the sound
+    // boundary for the compiler's unsigned modular tape model.
     let src_delta = *summary.deltas.get(&0).unwrap_or(&0);
 
     let coeff_sign = match src_delta {
@@ -132,7 +187,7 @@ fn recognize_affine_loop(body: &[BfIr]) -> Option<BfIr> {
     if targets.is_empty() {
         Some(BfIr::Clear)
     } else {
-        Some(BfIr::Distribute { targets })
+        Some(normalize_distribute_targets(&targets))
     }
 }
 
@@ -153,80 +208,50 @@ fn is_guarded_diverge_like(body: &[BfIr]) -> bool {
     }
 }
 
+fn try_recognize_guarded_diverge_loop(body: &[BfIr]) -> Option<BfIr> {
+    (body.is_empty() || is_guarded_diverge_like(body)).then_some(BfIr::Loop(vec![BfIr::Diverge]))
+}
+
+fn try_summarize_loop_body(body: &[BfIr]) -> Option<BfIr> {
+    try_summarize_clear_like_loop(body).or_else(|| try_summarize_affine_transfer_loop(body))
+}
+
 // --- Pass 3: canonicalize_loop ---
-// Canonicalize nested loops bottom-up, then summarize the current loop body if
-// the outer loop itself matches a sound summary rule.
+// Canonicalize an already-rewritten loop body. Structure traversal happens in
+// the shared bottom-up rewriter; loop policy lives here.
+fn canonicalize_loop_body(mut body: Vec<BfIr>) -> BfIr {
+    normalize_sequence(&mut body);
 
-pub(super) fn canonicalize_loop(body: Vec<BfIr>) -> CanonResult {
-    let mut stack = vec![CanonFrame::Seq {
-        input: body.into_iter(),
-        out: Vec::new(),
-    }];
-    let mut completed: Option<Vec<BfIr>> = None;
-
-    while let Some(frame) = stack.last_mut() {
-        match frame {
-            CanonFrame::Seq { input, out } => {
-                let Some(node) = input.next() else {
-                    let mut result = std::mem::take(out);
-                    merge_adjacent(&mut result);
-                    stack.pop();
-                    completed = Some(result);
-                    continue;
-                };
-
-                match node {
-                    BfIr::Loop(inner) => {
-                        stack.push(CanonFrame::LoopFinalize);
-                        stack.push(CanonFrame::Seq {
-                            input: inner.into_iter(),
-                            out: Vec::new(),
-                        });
-                    }
-                    BfIr::Add(0) | BfIr::MovePtr(0) => {}
-                    other => out.push(other),
-                }
-            }
-            CanonFrame::LoopFinalize => {
-                let inner = completed
-                    .take()
-                    .expect("canonicalized child loop body must exist");
-                stack.pop();
-                let CanonFrame::Seq { out, .. } = stack
-                    .last_mut()
-                    .expect("child loop must have a parent sequence")
-                else {
-                    unreachable!();
-                };
-
-                if inner.is_empty() || is_guarded_diverge_like(&inner) {
-                    out.push(BfIr::Loop(vec![BfIr::Diverge]));
-                } else {
-                    match summarize_loop(&inner) {
-                        Some(summary) => out.push(summary),
-                        None => out.push(BfIr::Loop(inner)),
-                    }
-                }
-            }
-        }
+    if let Some(diverge) = try_recognize_guarded_diverge_loop(&body) {
+        return diverge;
     }
 
-    let mut current = completed.unwrap_or_default();
-    merge_adjacent(&mut current);
-
-    if current.is_empty() || is_guarded_diverge_like(&current) {
-        CanonResult::Loop(vec![BfIr::Diverge])
-    } else {
-        match summarize_loop(&current) {
-            Some(summary) => CanonResult::Summary(summary),
-            None => CanonResult::Loop(current),
-        }
+    match try_summarize_loop_body(&body) {
+        Some(summary) => summary,
+        None => BfIr::Loop(body),
     }
 }
 
-// --- Stack orchestration ---
+#[cfg(test)]
+pub(super) fn canonicalize_loop(body: Vec<BfIr>) -> BfIr {
+    canonicalize_loop_body(rewrite_ir_bottom_up(body, &canonicalize_loop_body))
+}
 
-enum OptimizeFrame {
+// --- Pass 4: lowering cleanup ---
+// This pass is semantics-blind and only reduces redundant IR surface area after
+// structural loop rewriting has finished.
+fn normalize_loop_for_lowering(mut body: Vec<BfIr>) -> BfIr {
+    normalize_sequence(&mut body);
+    try_recognize_guarded_diverge_loop(&body).unwrap_or(BfIr::Loop(body))
+}
+
+fn cleanup_lowering_ir(program: Vec<BfIr>) -> Vec<BfIr> {
+    rewrite_ir_bottom_up(program, &normalize_loop_for_lowering)
+}
+
+// --- Bottom-up structural rewrite ---
+
+enum RewriteFrame {
     Seq {
         input: std::vec::IntoIter<BfIr>,
         out: Vec<BfIr>,
@@ -234,8 +259,11 @@ enum OptimizeFrame {
     LoopFinalize,
 }
 
-fn optimize_sequence(program: Vec<BfIr>) -> Vec<BfIr> {
-    let mut stack = vec![OptimizeFrame::Seq {
+fn rewrite_ir_bottom_up(
+    program: Vec<BfIr>,
+    rewrite_loop: &impl Fn(Vec<BfIr>) -> BfIr,
+) -> Vec<BfIr> {
+    let mut stack = vec![RewriteFrame::Seq {
         input: program.into_iter(),
         out: Vec::new(),
     }];
@@ -243,18 +271,18 @@ fn optimize_sequence(program: Vec<BfIr>) -> Vec<BfIr> {
 
     while let Some(frame) = stack.last_mut() {
         match frame {
-            OptimizeFrame::Seq { input, out } => {
+            RewriteFrame::Seq { input, out } => {
                 let Some(node) = input.next() else {
                     let mut result = std::mem::take(out);
-                    merge_adjacent(&mut result);
+                    normalize_sequence(&mut result);
                     stack.pop();
                     completed = Some(result);
                     continue;
                 };
                 match node {
                     BfIr::Loop(body) => {
-                        stack.push(OptimizeFrame::LoopFinalize);
-                        stack.push(OptimizeFrame::Seq {
+                        stack.push(RewriteFrame::LoopFinalize);
+                        stack.push(RewriteFrame::Seq {
                             input: body.into_iter(),
                             out: Vec::new(),
                         });
@@ -263,16 +291,13 @@ fn optimize_sequence(program: Vec<BfIr>) -> Vec<BfIr> {
                     other => out.push(other),
                 }
             }
-            OptimizeFrame::LoopFinalize => {
+            RewriteFrame::LoopFinalize => {
                 let body = completed.take().unwrap();
                 stack.pop();
-                let OptimizeFrame::Seq { out, .. } = stack.last_mut().unwrap() else {
+                let RewriteFrame::Seq { out, .. } = stack.last_mut().unwrap() else {
                     unreachable!();
                 };
-                match canonicalize_loop(body) {
-                    CanonResult::Summary(s) => out.push(s),
-                    CanonResult::Loop(b) => out.push(BfIr::Loop(b)),
-                }
+                out.push(rewrite_loop(body));
             }
         }
     }

@@ -1,10 +1,40 @@
 use crate::bitgrid::BitGrid;
-use crate::life_grid_format;
+use crate::hashlife;
+use crate::persistence;
+use std::error::Error;
+use std::fmt;
 
 use super::ir::BfIr;
 use super::optimizer::{CellSign, CodegenOpts, IoMode};
 
 pub(super) const C_TAPE_LEN: usize = 30_000;
+const BF_LIFE_STEP_BUDGET: u64 = 10_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BfLifeEmitError {
+    SignedCellsUnsupported,
+    DivergenceDetected,
+    StepBudgetExceeded,
+}
+
+impl fmt::Display for BfLifeEmitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::SignedCellsUnsupported => {
+                "Life emitters require --unsigned-cells; signed-cell export is unsupported"
+            }
+            Self::DivergenceDetected => {
+                "Life emitters rejected a diverging program instead of emitting unsound output"
+            }
+            Self::StepBudgetExceeded => {
+                "Life emitters rejected a program that exceeded the execution step budget"
+            }
+        };
+        f.write_str(message)
+    }
+}
+
+impl Error for BfLifeEmitError {}
 
 fn indent(n: usize) -> String {
     " ".repeat(n)
@@ -366,12 +396,18 @@ pub fn emit_c(program: &[BfIr], opts: CodegenOpts) -> String {
         .replace("/* @BF_PROGRAM */", &ir_body)
 }
 
-/// Interpret the BF IR program and encode the resulting tape as a Life pattern.
+/// Interpret BF IR under the unsigned modular tape model used for Life export.
 ///
 /// Each tape cell `i` with value `v` maps to `v` live cells at `y=0`,
 /// `x = i * stride .. i * stride + v - 1`, where `stride = cell_max + 2`.
-pub fn compile_to_life_grid(program: &[BfIr], opts: CodegenOpts) -> BitGrid {
+pub fn compile_to_life_grid(
+    program: &[BfIr],
+    opts: CodegenOpts,
+) -> Result<BitGrid, BfLifeEmitError> {
     const MAX_TAPE: usize = 30_000;
+    if opts.cell_sign != CellSign::Unsigned {
+        return Err(BfLifeEmitError::SignedCellsUnsupported);
+    }
     let cell_bits = opts.cell_bits.min(63);
     let cell_max: i64 = if cell_bits == 0 {
         0
@@ -382,7 +418,7 @@ pub fn compile_to_life_grid(program: &[BfIr], opts: CodegenOpts) -> BitGrid {
 
     let mut tape = vec![0_i64; MAX_TAPE];
     let mut ptr = 0_usize;
-    interpret(program, &mut tape, &mut ptr, cell_max);
+    interpret_unsigned_for_life_export(program, &mut tape, &mut ptr, cell_max)?;
 
     let mut cells = Vec::new();
     for (i, &v) in tape.iter().enumerate() {
@@ -392,13 +428,18 @@ pub fn compile_to_life_grid(program: &[BfIr], opts: CodegenOpts) -> BitGrid {
             cells.push((base_x + dx, 0_i64));
         }
     }
-    BitGrid::from_cells(&cells)
+    Ok(BitGrid::from_cells(&cells))
 }
 
-/// Iteratively interpret a BF IR program. I/O ops are skipped.
-/// Stops on Diverge or after 10M steps.
-fn interpret(program: &[BfIr], tape: &mut Vec<i64>, ptr: &mut usize, cell_mask: i64) {
-    const STEP_BUDGET: u64 = 10_000_000;
+/// Iteratively interpret BF IR for unsigned Life export only.
+/// This is not a general BF semantics oracle and must fail closed on
+/// unsupported or indeterminate execution rather than emitting approximations.
+fn interpret_unsigned_for_life_export(
+    program: &[BfIr],
+    tape: &mut Vec<i64>,
+    ptr: &mut usize,
+    cell_mask: i64,
+) -> Result<(), BfLifeEmitError> {
     fn wrap(v: i64, mask: i64) -> i64 {
         v & mask
     }
@@ -406,13 +447,13 @@ fn interpret(program: &[BfIr], tape: &mut Vec<i64>, ptr: &mut usize, cell_mask: 
     let mut stack: Vec<(&[BfIr], usize)> = vec![(program, 0)];
     let mut steps = 0_u64;
 
-    'outer: while let Some((nodes, index)) = stack.last_mut() {
+    while let Some((nodes, index)) = stack.last_mut() {
         if *index >= nodes.len() {
             stack.pop();
             continue;
         }
-        if steps >= STEP_BUDGET {
-            break;
+        if steps >= BF_LIFE_STEP_BUDGET {
+            return Err(BfLifeEmitError::StepBudgetExceeded);
         }
         steps += 1;
 
@@ -438,7 +479,7 @@ fn interpret(program: &[BfIr], tape: &mut Vec<i64>, ptr: &mut usize, cell_mask: 
                 }
                 tape[*ptr] = 0;
             }
-            BfIr::Diverge => break 'outer,
+            BfIr::Diverge => return Err(BfLifeEmitError::DivergenceDetected),
             BfIr::Loop(body) => {
                 if tape[*ptr] != 0 {
                     stack.last_mut().unwrap().1 -= 1;
@@ -447,8 +488,120 @@ fn interpret(program: &[BfIr], tape: &mut Vec<i64>, ptr: &mut usize, cell_mask: 
             }
         }
     }
+    Ok(())
 }
 
-pub fn serialize_life_grid(program: &[BfIr], opts: CodegenOpts) -> String {
-    life_grid_format::serialize(&compile_to_life_grid(program, opts))
+#[cfg(test)]
+pub(crate) fn interpret_unsigned_for_tests(
+    program: &[BfIr],
+    cell_bits: u32,
+) -> Result<(Vec<i64>, usize), BfLifeEmitError> {
+    interpret_for_tests(
+        program,
+        CodegenOpts {
+            io_mode: IoMode::Char,
+            cell_bits,
+            input_bits: None,
+            output_bits: None,
+            cell_sign: CellSign::Unsigned,
+        },
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn interpret_for_tests(
+    program: &[BfIr],
+    opts: CodegenOpts,
+) -> Result<(Vec<i64>, usize), BfLifeEmitError> {
+    fn wrap_unsigned(v: i64, bits: u32) -> i64 {
+        if bits == 0 {
+            return 0;
+        }
+        let mask = (1_u64 << bits) - 1;
+        ((v as u64) & mask) as i64
+    }
+
+    fn wrap_signed(v: i64, bits: u32) -> i64 {
+        if bits == 0 {
+            return 0;
+        }
+        let mask = (1_u64 << bits) - 1;
+        let raw = (v as u64) & mask;
+        let sign_bit = 1_u64 << (bits - 1);
+        if raw & sign_bit == 0 {
+            raw as i64
+        } else {
+            (raw as i128 - (1_i128 << bits)) as i64
+        }
+    }
+
+    fn wrap(v: i64, bits: u32, sign: CellSign) -> i64 {
+        match sign {
+            CellSign::Signed => wrap_signed(v, bits),
+            CellSign::Unsigned => wrap_unsigned(v, bits),
+        }
+    }
+
+    let cell_bits = opts.cell_bits.min(63);
+    let mut tape = vec![0_i64; C_TAPE_LEN];
+    let mut ptr = 0_usize;
+    let mut stack: Vec<(&[BfIr], usize)> = vec![(program, 0)];
+    let mut steps = 0_u64;
+
+    while let Some((nodes, index)) = stack.last_mut() {
+        if *index >= nodes.len() {
+            stack.pop();
+            continue;
+        }
+        if steps >= BF_LIFE_STEP_BUDGET {
+            return Err(BfLifeEmitError::StepBudgetExceeded);
+        }
+        steps += 1;
+
+        let node = &nodes[*index];
+        *index += 1;
+
+        match node {
+            BfIr::MovePtr(n) => {
+                ptr = (ptr as i64 + *n as i64).rem_euclid(tape.len() as i64) as usize;
+            }
+            BfIr::Add(n) => {
+                tape[ptr] = wrap(tape[ptr] + *n as i64, cell_bits, opts.cell_sign);
+            }
+            BfIr::Input | BfIr::Output => {}
+            BfIr::Clear => tape[ptr] = 0,
+            BfIr::Distribute { targets } => {
+                let v = tape[ptr];
+                for &(offset, coeff) in targets {
+                    let t = (ptr as i64 + offset as i64).rem_euclid(tape.len() as i64) as usize;
+                    tape[t] = wrap(tape[t] + v * coeff as i64, cell_bits, opts.cell_sign);
+                }
+                tape[ptr] = 0;
+            }
+            BfIr::Diverge => return Err(BfLifeEmitError::DivergenceDetected),
+            BfIr::Loop(body) => {
+                if tape[ptr] != 0 {
+                    stack.last_mut().unwrap().1 -= 1;
+                    stack.push((body, 0));
+                }
+            }
+        }
+    }
+
+    Ok((tape, ptr))
+}
+
+pub fn serialize_legacy_life_grid(
+    program: &[BfIr],
+    opts: CodegenOpts,
+) -> Result<String, BfLifeEmitError> {
+    Ok(persistence::serialize_life_grid(&compile_to_life_grid(
+        program, opts,
+    )?))
+}
+
+pub fn serialize_life_grid(program: &[BfIr], opts: CodegenOpts) -> Result<String, BfLifeEmitError> {
+    Ok(hashlife::serialize_grid_snapshot(&compile_to_life_grid(
+        program, opts,
+    )?))
 }

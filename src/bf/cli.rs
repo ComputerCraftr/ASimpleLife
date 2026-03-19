@@ -1,6 +1,6 @@
 use std::io::{self, Read};
 
-use super::codegen::{emit_c, format_ir, serialize_life_grid};
+use super::codegen::{emit_c, format_ir, serialize_legacy_life_grid, serialize_life_grid};
 use super::ir::Parser;
 use super::optimizer::{CellSign, CodegenOpts, IoMode, optimize};
 
@@ -9,17 +9,23 @@ enum OutputMode {
     DumpIr,
     EmitC,
     EmitLife,
+    EmitLifeGridLegacy,
 }
 
 pub fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         eprintln!(
-            "usage: bf_life [--dump-ir|--emit-c|--emit-life] [opts] [-- <src> | <file> | <src>]"
+            "usage: bf_life [--dump-ir|--emit-c|--emit-life|--emit-life-grid] [opts] [-- <src> | <file> | <src>]"
         );
         eprintln!("  --dump-ir      print parsed and optimized IR (default)");
         eprintln!("  --emit-c       emit a C translation");
-        eprintln!("  --emit-life    emit a life grid file (tape state as live cells)");
+        eprintln!(
+            "  --emit-life    emit a compact HashLife snapshot for unsigned, terminating programs"
+        );
+        eprintln!(
+            "  --emit-life-grid emit the legacy life grid cell-list format for unsigned, terminating programs"
+        );
         eprintln!("opts: --cell-bits N  --io char|number  --signed-cells  --unsigned-cells");
         return;
     }
@@ -51,8 +57,21 @@ pub fn run() {
         OutputMode::EmitC => {
             print!("{}", emit_c(&optimize(parsed), opts));
         }
-        OutputMode::EmitLife => {
-            print!("{}", serialize_life_grid(&optimize(parsed), opts));
+        OutputMode::EmitLife => match serialize_life_grid(&optimize(parsed), opts) {
+            Ok(output) => print!("{output}"),
+            Err(err) => {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+        },
+        OutputMode::EmitLifeGridLegacy => {
+            match serialize_legacy_life_grid(&optimize(parsed), opts) {
+                Ok(output) => print!("{output}"),
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }
@@ -73,6 +92,10 @@ fn read_input(args: &[String]) -> Result<(OutputMode, CodegenOpts, String), Stri
             }
             "--emit-life" => {
                 mode = OutputMode::EmitLife;
+                rest = &rest[1..];
+            }
+            "--emit-life-grid" => {
+                mode = OutputMode::EmitLifeGridLegacy;
                 rest = &rest[1..];
             }
             _ => {}

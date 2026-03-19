@@ -262,10 +262,7 @@ fn collect_target_chunks(grid: &BitGrid) -> Vec<Cell> {
     targets
 }
 
-fn gather_neighborhood_words_9xn(
-    grid: &BitGrid,
-    targets: &[Cell],
-) -> [[u64; SIMD_BATCH_LANES]; 9] {
+fn gather_neighborhood_words_9xn(grid: &BitGrid, targets: &[Cell]) -> [[u64; SIMD_BATCH_LANES]; 9] {
     let mut words = [[0_u64; SIMD_BATCH_LANES]; 9];
     for (word, (dx, dy)) in CHUNK_NEIGHBORHOOD_OFFSETS_3X3.into_iter().enumerate() {
         for (lane, &(cx, cy)) in targets.iter().enumerate() {
@@ -282,17 +279,21 @@ fn transpose_words_9xn_to_neighborhoods(
     let mut neighborhoods = [EMPTY_CHUNK_NEIGHBORHOOD; SIMD_BATCH_LANES];
     for lane in 0..active_lanes {
         neighborhoods[lane] = ChunkNeighborhood([
-            words[0][lane], words[1][lane], words[2][lane], words[3][lane], words[4][lane],
-            words[5][lane], words[6][lane], words[7][lane], words[8][lane],
+            words[0][lane],
+            words[1][lane],
+            words[2][lane],
+            words[3][lane],
+            words[4][lane],
+            words[5][lane],
+            words[6][lane],
+            words[7][lane],
+            words[8][lane],
         ]);
     }
     neighborhoods
 }
 
-fn gather_neighborhoods_staged(
-    grid: &BitGrid,
-    targets: &[Cell],
-) -> StagedNeighborhoodBatch {
+fn gather_neighborhoods_staged(grid: &BitGrid, targets: &[Cell]) -> StagedNeighborhoodBatch {
     let words = gather_neighborhood_words_9xn(grid, targets);
     let neighborhoods = transpose_words_9xn_to_neighborhoods(&words, targets.len());
     StagedNeighborhoodBatch {
@@ -448,9 +449,7 @@ fn accumulate_neighbor_bitplanes(neighbors: &[u64x8; 8]) -> (u64x8, u64x8, u64x8
 }
 
 // Batched row layout
-fn build_chunk_row_batches_from_pending(
-    pending: &PendingChunkBatch,
-) -> [[u16x32; 2]; 9] {
+fn build_chunk_row_batches_from_pending(pending: &PendingChunkBatch) -> [[u16x32; 2]; 9] {
     let mut chunks = AlignedU16LaneChunkRows9::default();
 
     for lane in 0..pending.len {
@@ -640,8 +639,14 @@ fn align_diagonal_rows(
 fn shift_rows_with_edge(rows: [u16; 8], edge_fill: u16, shift_rows: i32) -> u16x8 {
     let row_bytes: i8x16 = must_cast(rows);
     let (edge_bytes, shifted_bytes): (i8x16, i8x16) = match shift_rows {
-        1 => (edge_fill_bytes(edge_fill, 0), row_bytes.swizzle(SHIFT_ROWS_DOWN_BYTES)),
-        -1 => (edge_fill_bytes(edge_fill, 7), row_bytes.swizzle(SHIFT_ROWS_UP_BYTES)),
+        1 => (
+            edge_fill_bytes(edge_fill, 0),
+            row_bytes.swizzle(SHIFT_ROWS_DOWN_BYTES),
+        ),
+        -1 => (
+            edge_fill_bytes(edge_fill, 7),
+            row_bytes.swizzle(SHIFT_ROWS_UP_BYTES),
+        ),
         _ => panic!("unsupported row shift: {shift_rows}"),
     };
     must_cast(shifted_bytes | edge_bytes)
@@ -684,11 +689,7 @@ fn edge_column_mask_rows(rows: u16x8, edge_col: usize, target_col: u16) -> u16x8
     ((rows >> (edge_col as u16)) & u16x8::ONE) << target_col
 }
 
-fn edge_column_mask_batch(
-    chunk: &[u16x32; 2],
-    edge_col: usize,
-    target_col: u16,
-) -> [u16x32; 2] {
+fn edge_column_mask_batch(chunk: &[u16x32; 2], edge_col: usize, target_col: u16) -> [u16x32; 2] {
     [
         ((chunk[0] >> (edge_col as u16)) & u16x32::ONE) << target_col,
         ((chunk[1] >> (edge_col as u16)) & u16x32::ONE) << target_col,

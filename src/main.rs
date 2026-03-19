@@ -47,7 +47,7 @@ fn main() {
             .as_mut()
             .expect("startup target generation should create a simulation session");
         let outcome = OracleSession::new(initial.clone(), 0, HashMap::new(), simulation)
-            .advance_runtime_target_hashlife_first(start_generation, None);
+            .advance_runtime_target(start_generation, None);
         startup_population = Some(outcome.population);
         outcome.classification.to_string()
     };
@@ -322,8 +322,9 @@ mod tests {
     use super::{
         compute_view_height, sample_visible_session_grid, status_text, wrapped_line_count,
     };
+    use a_simple_life::classify::Classification;
     use a_simple_life::engine::SimulationSession;
-    use a_simple_life::generators::random_soup;
+    use a_simple_life::generators::{pattern_by_name, random_soup};
     use a_simple_life::oracle::OracleSession;
 
     #[test]
@@ -365,12 +366,30 @@ mod tests {
         let target_generation = 100_000;
         let mut simulation = SimulationSession::new();
         let outcome = OracleSession::new(initial, 0, Default::default(), &mut simulation)
-            .advance_runtime_target_hashlife_first(target_generation, None);
+            .advance_runtime_target(target_generation, None);
 
         assert_eq!(outcome.final_generation, target_generation);
         assert_eq!(simulation.hashlife_generation(), target_generation);
         assert!(simulation.hashlife_population().unwrap_or(0) > 0);
         assert!(simulation.hashlife_bounds().is_some());
+    }
+
+    #[test]
+    fn startup_target_generation_keeps_small_oscillator_first_seen_exact() {
+        let initial = pattern_by_name("pulsar").unwrap();
+        let target_generation = 1_000_000;
+        let mut simulation = SimulationSession::new();
+        let outcome = OracleSession::new(initial, 0, Default::default(), &mut simulation)
+            .advance_runtime_target(target_generation, None);
+
+        assert_eq!(outcome.final_generation, target_generation);
+        assert_eq!(
+            outcome.classification,
+            Classification::Repeats {
+                period: 3,
+                first_seen: 0,
+            }
+        );
     }
 
     #[test]

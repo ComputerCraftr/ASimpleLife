@@ -1,7 +1,7 @@
 use super::{
-    GridExtractionError, GridExtractionPolicy, HashLifeCheckpoint, HashLifeCheckpointSignature,
-    HASHLIFE_CHECKPOINT_MAX_BOUNDS_SPAN, HASHLIFE_CHECKPOINT_MAX_POPULATION, HashLifeEngine,
-    NodeId, PackedNodeKey, base_transitions,
+    GridExtractionError, GridExtractionPolicy, HASHLIFE_CHECKPOINT_MAX_BOUNDS_SPAN,
+    HASHLIFE_CHECKPOINT_MAX_POPULATION, HashLifeCheckpoint, HashLifeCheckpointSignature,
+    HashLifeEngine, NodeId, PackedNodeKey, base_transitions,
 };
 use crate::bitgrid::{BitGrid, CHUNK_SIZE, Cell, Coord};
 use crate::life::step_grid_with_changes_and_memo;
@@ -63,12 +63,9 @@ impl HashLifeEngine {
         let [nw, ne, sw, se] = self.node_columns.quadrants(node);
         debug_assert_eq!(self.node_columns.level(node), 1);
         (u16::from(self.node_columns.population(nw) != 0) << (base_y * 4 + base_x))
-            | (u16::from(self.node_columns.population(ne) != 0)
-                << (base_y * 4 + base_x + 1))
-            | (u16::from(self.node_columns.population(sw) != 0)
-                << ((base_y + 1) * 4 + base_x))
-            | (u16::from(self.node_columns.population(se) != 0)
-                << ((base_y + 1) * 4 + base_x + 1))
+            | (u16::from(self.node_columns.population(ne) != 0) << (base_y * 4 + base_x + 1))
+            | (u16::from(self.node_columns.population(sw) != 0) << ((base_y + 1) * 4 + base_x))
+            | (u16::from(self.node_columns.population(se) != 0) << ((base_y + 1) * 4 + base_x + 1))
     }
 
     pub(super) fn node_to_grid(

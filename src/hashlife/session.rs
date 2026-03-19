@@ -1,5 +1,6 @@
 use super::{
-    GridExtractionError, GridExtractionPolicy, HashLifeCheckpoint, HashLifeEngine, NodeId,
+    GridExtractionError, GridExtractionPolicy, HashLifeCheckpoint, HashLifeEngine,
+    HashLifeSnapshotError, NodeId,
 };
 use crate::bitgrid::{BitGrid, Coord};
 
@@ -60,6 +61,23 @@ impl HashLifeSession {
         self.root_is_centered = false;
         self.sampled_bounds = Some(grid.bounds());
         self.sampled_checkpoint = None;
+    }
+
+    pub fn load_snapshot_string(&mut self, snapshot: &str) -> Result<(), HashLifeSnapshotError> {
+        if self.current_root.is_some() || self.active_run {
+            self.finish_active_run();
+        }
+        self.ensure_active_run();
+        let (root, origin_x, origin_y, generation) =
+            self.engine.import_snapshot_string(snapshot)?;
+        self.current_root = Some(root);
+        self.current_origin_x = origin_x;
+        self.current_origin_y = origin_y;
+        self.current_generation = generation;
+        self.root_is_centered = false;
+        self.sampled_bounds = None;
+        self.sampled_checkpoint = None;
+        Ok(())
     }
 
     pub fn generation(&self) -> u64 {
@@ -220,6 +238,16 @@ impl HashLifeSession {
     pub fn sample_grid(&mut self) -> Option<BitGrid> {
         self.extract_grid(unrestricted_debug_full_grid_policy())
             .ok()
+    }
+
+    pub fn export_snapshot_string(&mut self) -> Option<String> {
+        let root = self.current_root?;
+        Some(self.engine.export_snapshot_string(
+            root,
+            self.current_origin_x,
+            self.current_origin_y,
+            self.current_generation,
+        ))
     }
 
     pub fn extract_grid(

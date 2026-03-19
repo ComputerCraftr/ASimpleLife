@@ -4,48 +4,86 @@ use crate::simd_layout::AlignedLaneIndexBatch;
 use crate::simd_layout::AlignedU64LaneWords9;
 
 impl HashLifeEngine {
-    pub(super) fn probe_and_build_overlaps_from_canonical_keys_staged<const N: usize>(
-        &mut self,
-        cache_keys: &[CanonicalJumpKey; N],
-        active_lanes: usize,
-    ) -> [[NodeId; 9]; N] {
-        let mut canonical_keys = [PackedNodeKey::new(0, [0; 4]); N];
-        let mut canonical_fingerprints = [0_u64; N];
-        for lane in 0..active_lanes {
-            canonical_keys[lane] = cache_keys[lane].packed;
-            canonical_fingerprints[lane] = cache_keys[lane].packed.fingerprint();
+    fn write_population_lane<const N: usize>(
+        populations: &mut AlignedU64WordBatch9,
+        lane: usize,
+        input_populations: [u64; N],
+    ) {
+        for (index, population) in input_populations.into_iter().enumerate() {
+            populations.0[index][lane] = population;
         }
-        self.stats.cache_probe_batches += 1;
-        self.stats.scheduler_probe_batches += 1;
-        self.stats.overlap_prep_batches += 1;
-        self.stats.packed_overlap_outputs_produced += active_lanes;
-        self.probe_and_build_canonical_overlaps_staged(
-            &canonical_keys,
-            &canonical_fingerprints,
-            active_lanes,
-        )
+    }
+
+    fn populate_nodes_and_populations<const N: usize>(
+        &mut self,
+        source_nodes: &[NodeId],
+    ) -> ([NodeId; N], [u64; N]) {
+        let mut nodes = [0; N];
+        let mut populations = [0; N];
+        nodes.copy_from_slice(&source_nodes[..N]);
+        for (index, node) in nodes.into_iter().enumerate() {
+            populations[index] = self.node_columns.population(node);
+            nodes[index] = node;
+        }
+        (nodes, populations)
+    }
+
+    fn overlap_miss_join_intents_from_records<const N: usize>(
+        miss_records: &[OverlapMissRecord; N],
+        miss_unique_count: usize,
+    ) -> [[Option<JoinIntent>; N]; 5] {
+        let mut intents = [[None; N]; 5];
+        for unique in 0..miss_unique_count {
+            let join_level = miss_records[unique].join_level;
+            for join_index in 0..5 {
+                intents[join_index][unique] = Some(JoinIntent {
+                    level: join_level,
+                    children: miss_records[unique].join_children[join_index],
+                });
+            }
+        }
+        intents
     }
 
     pub(super) fn probe_and_build_canonical_overlaps_staged<const N: usize>(
         &mut self,
-        canonical_keys: &[PackedNodeKey; N],
-        canonical_fingerprints: &[u64; N],
+        identities: &[CanonicalNodeIdentity; N],
+        fingerprints: &[u64; N],
         active_lanes: usize,
     ) -> [[NodeId; 9]; N] {
+        #[derive(Clone, Copy)]
+        struct DuplicateMissLane {
+            lane: usize,
+            unique: usize,
+        }
+
         let mut canonical_overlap_lanes = [[0; 9]; N];
+        let mut structural_keys = [CanonicalStructKey::new(0, [0; 4]); N];
+        for lane in 0..active_lanes {
+            structural_keys[lane] = identities[lane].structural;
+        }
         let cached = self.overlap_cache.get_many_with_fingerprints(
-            canonical_keys,
-            canonical_fingerprints,
+            &structural_keys,
+            fingerprints,
             active_lanes,
         );
-        let mut miss_levels = [0_u32; N];
-        let mut miss_children = [[[0_u64; 4]; N]; 5];
-        let mut miss_unique_keys = [PackedNodeKey::new(0, [0; 4]); N];
-        let mut miss_unique_fingerprints = [0_u64; N];
-        let mut miss_unique_active = [false; N];
-        let mut miss_lane_to_unique = [usize::MAX; N];
-        let mut is_miss = [false; N];
+        let mut miss_records = [OverlapMissRecord {
+            representative_lane: 0,
+            identity: CanonicalNodeIdentity {
+                packed: PackedNodeKey::new(0, [0; 4]),
+                structural: CanonicalStructKey::new(0, [0; 4]),
+                symmetry: Symmetry::Identity,
+            },
+            fingerprint: 0,
+            join_level: 0,
+            join_children: [[0; 4]; 5],
+            overlaps: [0; 9],
+        }; N];
+        let mut duplicate_miss_lanes = [DuplicateMissLane { lane: 0, unique: 0 }; N];
+        let mut duplicate_miss_count = 0usize;
         let mut miss_unique_count = 0;
+        let mut unique_lookup =
+            FlatTable::<CanonicalStructKey, usize>::with_capacity(active_lanes.max(4));
 
         for lane in 0..active_lanes {
             if let Some(lane_overlaps) = cached[lane] {
@@ -54,18 +92,14 @@ impl HashLifeEngine {
                 continue;
             }
 
-            let canonical_key = canonical_keys[lane];
-            let mut existing_unique = None;
-            for unique in 0..miss_unique_count {
-                if miss_unique_keys[unique] == canonical_key {
-                    existing_unique = Some(unique);
-                    break;
-                }
-            }
-            if let Some(unique) = existing_unique {
+            let canonical_identity = identities[lane];
+            let canonical_key = canonical_identity.packed;
+            let structural_key = canonical_identity.structural;
+            if let Some(unique) = unique_lookup.get_with_fingerprint(&structural_key, fingerprints[lane])
+            {
                 self.stats.overlap_local_reuse_lanes += 1;
-                miss_lane_to_unique[lane] = unique;
-                is_miss[lane] = true;
+                duplicate_miss_lanes[duplicate_miss_count] = DuplicateMissLane { lane, unique };
+                duplicate_miss_count += 1;
                 continue;
             }
 
@@ -75,38 +109,42 @@ impl HashLifeEngine {
             let [ne_nw, _, ne_sw, ne_se] = self.node_columns.quadrants(ne);
             let [sw_nw, sw_ne, _, sw_se] = self.node_columns.quadrants(sw);
             let [se_nw, se_ne, se_sw, _] = self.node_columns.quadrants(se);
-            miss_levels[miss_unique_count] = canonical_key.level - 1;
-            miss_children[0][miss_unique_count] = [nw_ne, ne_nw, nw_se, ne_sw];
-            miss_children[1][miss_unique_count] = [nw_sw, nw_se, sw_nw, sw_ne];
-            miss_children[2][miss_unique_count] = [nw_se, ne_sw, sw_ne, se_nw];
-            miss_children[3][miss_unique_count] = [ne_sw, ne_se, se_nw, se_ne];
-            miss_children[4][miss_unique_count] = [sw_ne, se_nw, sw_se, se_sw];
-            miss_unique_keys[miss_unique_count] = canonical_key;
-            miss_unique_fingerprints[miss_unique_count] = canonical_fingerprints[lane];
-            miss_unique_active[miss_unique_count] = true;
-            miss_lane_to_unique[lane] = miss_unique_count;
-            is_miss[lane] = true;
+            miss_records[miss_unique_count] = OverlapMissRecord {
+                representative_lane: lane,
+                identity: canonical_identity,
+                fingerprint: fingerprints[lane],
+                join_level: canonical_key.level - 1,
+                join_children: [
+                    [nw_ne, ne_nw, nw_se, ne_sw],
+                    [nw_sw, nw_se, sw_nw, sw_ne],
+                    [nw_se, ne_sw, sw_ne, se_nw],
+                    [ne_sw, ne_se, se_nw, se_ne],
+                    [sw_ne, se_nw, sw_se, se_sw],
+                ],
+                overlaps: [0; 9],
+            };
+            unique_lookup.insert_with_fingerprint(
+                structural_key,
+                fingerprints[lane],
+                miss_unique_count,
+            );
             miss_unique_count += 1;
         }
 
         if miss_unique_count != 0 {
-            let miss_join_intents = Self::join_intents_from_child_words_5x4xn(
-                miss_unique_count,
-                &miss_unique_active,
-                &miss_levels,
-                &miss_children,
-            );
+            let miss_join_intents =
+                Self::overlap_miss_join_intents_from_records(&miss_records, miss_unique_count);
             let resolved_join_0 = self.resolve_join_intents_staged(miss_join_intents[0]);
             let resolved_join_1 = self.resolve_join_intents_staged(miss_join_intents[1]);
             let resolved_join_2 = self.resolve_join_intents_staged(miss_join_intents[2]);
             let resolved_join_3 = self.resolve_join_intents_staged(miss_join_intents[3]);
             let resolved_join_4 = self.resolve_join_intents_staged(miss_join_intents[4]);
-            let mut miss_overlaps = [[0_u64; 9]; N];
 
             for unique in 0..miss_unique_count {
-                let canonical_key = miss_unique_keys[unique];
+                let miss_record = &mut miss_records[unique];
+                let canonical_key = miss_record.identity.packed;
                 let [nw, ne, sw, se] = canonical_key.children;
-                let lane_overlaps = [
+                miss_record.overlaps = [
                     nw,
                     resolved_join_0[unique].expect("overlap join should resolve"),
                     ne,
@@ -118,23 +156,19 @@ impl HashLifeEngine {
                     se,
                 ];
                 self.overlap_cache.insert_with_fingerprint(
-                    canonical_key,
-                    miss_unique_fingerprints[unique],
-                    lane_overlaps,
+                    miss_record.identity.structural,
+                    miss_record.fingerprint,
+                    miss_record.overlaps,
                 );
-                miss_overlaps[unique] = lane_overlaps;
+                canonical_overlap_lanes[miss_record.representative_lane] = miss_record.overlaps;
             }
 
-            for lane in 0..active_lanes {
-                if is_miss[lane] {
-                    canonical_overlap_lanes[lane] = miss_overlaps[miss_lane_to_unique[lane]];
-                }
+            for duplicate in &duplicate_miss_lanes[..duplicate_miss_count] {
+                canonical_overlap_lanes[duplicate.lane] = miss_records[duplicate.unique].overlaps;
             }
         }
 
-        for _ in 0..active_lanes {
-            self.stats.overlap_prep_lanes += 1;
-        }
+        self.stats.overlap_prep_lanes += active_lanes;
         canonical_overlap_lanes
     }
 
@@ -150,23 +184,26 @@ impl HashLifeEngine {
 
     #[cfg(test)]
     pub(super) fn overlapping_subnodes(&mut self, node: NodeId) -> [NodeId; 9] {
-        let (packed, symmetry, fingerprint, used_cached_fingerprint) =
+        let (packed, structural, symmetry, fingerprint, used_cached_fingerprint) =
             if self.record_symmetry_gate_decision(node) {
                 let canonical = self.canonicalize_packed_node(node);
                 (
-                    canonical.packed,
-                    canonical.symmetry,
+                    canonical.node.packed,
+                    canonical.node.structural,
+                    canonical.node.symmetry,
                     canonical.fingerprint,
                     canonical.used_cached_fingerprint,
                 )
             } else {
                 let (packed, fingerprint) = self.node_columns.packed_key_and_fingerprint(node);
-                (packed, Symmetry::Identity, fingerprint, true)
+                let transform_id = self.transform_packed_node_key(packed, Symmetry::Identity);
+                let structural = self.structural_key_from_transform_id(transform_id);
+                (packed, structural, Symmetry::Identity, fingerprint, true)
             };
         self.record_fingerprint_probe(used_cached_fingerprint, 1);
         if let Some(overlaps) = self
             .overlap_cache
-            .get_with_fingerprint(&packed, fingerprint)
+            .get_with_fingerprint(&structural, fingerprint)
         {
             self.stats.overlap_cache_hits += 1;
             self.stats.overlap_prep_lanes += 1;
@@ -192,7 +229,7 @@ impl HashLifeEngine {
             se,
         ];
         self.overlap_cache
-            .insert_with_fingerprint(packed, fingerprint, overlaps);
+            .insert_with_fingerprint(structural, fingerprint, overlaps);
         symmetry.inverse().transform_overlap_nodes(self, overlaps)
     }
 
@@ -203,38 +240,46 @@ impl HashLifeEngine {
         active_lanes: usize,
     ) -> [[NodeId; 9]; N] {
         let mut inverse_symmetries = [Symmetry::Identity; N];
-        let mut canonical_keys = [PackedNodeKey::new(0, [0; 4]); N];
-        let mut canonical_fingerprints = [0_u64; N];
+        let mut identities = [CanonicalNodeIdentity {
+            packed: PackedNodeKey::new(0, [0; 4]),
+            structural: CanonicalStructKey::new(0, [0; 4]),
+            symmetry: Symmetry::Identity,
+        }; N];
+        let mut fingerprints = [0_u64; N];
         let canonicalized = self.canonicalize_packed_nodes_batch(nodes, active_lanes);
         for lane in 0..active_lanes {
-            let (packed, symmetry, fingerprint, used_cached_fingerprint) =
+            let (packed, structural, symmetry, fingerprint, used_cached_fingerprint) =
                 if self.record_symmetry_gate_decision(nodes[lane]) {
                     let canonical = canonicalized[lane];
                     (
-                        canonical.packed,
-                        canonical.symmetry,
+                        canonical.node.packed,
+                        canonical.node.structural,
+                        canonical.node.symmetry,
                         canonical.fingerprint,
                         canonical.used_cached_fingerprint,
                     )
                 } else {
                     let (packed, fingerprint) =
                         self.node_columns.packed_key_and_fingerprint(nodes[lane]);
-                    (packed, Symmetry::Identity, fingerprint, true)
+                    let transform_id = self.transform_packed_node_key(packed, Symmetry::Identity);
+                    let structural = self.structural_key_from_transform_id(transform_id);
+                    (packed, structural, Symmetry::Identity, fingerprint, true)
                 };
             self.record_fingerprint_probe(used_cached_fingerprint, 1);
             inverse_symmetries[lane] = symmetry.inverse();
-            canonical_keys[lane] = packed;
-            canonical_fingerprints[lane] = fingerprint;
+            identities[lane] = CanonicalNodeIdentity {
+                packed,
+                structural,
+                symmetry,
+            };
+            fingerprints[lane] = fingerprint;
         }
 
         self.stats.cache_probe_batches += 1;
         self.stats.scheduler_probe_batches += 1;
         self.stats.overlap_prep_batches += 1;
-        let canonical_overlap_lanes = self.probe_and_build_canonical_overlaps_staged(
-            &canonical_keys,
-            &canonical_fingerprints,
-            active_lanes,
-        );
+        let canonical_overlap_lanes =
+            self.probe_and_build_canonical_overlaps_staged(&identities, &fingerprints, active_lanes);
         self.transform_overlap_words_grouped(
             &canonical_overlap_lanes,
             &inverse_symmetries,
@@ -263,20 +308,20 @@ impl HashLifeEngine {
         active_lanes: usize,
     ) -> [NodeId; N] {
         let mut centered = [0; N];
+        let mut reuse = FlatTable::<NodeId, NodeId>::with_capacity(active_lanes.max(4));
         for lane in 0..active_lanes {
             let node = nodes[lane];
             if self.node_columns.level(node) == 1 {
                 centered[lane] = node;
                 continue;
             }
-            let mut reused = None;
-            for prev in 0..lane {
-                if nodes[prev] == node {
-                    reused = Some(centered[prev]);
-                    break;
-                }
+            if let Some(reused) = reuse.get(&node) {
+                centered[lane] = reused;
+                continue;
             }
-            centered[lane] = reused.unwrap_or_else(|| self.centered_subnode(node));
+            let computed = self.centered_subnode(node);
+            centered[lane] = computed;
+            reuse.insert(node, computed);
         }
         centered
     }
@@ -327,54 +372,45 @@ impl HashLifeEngine {
         overlap_lanes
     }
 
-    pub(super) fn join_intents_from_child_words_5x4xn<const N: usize>(
-        active_lanes: usize,
-        is_active: &[bool; N],
-        levels: &[u32; N],
-        child_words: &[[[u64; 4]; N]; 5],
-    ) -> [[Option<JoinIntent>; N]; 5] {
-        let mut intents = [[None; N]; 5];
-        for join_index in 0..5 {
-            for lane in 0..active_lanes {
-                if is_active[lane] {
-                    intents[join_index][lane] = Some(JoinIntent {
-                        level: levels[lane],
-                        children: child_words[join_index][lane],
-                    });
-                }
-            }
-        }
-        intents
-    }
-
     pub(super) fn build_step0_provisional_records_staged(
         &mut self,
-        cache_keys: &[CanonicalJumpKey],
+        discovered_tasks: &[DiscoveredJumpTask],
         provisional_candidates: &mut Vec<SimdProvisionalRecord>,
     ) {
-        let mut canonical_jump_keys = [CanonicalJumpKey {
+        let mut identities = [CanonicalNodeIdentity {
             packed: PackedNodeKey::new(0, [0; 4]),
-            step_exp: 0,
+            structural: CanonicalStructKey::new(0, [0; 4]),
+            symmetry: Symmetry::Identity,
         }; SIMD_BATCH_LANES];
-        for (lane, cache_key) in cache_keys.iter().enumerate() {
-            canonical_jump_keys[lane] = *cache_key;
+        let mut fingerprints = [0_u64; SIMD_BATCH_LANES];
+        for (lane, discovered_task) in discovered_tasks.iter().enumerate() {
+            identities[lane] = CanonicalNodeIdentity {
+                packed: discovered_task.canonical_packed,
+                structural: discovered_task.key.structural,
+                symmetry: Symmetry::Identity,
+            };
+            fingerprints[lane] = discovered_task.key.structural.fingerprint();
         }
-        let overlaps = self.probe_and_build_overlaps_from_canonical_keys_staged(
-            &canonical_jump_keys,
-            cache_keys.len(),
-        );
+        self.stats.cache_probe_batches += 1;
+        self.stats.scheduler_probe_batches += 1;
+        self.stats.overlap_prep_batches += 1;
+        self.stats.packed_overlap_outputs_produced += discovered_tasks.len();
+        let overlaps = self
+            .probe_and_build_canonical_overlaps_staged(&identities, &fingerprints, discovered_tasks.len());
         let (centered_lanes, population_lanes) =
-            self.build_centered_population_lanes_9xn(&overlaps, cache_keys.len());
-        for (lane, &cache_key) in cache_keys.iter().enumerate() {
+            self.build_centered_population_lanes_9xn(&overlaps, discovered_tasks.len());
+        for (lane, discovered_task) in discovered_tasks.iter().enumerate() {
+            let cache_key = discovered_task.key;
             let input_nodes = centered_lanes[lane];
             let input_populations = population_lanes[lane];
             self.stats.step0_provisional_records += 1;
             provisional_candidates.push(SimdProvisionalRecord {
                 cache_key,
-                level: cache_key.packed.level,
-                kind: SimdTaskKind::Step0,
-                input_nodes,
-                input_populations,
+                level: cache_key.structural.level,
+                inputs: SimdProvisionalInputs::Nine {
+                    nodes: input_nodes,
+                    populations: input_populations,
+                },
                 payload: SimdProvisionalPayload::Step0 {
                     dispatch: Step0LaneDispatch::SimdChild,
                 },
@@ -408,7 +444,12 @@ impl HashLifeEngine {
         let level = provisional.level;
         debug_assert!(level >= 3);
         let empty_child = self.empty(level - 1);
-        let centered = provisional.input_nodes;
+        let centered = match provisional.inputs {
+            SimdProvisionalInputs::Nine { nodes, .. } => nodes,
+            SimdProvisionalInputs::Four { .. } => {
+                unreachable!("step0 provisional records must carry 9-node inputs")
+            }
+        };
         let join_level = level - 1;
         let intents = [
             ((lane_result.output_nonzero_mask & 1) != 0).then_some(JoinIntent {
@@ -492,27 +533,11 @@ impl HashLifeEngine {
             return resolved;
         }
 
-        let mut order = [usize::MAX; N];
-        for (index, slot) in order[..unresolved_count].iter_mut().enumerate() {
-            *slot = index;
-        }
-        order[..unresolved_count]
-            .sort_unstable_by_key(|&index| packed_fingerprints[unresolved_slots[index]]);
-        let mut committed_keys = [PackedNodeKey::new(0, [0; 4]); N];
-        let mut committed_values = [0; N];
-        let mut committed_count = 0;
-
-        for &index in &order[..unresolved_count] {
-            let slot = unresolved_slots[index];
+        let mut committed =
+            FlatTable::<PackedNodeKey, NodeId>::with_capacity(unresolved_count.max(4));
+        for &slot in &unresolved_slots[..unresolved_count] {
             let key = packed_keys[slot];
-            let mut reused = None;
-            for committed_index in 0..committed_count {
-                if committed_keys[committed_index] == key {
-                    reused = Some(committed_values[committed_index]);
-                    break;
-                }
-            }
-            if let Some(node_id) = reused {
+            if let Some(node_id) = committed.get_with_fingerprint(&key, packed_fingerprints[slot]) {
                 let lane = lane_map[slot];
                 resolved[lane] = Some(node_id);
                 continue;
@@ -525,9 +550,7 @@ impl HashLifeEngine {
                 + self.node_columns.population(se);
             let node_id = self.push_node(key.level, population, nw, ne, sw, se);
             self.intern.insert(key, node_id);
-            committed_keys[committed_count] = key;
-            committed_values[committed_count] = node_id;
-            committed_count += 1;
+            committed.insert_with_fingerprint(key, packed_fingerprints[slot], node_id);
             let lane = lane_map[slot];
             resolved[lane] = Some(node_id);
         }
@@ -544,15 +567,20 @@ impl HashLifeEngine {
         let mut active_mask = 0_u8;
         for (lane, provisional) in provisional_candidates.iter().enumerate() {
             active_mask |= 1 << lane;
-            populations.0[0][lane] = provisional.input_populations[0];
-            populations.0[1][lane] = provisional.input_populations[1];
-            populations.0[2][lane] = provisional.input_populations[2];
-            populations.0[3][lane] = provisional.input_populations[3];
-            populations.0[4][lane] = provisional.input_populations[4];
-            populations.0[5][lane] = provisional.input_populations[5];
-            populations.0[6][lane] = provisional.input_populations[6];
-            populations.0[7][lane] = provisional.input_populations[7];
-            populations.0[8][lane] = provisional.input_populations[8];
+            match provisional.inputs {
+                SimdProvisionalInputs::Nine {
+                    populations: input_populations,
+                    ..
+                } => {
+                    Self::write_population_lane(&mut populations, lane, input_populations);
+                }
+                SimdProvisionalInputs::Four {
+                    populations: input_populations,
+                    ..
+                } => {
+                    Self::write_population_lane(&mut populations, lane, input_populations);
+                }
+            }
         }
         SimdPackedBatch {
             active_lanes: provisional_candidates.len(),
@@ -601,90 +629,40 @@ impl HashLifeEngine {
         SimdBatchResult { lanes }
     }
 
-    pub(super) fn build_phase1_provisional_record(
+    fn jump_result_query_batch<const N: usize>(
         &mut self,
-        task_id: usize,
-        task_key: CanonicalJumpKey,
-        next_exp: u32,
-        inputs: [NodeId; 9],
-    ) -> SimdProvisionalRecord {
-        let input_nodes = self.jump_result_batch(inputs, next_exp);
-        let input_populations = input_nodes.map(|node| self.node_columns.population(node));
-        self.stats.phase1_provisional_records += 1;
-        SimdProvisionalRecord {
-            cache_key: task_key,
-            level: task_key.packed.level,
-            kind: SimdTaskKind::PhaseOne,
-            input_nodes,
-            input_populations,
-            payload: SimdProvisionalPayload::Recursive {
-                next_exp,
-                source_task_id: task_id,
-            },
-        }
-    }
-
-    pub(super) fn build_phase2_provisional_record(
-        &mut self,
-        task_id: usize,
-        task_key: CanonicalJumpKey,
-        next_exp: u32,
-        inputs: [NodeId; 4],
-    ) -> SimdProvisionalRecord {
-        let mut input_nodes = [self.empty(0); 9];
-        let jump_inputs = self.jump_result_batch(inputs, next_exp);
-        input_nodes[..4].copy_from_slice(&jump_inputs);
-        let input_populations = input_nodes.map(|node| self.node_columns.population(node));
-        self.stats.phase2_provisional_records += 1;
-        SimdProvisionalRecord {
-            cache_key: task_key,
-            level: task_key.packed.level,
-            kind: SimdTaskKind::PhaseTwo,
-            input_nodes,
-            input_populations,
-            payload: SimdProvisionalPayload::Recursive {
-                next_exp,
-                source_task_id: task_id,
-            },
-        }
-    }
-
-    pub(super) fn jump_result_batch<const N: usize>(
-        &mut self,
-        nodes: [NodeId; N],
-        step_exp: u32,
+        queries: [JumpQuery; N],
+        active_lanes: usize,
     ) -> [NodeId; N] {
         let mut results = [0; N];
-        let mut unique_nodes = [0; N];
-        let mut lane_to_unique = [usize::MAX; N];
-        let mut unique_cache_keys = [PackedJumpCacheKey {
-            packed: PackedNodeKey::new(0, [0; 4]),
-            step_exp: 0,
+        let mut unique_queries = [UniqueJumpQueryRecord {
+            query: JumpQuery {
+                node: 0,
+                step_exp: 0,
+            },
+            cache_key: CanonicalJumpKey::empty(),
+            inverse_symmetry: Symmetry::Identity,
+            fingerprint: 0,
         }; N];
-        let mut unique_inverse_symmetries = [Symmetry::Identity; N];
-        let mut unique_fingerprints = [0_u64; N];
+        let mut lane_to_unique = [usize::MAX; N];
         let mut unique_count = 0;
-        for lane in 0..N {
-            let node = nodes[lane];
-            let mut existing = None;
-            for index in 0..unique_count {
-                if unique_nodes[index] == node {
-                    existing = Some(index);
-                    break;
-                }
-            }
-            if let Some(index) = existing {
+        let mut unique_lookup = FlatTable::<JumpQuery, usize>::with_capacity(N.max(4));
+        for lane in 0..active_lanes {
+            let query = queries[lane];
+            if let Some(index) = unique_lookup.get(&query) {
                 self.stats.jump_batch_reused_queries += 1;
                 lane_to_unique[lane] = index;
             } else {
-                let (cache_key, symmetry, fingerprint, used_cached_fingerprint) =
-                    self.canonical_cache_key_packed_only((node, step_exp));
-                self.record_fingerprint_probe(used_cached_fingerprint, 1);
-                unique_nodes[unique_count] = node;
-                unique_cache_keys[unique_count] = cache_key;
-                unique_inverse_symmetries[unique_count] = symmetry.inverse();
-                unique_fingerprints[unique_count] = fingerprint;
+                let jump_probe = self.canonical_jump_probe((query.node, query.step_exp));
+                self.record_fingerprint_probe(jump_probe.used_cached_fingerprint, 1);
+                unique_queries[unique_count] = UniqueJumpQueryRecord {
+                    query,
+                    cache_key: jump_probe.key,
+                    inverse_symmetry: jump_probe.node.symmetry.inverse(),
+                    fingerprint: jump_probe.fingerprint,
+                };
                 lane_to_unique[lane] = unique_count;
+                unique_lookup.insert(query, unique_count);
                 unique_count += 1;
                 self.stats.jump_batch_unique_queries += 1;
             }
@@ -695,57 +673,158 @@ impl HashLifeEngine {
         }
 
         self.stats.cache_probe_batches += 1;
+        let unique_cache_keys = unique_queries.map(|record| record.cache_key);
+        let unique_fingerprints = unique_queries.map(|record| record.fingerprint);
         let cached = self.jump_cache.get_many_with_fingerprints(
             &unique_cache_keys,
             &unique_fingerprints,
             unique_count,
         );
-        self.stats.packed_cache_result_lookups += unique_count;
-        let mut unique_oriented_packed = [PackedNodeKey::new(0, [0; 4]); N];
-        let mut unique_oriented_symmetry = [Symmetry::Identity; N];
+        self.stats.jump_result_cache_lookups += unique_count;
         let mut unique_to_oriented = [usize::MAX; N];
-        let mut oriented_result_nodes = [0_u64; N];
+        let mut oriented_results = [UniqueOrientedResultRecord {
+            packed: PackedNodeKey::new(0, [0; 4]),
+            symmetry: Symmetry::Identity,
+            node: 0,
+        }; N];
         let mut oriented_count = 0;
+        let mut oriented_lookup =
+            FlatTable::<OrientedPackedResultKey, usize>::with_capacity(unique_count.max(4));
         for index in 0..unique_count {
-            self.stats.jump_cache_hits += 1;
             let cached_entry = cached[index].unwrap_or_else(|| {
                 panic!(
-                    "missing HashLife jump result for grouped batch node={} step_exp={step_exp}",
-                    unique_nodes[index]
+                    "missing HashLife jump result for grouped batch node={} step_exp={}",
+                    unique_queries[index].query.node, unique_queries[index].query.step_exp,
                 )
             });
-            self.stats.packed_cache_result_hits += 1;
-            let output_symmetry = unique_inverse_symmetries[index];
+            self.stats.jump_result_cache_hits += 1;
+            let output_symmetry = unique_queries[index].inverse_symmetry;
             let combined = cached_entry.symmetry.inverse().then(output_symmetry);
-            let mut existing = None;
-            for oriented in 0..oriented_count {
-                if unique_oriented_packed[oriented] == cached_entry.packed
-                    && unique_oriented_symmetry[oriented] == combined
-                {
-                    existing = Some(oriented);
-                    break;
-                }
+            if combined != Symmetry::Identity {
+                self.stats.symmetric_jump_result_cache_hits += 1;
             }
-            unique_to_oriented[index] = if let Some(oriented) = existing {
+            let oriented_key = OrientedPackedResultKey {
+                packed: cached_entry.packed,
+                symmetry: combined,
+            };
+            unique_to_oriented[index] = if let Some(oriented) = oriented_lookup.get(&oriented_key) {
                 oriented
             } else {
-                unique_oriented_packed[oriented_count] = cached_entry.packed;
-                unique_oriented_symmetry[oriented_count] = combined;
+                oriented_results[oriented_count] = UniqueOrientedResultRecord {
+                    packed: cached_entry.packed,
+                    symmetry: combined,
+                    node: 0,
+                };
+                oriented_lookup.insert(oriented_key, oriented_count);
                 oriented_count += 1;
                 oriented_count - 1
             };
         }
         for oriented in 0..oriented_count {
-            oriented_result_nodes[oriented] = self.materialize_oriented_packed_result(
-                unique_oriented_packed[oriented],
+            oriented_results[oriented].node = self.materialize_oriented_packed_result(
+                oriented_results[oriented].packed,
                 Symmetry::Identity,
-                unique_oriented_symmetry[oriented],
+                oriented_results[oriented].symmetry,
             );
         }
-        for lane in 0..N {
-            results[lane] = oriented_result_nodes[unique_to_oriented[lane_to_unique[lane]]];
+        for lane in 0..active_lanes {
+            results[lane] = oriented_results[unique_to_oriented[lane_to_unique[lane]]].node;
         }
         results
+    }
+
+    #[cfg(test)]
+    pub(super) fn jump_result_batch<const N: usize>(
+        &mut self,
+        nodes: [NodeId; N],
+        step_exp: u32,
+    ) -> [NodeId; N] {
+        self.jump_result_query_batch(nodes.map(|node| JumpQuery { node, step_exp }), N)
+    }
+
+    pub(super) fn build_phase1_provisional_records_batch(
+        &mut self,
+        ready_lanes: &[Phase1ReadyLane; SIMD_BATCH_LANES],
+        active_lanes: usize,
+        out: &mut Vec<SimdProvisionalRecord>,
+    ) {
+        if active_lanes == 0 {
+            return;
+        }
+        let mut queries = [JumpQuery {
+            node: 0,
+            step_exp: 0,
+        }; SIMD_BATCH_LANES * 9];
+        let mut query_count = 0;
+        for lane in 0..active_lanes {
+            for index in 0..9 {
+                queries[query_count] = JumpQuery {
+                    node: ready_lanes[lane].inputs[index],
+                    step_exp: ready_lanes[lane].next_exp,
+                };
+                query_count += 1;
+            }
+        }
+        let query_results = self.jump_result_query_batch(queries, query_count);
+        for lane in 0..active_lanes {
+            let base = lane * 9;
+            let (input_nodes, input_populations) =
+                self.populate_nodes_and_populations::<9>(&query_results[base..base + 9]);
+            self.stats.phase1_provisional_records += 1;
+            out.push(SimdProvisionalRecord {
+                cache_key: ready_lanes[lane].key,
+                level: ready_lanes[lane].key.structural.level,
+                inputs: SimdProvisionalInputs::Nine {
+                    nodes: input_nodes,
+                    populations: input_populations,
+                },
+                payload: SimdProvisionalPayload::PhaseOne {
+                    next_exp: ready_lanes[lane].next_exp,
+                    source_task_id: ready_lanes[lane].task_id,
+                },
+            });
+        }
+    }
+
+    pub(super) fn build_phase2_provisional_records_batch(
+        &mut self,
+        ready_lanes: &[Phase2ReadyLane; SIMD_BATCH_LANES],
+        active_lanes: usize,
+        out: &mut Vec<SimdProvisionalRecord>,
+    ) {
+        if active_lanes == 0 {
+            return;
+        }
+        let mut queries = [JumpQuery {
+            node: 0,
+            step_exp: 0,
+        }; SIMD_BATCH_LANES * 4];
+        let mut query_count = 0;
+        for lane in 0..active_lanes {
+            for index in 0..4 {
+                queries[query_count] = JumpQuery {
+                    node: ready_lanes[lane].inputs[index],
+                    step_exp: ready_lanes[lane].next_exp,
+                };
+                query_count += 1;
+            }
+        }
+        let query_results = self.jump_result_query_batch(queries, query_count);
+        for lane in 0..active_lanes {
+            let base = lane * 4;
+            let (input_nodes, input_populations) =
+                self.populate_nodes_and_populations::<4>(&query_results[base..base + 4]);
+            self.stats.phase2_provisional_records += 1;
+            out.push(SimdProvisionalRecord {
+                cache_key: ready_lanes[lane].key,
+                level: ready_lanes[lane].key.structural.level,
+                inputs: SimdProvisionalInputs::Four {
+                    nodes: input_nodes,
+                    populations: input_populations,
+                },
+                payload: SimdProvisionalPayload::PhaseTwo,
+            });
+        }
     }
 }
 

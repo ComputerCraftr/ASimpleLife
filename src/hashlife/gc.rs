@@ -20,7 +20,6 @@ impl HashLifeEngine {
         self.canonical_transform_cache.clear();
         self.oriented_result_cache.clear();
         self.packed_transform_compare_cache.clear();
-        self.packed_symmetry_children_cache.clear();
         self.reset_packed_transform_state();
         self.canonical_node_cache.clear();
     }
@@ -60,6 +59,7 @@ impl HashLifeEngine {
             self.compact_marked_nodes(marked);
             self.stats.nodes_after_compact = self.node_count();
             self.last_gc_nodes = self.node_count();
+            self.clear_transient_state();
         } else {
             self.stats.gc_reason = if reason == "root_changed" {
                 "root_changed_mark_only"
@@ -70,8 +70,6 @@ impl HashLifeEngine {
             self.stats.nodes_after_compact = self.node_count();
             self.last_gc_nodes = live_nodes;
         }
-
-        self.clear_transient_state();
     }
 
     pub(super) fn mark_live_nodes(&mut self) -> (Vec<u64>, usize) {

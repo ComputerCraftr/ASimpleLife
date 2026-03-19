@@ -1,6 +1,7 @@
 use crate::bitgrid::{BitGrid, Coord};
 use crate::hashlife::{
     GridExtractionError, GridExtractionPolicy, HashLifeCheckpoint, HashLifeSession,
+    HashLifeSnapshotError,
 };
 use crate::life::step_grid_with_changes_and_memo;
 use crate::memo::Memo;
@@ -111,6 +112,16 @@ impl SimulationSession {
 
     pub fn hashlife_loaded(&self) -> bool {
         self.hashlife_session.is_loaded()
+    }
+
+    pub fn load_hashlife_snapshot(&mut self, snapshot: &str) -> Result<(), HashLifeSnapshotError> {
+        self.hashlife_session.load_snapshot_string(snapshot)?;
+        self.preferred_backend = Some(SimulationBackend::HashLife);
+        Ok(())
+    }
+
+    pub fn export_hashlife_snapshot(&mut self) -> Option<String> {
+        self.hashlife_session.export_snapshot_string()
     }
 
     pub fn hashlife_generation(&self) -> u64 {

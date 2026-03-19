@@ -37,10 +37,10 @@ impl HashLifeEngine {
     pub(crate) fn verify_canonical_overlap_batch_parity(&mut self, grid: &BitGrid) -> bool {
         let (root, _, _) = self.embed_grid_state(grid);
         let mut nodes = [0; crate::simd_layout::SIMD_BATCH_LANES];
-        let mut canonical_keys = [super::CanonicalJumpKey {
-            packed: super::PackedNodeKey::new(0, [0; 4]),
-            step_exp: 1,
-        }; crate::simd_layout::SIMD_BATCH_LANES];
+        let mut canonical_keys =
+            [super::CanonicalJumpKey::empty(); crate::simd_layout::SIMD_BATCH_LANES];
+        let mut canonical_packed =
+            [super::PackedNodeKey::new(0, [0; 4]); crate::simd_layout::SIMD_BATCH_LANES];
         let mut active = 0;
         let mut stack = vec![root];
 
@@ -49,7 +49,12 @@ impl HashLifeEngine {
                 continue;
             }
             nodes[active] = node;
-            canonical_keys[active] = self.canonical_jump_key_packed((node, 1)).0;
+            let canonical = self.canonicalize_packed_node(node);
+            canonical_keys[active] = super::CanonicalJumpKey {
+                structural: canonical.node.structural,
+                step_exp: 1,
+            };
+            canonical_packed[active] = canonical.node.packed;
             active += 1;
             if active == crate::simd_layout::SIMD_BATCH_LANES {
                 break;
@@ -64,9 +69,32 @@ impl HashLifeEngine {
         if active == 0 {
             return true;
         }
-        let raw = self.probe_and_build_overlaps_staged(&nodes, active);
+        let mut canonical_nodes = [0; crate::simd_layout::SIMD_BATCH_LANES];
+        for lane in 0..active {
+            canonical_nodes[lane] = self.materialize_packed_node_key(canonical_packed[lane]);
+        }
+        let raw = self.probe_and_build_overlaps_staged(&canonical_nodes, active);
+        let mut identities = [super::CanonicalNodeIdentity {
+            packed: super::PackedNodeKey::new(0, [0; 4]),
+            structural: super::CanonicalStructKey::new(0, [0; 4]),
+            symmetry: super::Symmetry::Identity,
+        }; crate::simd_layout::SIMD_BATCH_LANES];
+        let mut fingerprints = [0_u64; crate::simd_layout::SIMD_BATCH_LANES];
+        for lane in 0..active {
+            identities[lane] = super::CanonicalNodeIdentity {
+                packed: canonical_packed[lane],
+                structural: canonical_keys[lane].structural,
+                symmetry: super::Symmetry::Identity,
+            };
+            fingerprints[lane] =
+                crate::flat_table::FlatKey::fingerprint(&canonical_keys[lane].structural);
+        }
+        self.stats.cache_probe_batches += 1;
+        self.stats.scheduler_probe_batches += 1;
+        self.stats.overlap_prep_batches += 1;
+        self.stats.packed_overlap_outputs_produced += active;
         let canonical =
-            self.probe_and_build_overlaps_from_canonical_keys_staged(&canonical_keys, active);
+            self.probe_and_build_canonical_overlaps_staged(&identities, &fingerprints, active);
         (0..active).all(|lane| raw[lane] == canonical[lane])
     }
 
@@ -85,7 +113,12 @@ impl HashLifeEngine {
             overlaps[0],
         ];
         let batched = self.discovered_jump_tasks_from_nodes(nodes, 2);
-        (0..9).all(|lane| batched[lane].key == self.canonical_jump_key_packed((nodes[lane], 2)).0)
+        (0..9).all(|lane| {
+            batched[lane].key
+                == self
+                    .canonical_jump_probe((nodes[lane], 2))
+                    .key
+        })
     }
 
     pub(crate) fn duplicate_overlap_batch_dedupe_stats(
@@ -132,10 +165,10 @@ impl HashLifeEngine {
     ) -> bool {
         let embedded = self.embed_for_jump(grid, step_exp);
         let root = embedded.root;
-        let before_hits = self.stats.packed_cache_result_hits;
+        let before_hits = self.stats.jump_result_cache_hits;
         let result = self.advance_pow2(root, step_exp);
         let cached = self.cached_jump_result((root, step_exp));
-        cached == Some(result) && self.stats.packed_cache_result_hits > before_hits
+        cached == Some(result) && self.stats.jump_result_cache_hits > before_hits
     }
 
     pub(crate) fn duplicate_oriented_result_cache_stats(
@@ -212,10 +245,64 @@ impl HashLifeEngine {
             if self.node_columns.level(node) == 0 {
                 continue;
             }
-            let canonical = self.canonicalize_packed_node(node).packed;
+            let canonical = self.canonicalize_packed_node(node);
             for symmetry in crate::symmetry::D4Symmetry::ALL {
                 let transformed = self.transform_node(node, symmetry);
-                if self.canonicalize_packed_node(transformed).packed != canonical {
+                let transformed_canonical = self.canonicalize_packed_node(transformed);
+                if transformed_canonical.node.structural != canonical.node.structural {
+                    return false;
+                }
+                let expected = self.materialize_packed_node_key(canonical.node.packed);
+                let actual = self.materialize_packed_node_key(transformed_canonical.node.packed);
+                let policy = crate::hashlife::GridExtractionPolicy::FullGridIfUnder {
+                    max_population: u64::MAX,
+                    max_chunks: usize::MAX,
+                    max_bounds_span: i64::MAX,
+                };
+                if crate::normalize::normalize(
+                    &self
+                        .node_to_grid(expected, 0, 0, policy)
+                        .expect("canonical packed test node should materialize"),
+                )
+                .0
+                    != crate::normalize::normalize(
+                        &self
+                            .node_to_grid(actual, 0, 0, policy)
+                            .expect("canonical packed test node should materialize"),
+                    )
+                    .0
+                {
+                    return false;
+                }
+            }
+            checked += 1;
+            if checked == crate::simd_layout::SIMD_BATCH_LANES {
+                break;
+            }
+            let [nw, ne, sw, se] = self.node_columns.quadrants(node);
+            stack.push(se);
+            stack.push(sw);
+            stack.push(ne);
+            stack.push(nw);
+        }
+        true
+    }
+
+    pub(crate) fn verify_packed_transform_root_key_parity(&mut self, grid: &BitGrid) -> bool {
+        let (root, _, _) = self.embed_grid_state(grid);
+        let mut stack = vec![root];
+        let mut checked = 0;
+        while let Some(node) = stack.pop() {
+            if self.node_columns.level(node) == 0 {
+                continue;
+            }
+            let packed = self.node_columns.packed_key(node);
+            for symmetry in crate::symmetry::D4Symmetry::ALL {
+                let transform_id = self.transform_packed_node_key(packed, symmetry);
+                let materialized = self.materialize_packed_transform_root(transform_id);
+                let expected = self.node_columns.packed_key(materialized);
+                let actual = self.materialize_winning_packed_transform_root(transform_id);
+                if actual != expected {
                     return false;
                 }
             }
@@ -240,9 +327,12 @@ impl HashLifeEngine {
             jump_cache: self.jump_cache.len(),
             retained_roots: self.retained_roots.len(),
             overlap_cache: self.overlap_cache.len(),
-            jump_cache_hits: self.stats.jump_cache_hits,
-            symmetric_jump_cache_hits: self.stats.symmetric_jump_cache_hits,
-            jump_cache_misses: self.stats.jump_cache_misses,
+            jump_presence_avoids: self.stats.jump_presence_avoids,
+            jump_presence_misses: self.stats.jump_presence_misses,
+            jump_result_cache_lookups: self.stats.jump_result_cache_lookups,
+            jump_result_cache_hits: self.stats.jump_result_cache_hits,
+            symmetric_jump_result_cache_hits: self.stats.symmetric_jump_result_cache_hits,
+            root_result_cache_lookups: self.stats.root_result_cache_lookups,
             root_result_cache_hits: self.stats.root_result_cache_hits,
             root_result_cache_misses: self.stats.root_result_cache_misses,
             overlap_cache_hits: self.stats.overlap_cache_hits,
@@ -303,8 +393,6 @@ impl HashLifeEngine {
             packed_recursive_transform_hits: self.stats.packed_recursive_transform_hits,
             packed_recursive_transform_misses: self.stats.packed_recursive_transform_misses,
             packed_overlap_outputs_produced: self.stats.packed_overlap_outputs_produced,
-            packed_cache_result_lookups: self.stats.packed_cache_result_lookups,
-            packed_cache_result_hits: self.stats.packed_cache_result_hits,
             packed_cache_result_materializations: self.stats.packed_cache_result_materializations,
             transformed_node_materializations: self.stats.transformed_node_materializations,
         }
@@ -312,7 +400,6 @@ impl HashLifeEngine {
 
     pub(crate) fn diagnostic_summary(&self) -> super::HashLifeDiagnosticSummary {
         let stats = self.runtime_stats();
-        let jump_full_total = stats.jump_cache_hits + stats.jump_cache_misses;
         let jump_presence_total = stats.jump_presence_probe_hits
             + stats
                 .jump_presence_probe_lanes
@@ -332,7 +419,10 @@ impl HashLifeEngine {
             retained_roots: stats.retained_roots,
             nodes_match_intern: stats.nodes == stats.intern,
             dependency_stalls: stats.dependency_stalls,
-            jump_full_hit_rate: stats.jump_cache_hits as f64 / jump_full_total.max(1) as f64,
+            jump_result_hit_rate: stats.jump_result_cache_hits as f64
+                / stats.jump_result_cache_lookups.max(1) as f64,
+            root_result_hit_rate: stats.root_result_cache_hits as f64
+                / stats.root_result_cache_lookups.max(1) as f64,
             jump_presence_hit_rate: stats.jump_presence_probe_hits as f64
                 / jump_presence_total.max(1) as f64,
             overlap_hit_rate: stats.overlap_cache_hits as f64 / overlap_total.max(1) as f64,
@@ -342,9 +432,7 @@ impl HashLifeEngine {
                 / symmetry_gate_total.max(1) as f64,
             canonical_cache_hit_rate: stats.canonical_node_cache_hits as f64
                 / canonical_cache_total.max(1) as f64,
-            packed_cache_hit_rate: stats.packed_cache_result_hits as f64
-                / stats.packed_cache_result_lookups.max(1) as f64,
-            symmetry_jump_hits: stats.symmetric_jump_cache_hits,
+            symmetry_jump_result_hits: stats.symmetric_jump_result_cache_hits,
             simd_lane_coverage: total_simd_lanes as f64 / total_provisionals.max(1) as f64,
             scalar_commit_ratio: stats.scalar_commit_lanes as f64
                 / total_provisionals.max(1) as f64,
