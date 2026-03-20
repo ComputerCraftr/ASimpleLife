@@ -14,10 +14,14 @@ pub use cli::run;
 pub use c_backend::{emit_c, format_ir};
 pub use c_super_backend::emit_c_super;
 pub use ir::{BfIr, Parser};
-pub use lowered_ir::{LoweredBfInstr, lower_bf_control_flow};
+pub use lowered_ir::{
+    LoweredBfInstr, PhysicalBfInstr, expand_distribute_to_primitive,
+    lower_bf_control_flow, lower_bf_physical_control_flow,
+};
 pub use life_backend::{
-    BfLifeCircuit, BfLifeCircuitError, BfLifeCircuitState, CircuitPhase,
-    compile_to_life_circuit, serialize_life_circuit, serialize_life_circuit_hashlife,
+    BfLifeCircuit, BfLifeCircuitError, BfLifeCircuitState, CircuitPhase, MacroTimingSpec,
+    PlacedLifeMachine, RailGroup, RoutedRail, compile_to_life_circuit, serialize_life_circuit,
+    serialize_life_circuit_hashlife,
 };
 pub use life_macro_library::{
     LifeMacroInstance, LifeMacroKind, LifeMacroOrientation, LifeMacroPort, LifeMacroTemplate,
