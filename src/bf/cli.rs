@@ -1,40 +1,39 @@
 use std::io::{self, Read};
 
 use super::c_backend::{emit_c, format_ir};
+use super::c_super_backend::emit_c_super;
 use super::ir::Parser;
 use super::life_backend::{
     compile_to_life_circuit, serialize_life_circuit, serialize_life_circuit_hashlife,
 };
 use super::optimizer::{CellSign, CodegenOpts, IoMode, optimize};
-use super::c_super_backend::emit_c_super;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OutputMode {
-    DumpIr,
+    EmitIr,
     EmitC,
     EmitCSuper,
     EmitLife,
     EmitLifeHashLife,
 }
 
+fn print_help() {
+    println!(
+        "usage: bf_life [--emit-ir|--emit-c|--emit-c-super|--emit-life|--emit-life-hashlife] [opts] [-- <src>|<file>]"
+    );
+    println!("  --emit-ir      print parsed and optimized IR (default)");
+    println!("  --emit-c       emit a C translation");
+    println!("  --emit-c-super emit the symbolic-memo C backend");
+    println!("  --emit-life    emit the BF Life circuit as a standard life-grid export");
+    println!("  --emit-life-hashlife emit the BF Life circuit as a HashLife snapshot export");
+    println!("opts: --cell-bits N  --io char|number  --signed-cells true|false");
+}
+
 pub fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        eprintln!(
-            "usage: bf_life [--dump-ir|--emit-ir|--emit-c|--emit-c-super|--emit-life|--emit-life-hashlife] [opts] [-- <src> | <file> | <src>]"
-        );
-        eprintln!("  --dump-ir      print parsed and optimized IR (default)");
-        eprintln!("  --emit-ir      alias for --dump-ir");
-        eprintln!("  --emit-c       emit a C translation");
-        eprintln!("  --emit-c-super emit the symbolic-memo C backend");
-        eprintln!(
-            "  --emit-life    emit the BF Life circuit as a standard life-grid export"
-        );
-        eprintln!(
-            "  --emit-life-hashlife emit the BF Life circuit as a HashLife snapshot export"
-        );
-        eprintln!("opts: --cell-bits N  --io char|number  --signed-cells  --unsigned-cells");
-        return;
+        print_help();
+        std::process::exit(0);
     }
 
     let (mode, opts, src) = match read_input(&args) {
@@ -54,7 +53,7 @@ pub fn run() {
     };
 
     match mode {
-        OutputMode::DumpIr => {
+        OutputMode::EmitIr => {
             let optimized = optimize(parsed.clone());
             println!("=== Parsed IR ===");
             print!("{}", format_ir(&parsed));
@@ -85,7 +84,7 @@ pub fn run() {
 }
 
 pub(super) fn read_input(args: &[String]) -> Result<(OutputMode, CodegenOpts, String), String> {
-    let mut mode = OutputMode::DumpIr;
+    let mut mode = OutputMode::EmitIr;
     let mut rest = args;
 
     if let Some(first) = rest.first() {
@@ -98,12 +97,8 @@ pub(super) fn read_input(args: &[String]) -> Result<(OutputMode, CodegenOpts, St
                 mode = OutputMode::EmitCSuper;
                 rest = &rest[1..];
             }
-            "--dump-ir" => {
-                mode = OutputMode::DumpIr;
-                rest = &rest[1..];
-            }
             "--emit-ir" => {
-                mode = OutputMode::DumpIr;
+                mode = OutputMode::EmitIr;
                 rest = &rest[1..];
             }
             "--emit-life" => {
@@ -148,7 +143,7 @@ pub(super) fn parse_opts(args: &[String]) -> Result<(CodegenOpts, &[String]), St
         cell_bits: 8,
         input_bits: None,
         output_bits: None,
-        cell_sign: CellSign::Signed,
+        cell_sign: CellSign::Unsigned,
     };
     let mut i = 0;
 
@@ -207,14 +202,27 @@ pub(super) fn parse_opts(args: &[String]) -> Result<(CodegenOpts, &[String]), St
                 i += 2;
             }
             "--signed-cells" => {
-                opts.cell_sign = CellSign::Signed;
-                i += 1;
+                let v = args
+                    .get(i + 1)
+                    .ok_or("missing value after --signed-cells")?;
+                let signed: bool = v
+                    .parse()
+                    .map_err(|_| format!("invalid --signed-cells value '{v}'"))?;
+                opts.cell_sign = if signed {
+                    CellSign::Signed
+                } else {
+                    CellSign::Unsigned
+                };
+                i += 2;
             }
-            "--unsigned-cells" => {
-                opts.cell_sign = CellSign::Unsigned;
-                i += 1;
+            "--" => {
+                break;
             }
-            _ => break,
+            arg => {
+                eprintln!("unexpected argument: '{arg}'");
+                print_help();
+                std::process::exit(2);
+            }
         }
     }
     Ok((opts, &args[i..]))

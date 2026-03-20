@@ -1,10 +1,8 @@
+use super::c_backend::{emit_c, format_ir, interpret_for_tests, interpret_unsigned_for_tests};
+use super::c_super_backend::emit_c_super;
 use super::cli::{parse_opts, read_input};
-use super::c_backend::{
-    emit_c, format_ir, interpret_for_tests, interpret_unsigned_for_tests,
-};
 use super::ir::{BfIr, Parser};
 use super::optimizer::{CellSign, CodegenOpts, IoMode, optimize};
-use super::c_super_backend::emit_c_super;
 use std::fs;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -217,7 +215,10 @@ fn compile_and_run_c_source_with_args(c: &str, extra_cc_args: &[&str]) -> String
 
     let output = Command::new(&binary)
         .stdin(Stdio::null())
-        .env("ASAN_OPTIONS", "detect_leaks=0:halt_on_error=1:abort_on_error=1")
+        .env(
+            "ASAN_OPTIONS",
+            "detect_leaks=0:halt_on_error=1:abort_on_error=1",
+        )
         .env("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
         .output()
         .unwrap();
@@ -256,18 +257,31 @@ fn format_inline_source_ir() {
 
 #[test]
 fn unmatched_right_bracket_errors() {
-    assert!(Parser::new("]").parse().unwrap_err().contains("unmatched ']'"));
+    assert!(
+        Parser::new("]")
+            .parse()
+            .unwrap_err()
+            .contains("unmatched ']'")
+    );
 }
 
 #[test]
 fn unmatched_left_bracket_errors() {
-    assert!(Parser::new("[").parse().unwrap_err().contains("unmatched '['"));
+    assert!(
+        Parser::new("[")
+            .parse()
+            .unwrap_err()
+            .contains("unmatched '['")
+    );
 }
 
 #[test]
 fn plain_c_template_compiles_standalone_under_strict_c23() {
     let output = compile_and_run_c_template("src/bf/bf.c.in");
-    assert!(output.is_empty(), "unexpected standalone template output: {output}");
+    assert!(
+        output.is_empty(),
+        "unexpected standalone template output: {output}"
+    );
 }
 
 #[test]
@@ -304,9 +318,9 @@ fn emit_c_char_only_program_omits_numeric_format_constants() {
 #[test]
 fn emit_c_wraps_tape_pointer_moves() {
     let c = emit_c(&parse_and_opt(">>"), default_c_opts());
-    assert!(c.contains(
-        "static ptrdiff_t bf_wrap_ptr(ptrdiff_t ptr, ptrdiff_t delta, ptrdiff_t len) {"
-    ));
+    assert!(
+        c.contains("static ptrdiff_t bf_wrap_ptr(ptrdiff_t ptr, ptrdiff_t delta, ptrdiff_t len) {")
+    );
     assert!(c.contains("#define BF_TEMPLATE_TAPE_LEN 30000"));
     assert!(c.contains("ptr = bf_wrap_ptr(ptr, (ptrdiff_t)(2), BF_TAPE_LEN);"));
 }
@@ -386,9 +400,7 @@ fn emit_c_applies_custom_char_masks() {
     assert!(c.contains("#define BF_TEMPLATE_INPUT_MASK UINT64_C(31)"));
     assert!(c.contains("#define BF_TEMPLATE_OUTPUT_MASK UINT64_C(63)"));
     assert!(c.contains("BF_SIGNED_CELLS ? bf_wrap_from_u64_signed(((uint64_t)(uint8_t)ch) & BF_INPUT_MASK, BF_CELL_BITS) : bf_wrap_from_u64_unsigned(((uint64_t)(uint8_t)ch) & BF_INPUT_MASK, BF_CELL_BITS)"));
-    assert!(c.contains(
-        "putchar((unsigned char)(((uint64_t)tape[ptr]) & BF_OUTPUT_MASK));"
-    ));
+    assert!(c.contains("putchar((unsigned char)(((uint64_t)tape[ptr]) & BF_OUTPUT_MASK));"));
 }
 
 #[test]
@@ -406,9 +418,7 @@ fn emit_c_applies_custom_number_masks() {
     assert!(c.contains("#define BF_TEMPLATE_INPUT_MASK UINT64_C(7)"));
     assert!(c.contains("#define BF_TEMPLATE_OUTPUT_MASK UINT64_C(15)"));
     assert!(c.contains("{ int64_t tmp = 0; if (scanf(\"%\" SCNd64, &tmp) != 1) tmp = 0; tape[ptr] = bf_wrap_from_u64_signed(((uint64_t)tmp) & BF_INPUT_MASK, BF_CELL_BITS); }"));
-    assert!(
-        c.contains("bf_wrap_from_u64_signed(((uint64_t)tmp) & BF_INPUT_MASK, BF_CELL_BITS)")
-    );
+    assert!(c.contains("bf_wrap_from_u64_signed(((uint64_t)tmp) & BF_INPUT_MASK, BF_CELL_BITS)"));
     assert!(c.contains("printf(\"%\" PRId64 \"\\n\", bf_wrap_from_u64_signed(((uint64_t)tape[ptr]) & BF_OUTPUT_MASK, BF_CELL_BITS));"));
 }
 
@@ -480,8 +490,8 @@ fn read_input_accepts_emit_ir_alias_without_treating_it_as_source() {
         "+++[->++<]>.<.".to_string(),
     ];
     let (mode, opts, src) = read_input(&args).unwrap();
-    assert_eq!(mode, super::cli::OutputMode::DumpIr);
-    assert_eq!(opts, default_c_opts());
+    assert_eq!(mode, super::cli::OutputMode::EmitIr);
+    assert_eq!(opts, life_opts());
     assert_eq!(src, "+++[->++<]>.<.");
 }
 
@@ -489,7 +499,8 @@ fn read_input_accepts_emit_ir_alias_without_treating_it_as_source() {
 fn read_input_accepts_emit_life_hashlife_mode() {
     let args = vec![
         "--emit-life-hashlife".to_string(),
-        "--unsigned-cells".to_string(),
+        "--signed-cells".to_string(),
+        "false".to_string(),
         "--".to_string(),
         "+.".to_string(),
     ];

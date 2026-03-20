@@ -8,10 +8,10 @@ use crate::memo::Memo;
 use crate::persistence::serialize_life_grid;
 
 use super::ir::BfIr;
-use super::lowered_ir::{PhysicalBfInstr, lower_bf_physical_control_flow};
 use super::life_macro_library::{
     LifeMacroInstance, LifeMacroKind, LifeMacroOrientation, macro_instance_grid,
 };
+use super::lowered_ir::{PhysicalBfInstr, lower_bf_control_flow};
 use super::optimizer::{CellSign, CodegenOpts};
 
 const DEFAULT_CIRCUIT_TAPE_LEN: usize = 64;
@@ -37,11 +37,9 @@ impl fmt::Display for BfLifeCircuitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::SignedCellsUnsupported => {
-                "Life circuit backend requires --unsigned-cells; signed cells are unsupported"
+                "Life circuit backend requires --signed-cells false; signed cells are unsupported"
             }
-            Self::InputUnsupported => {
-                "Life circuit backend does not support BF input yet"
-            }
+            Self::InputUnsupported => "Life circuit backend does not support BF input yet",
             Self::StepBudgetExceeded => {
                 "Life circuit backend exceeded its bounded execution step budget"
             }
@@ -172,7 +170,12 @@ fn build_placed_machine(
         CircuitPhase::Commit,
     ];
 
-    push_macro(&mut instances, &mut next_id, LifeMacroKind::Clock, (0, CONTROL_BASE_Y));
+    push_macro(
+        &mut instances,
+        &mut next_id,
+        LifeMacroKind::Clock,
+        (0, CONTROL_BASE_Y),
+    );
     for phase_idx in 0..4 {
         push_macro(
             &mut instances,
@@ -405,9 +408,8 @@ pub fn compile_to_life_circuit(
     if contains_input(program) {
         return Err(BfLifeCircuitError::InputUnsupported);
     }
-    let lowered = lower_bf_physical_control_flow(program);
-    let placed_machine =
-        build_placed_machine(&lowered, DEFAULT_CIRCUIT_TAPE_LEN, cell_bits);
+    let lowered = lower_bf_control_flow(program);
+    let placed_machine = build_placed_machine(&lowered, DEFAULT_CIRCUIT_TAPE_LEN, cell_bits);
     Ok(BfLifeCircuit {
         tape_len: DEFAULT_CIRCUIT_TAPE_LEN,
         cell_bits,
@@ -418,7 +420,12 @@ pub fn compile_to_life_circuit(
         routed_signals: placed_machine
             .routed_rails
             .iter()
-            .map(|rail| format!("{:?}/{}: {} -> {}", rail.group, rail.name, rail.source, rail.sink))
+            .map(|rail| {
+                format!(
+                    "{:?}/{}: {} -> {}",
+                    rail.group, rail.name, rail.source, rail.sink
+                )
+            })
             .collect(),
         placed_machine,
         state: BfLifeCircuitState {
@@ -452,7 +459,12 @@ impl BfLifeCircuit {
         self.placed_machine
             .routed_rails
             .iter()
-            .map(|rail| format!("{:?}/{}: {} -> {}", rail.group, rail.name, rail.source, rail.sink))
+            .map(|rail| {
+                format!(
+                    "{:?}/{}: {} -> {}",
+                    rail.group, rail.name, rail.source, rail.sink
+                )
+            })
             .collect()
     }
 
@@ -527,7 +539,11 @@ impl BfLifeCircuit {
                 Ok(true)
             }
             CircuitPhase::Decode => {
-                let instr = self.state.latched_instr.clone().expect("fetch must latch an instruction");
+                let instr = self
+                    .state
+                    .latched_instr
+                    .clone()
+                    .expect("fetch must latch an instruction");
                 if instr == PhysicalBfInstr::Halt {
                     self.state.phase = CircuitPhase::Halted;
                     self.state.pending = None;
@@ -537,19 +553,27 @@ impl BfLifeCircuit {
                 Ok(true)
             }
             CircuitPhase::Evaluate => {
-                let instr = self.state.latched_instr.clone().expect("decode must retain the instruction");
+                let instr = self
+                    .state
+                    .latched_instr
+                    .clone()
+                    .expect("decode must retain the instruction");
                 let cur = self.state.tape[self.state.head];
                 let pending = match instr {
                     PhysicalBfInstr::Add(delta) => PendingAction {
                         next_pc: self.state.pc + 1,
                         next_head: self.state.head,
-                        writes: vec![(self.state.head, wrap_u(cur as i64 + delta as i64, self.cell_bits))],
+                        writes: vec![(
+                            self.state.head,
+                            wrap_u(cur as i64 + delta as i64, self.cell_bits),
+                        )],
                         emit: None,
                     },
                     PhysicalBfInstr::MovePtr(delta) => PendingAction {
                         next_pc: self.state.pc + 1,
                         next_head: (self.state.head as i64 + delta as i64)
-                            .rem_euclid(self.tape_len as i64) as usize,
+                            .rem_euclid(self.tape_len as i64)
+                            as usize,
                         writes: Vec::new(),
                         emit: None,
                     },
@@ -629,12 +653,20 @@ impl BfLifeCircuit {
             let base_x = cell_idx as i64 * TAPE_STRIDE_X;
             for bit in 0..self.cell_bits.max(1) {
                 if ((value >> bit) & 1) != 0 {
-                    grid.set(base_x + bit as i64 * tape_bit_spacing, TAPE_BASE_Y + 4, true);
+                    grid.set(
+                        base_x + bit as i64 * tape_bit_spacing,
+                        TAPE_BASE_Y + 4,
+                        true,
+                    );
                 }
             }
         }
 
-        grid.set(self.state.head as i64 * TAPE_STRIDE_X + 1, TAPE_BASE_Y - 6, true);
+        grid.set(
+            self.state.head as i64 * TAPE_STRIDE_X + 1,
+            TAPE_BASE_Y - 6,
+            true,
+        );
         for bit in 0..16 {
             if ((self.state.pc >> bit) & 1) != 0 {
                 grid.set(bit as i64 * 4, CONTROL_BASE_Y + 14, true);
@@ -673,7 +705,8 @@ impl BfLifeCircuit {
             let min_x = self.output_region_base_x();
             let min_y = OUTPUT_BASE_Y;
             let max_x = min_x + self.cell_bits.max(1) as i64 * OUTPUT_BIT_STRIDE_X - 1;
-            let max_y = OUTPUT_BASE_Y + (self.state.outputs.len() as i64 - 1) * OUTPUT_ROW_STRIDE_Y + 2;
+            let max_y =
+                OUTPUT_BASE_Y + (self.state.outputs.len() as i64 - 1) * OUTPUT_ROW_STRIDE_Y + 2;
             (min_x, min_y, max_x, max_y)
         })
     }
