@@ -21,7 +21,7 @@ jobs:
     env:
       RUSTDOCFLAGS: ${{ matrix.os == 'windows-latest' && '-C target-feature=+crt-static' || '' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
       - name: Check every target and feature
         run: cargo check --workspace --all-targets --all-features
@@ -32,7 +32,7 @@ jobs:
     name: Static CRT (musl)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
         with:
           targets: x86_64-unknown-linux-musl
@@ -61,7 +61,7 @@ jobs:
     name: Static CRT (MSVC)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
       - name: Verify Cargo enables static CRT
         shell: pwsh
@@ -105,7 +105,7 @@ jobs:
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
       - name: Differential-test native HashLife kernels
         run: cargo test --release hashlife::kernels::tests -- --nocapture
@@ -128,7 +128,7 @@ jobs:
     env:
       ASIMPLELIFE_HASHLIFE_KERNEL: scalar
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
       - name: Run scalar kernel differential tests
         run: cargo test --release hashlife::kernels::tests -- --nocapture
@@ -139,7 +139,7 @@ jobs:
     name: Generated C strict and sanitizer gates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
       - name: Compile strict C23-compatible templates
         run: cargo test template_compiles_standalone_under_strict_c23_compatibility_mode -- --nocapture
@@ -150,7 +150,7 @@ jobs:
     name: Formatting, policies, and strict Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
         with:
           components: clippy, rustfmt
@@ -171,7 +171,7 @@ jobs:
       MIRIFLAGS: -Zmiri-strict-provenance
       ASIMPLELIFE_HASHLIFE_KERNEL: scalar
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
         with:
           toolchain: nightly
