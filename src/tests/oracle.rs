@@ -90,8 +90,8 @@ fn oracle_session_uses_exact_repeat_to_reach_target() {
     let grid = pattern_by_name("block").or_invariant("required value");
     let target = 10_000_000_u64;
     let mut simulation = SimulationSession::new();
-    let outcome = OracleSession::new(grid.clone(), 0, Default::default(), &mut simulation)
-        .advance_to_target(target, None);
+    let outcome =
+        OracleSession::new(grid.clone(), 0, &mut simulation).advance_to_target(target, None);
 
     assert!(matches!(
         outcome.classification,
@@ -111,8 +111,7 @@ fn oracle_session_uses_exact_blinker_cycle_to_reach_huge_target() {
     let target = 1_000_001_u64;
     let expected = crate::hashlife::HashLifeEngine::default().advance(&grid, target);
     let mut simulation = SimulationSession::new();
-    let outcome = OracleSession::new(grid, 0, Default::default(), &mut simulation)
-        .advance_to_target(target, None);
+    let outcome = OracleSession::new(grid, 0, &mut simulation).advance_to_target(target, None);
 
     assert!(matches!(
         outcome.classification,
@@ -132,8 +131,7 @@ fn oracle_session_uses_translated_cycle_to_reach_huge_target() {
     let target = 1_000_003_u64;
     let expected = crate::hashlife::HashLifeEngine::default().advance(&grid, target);
     let mut simulation = SimulationSession::new();
-    let outcome = OracleSession::new(grid, 0, Default::default(), &mut simulation)
-        .advance_to_target(target, None);
+    let outcome = OracleSession::new(grid, 0, &mut simulation).advance_to_target(target, None);
 
     assert!(matches!(
         outcome.classification,
@@ -154,7 +152,7 @@ fn oracle_session_continuation_matches_expected_repeat() {
         max_generations: 1024,
     };
     let mut simulation = SimulationSession::new();
-    let result = OracleSession::new(grid, 0, Default::default(), &mut simulation)
+    let result = OracleSession::new(grid, 0, &mut simulation)
         .classify_continuation(limits.max_generations, 8);
     assert!(matches!(result, Classification::Repeats { period: 2, .. }));
 }
@@ -166,13 +164,11 @@ fn oracle_session_repeated_deep_runs_are_deterministic() {
 
     let first = {
         let mut simulation = SimulationSession::new();
-        OracleSession::new(grid.clone(), 0, Default::default(), &mut simulation)
-            .advance_to_target(target, None)
+        OracleSession::new(grid.clone(), 0, &mut simulation).advance_to_target(target, None)
     };
     let second = {
         let mut simulation = SimulationSession::new();
-        OracleSession::new(grid, 0, Default::default(), &mut simulation)
-            .advance_to_target(target, None)
+        OracleSession::new(grid, 0, &mut simulation).advance_to_target(target, None)
     };
 
     assert_eq!(
@@ -270,8 +266,8 @@ fn oracle_session_keeps_large_emitter_target_on_hashlife_backend() {
         }
     };
 
-    let outcome = OracleSession::new(grid, 0, Default::default(), &mut simulation)
-        .advance_to_target(target, Some(&mut callback));
+    let outcome =
+        OracleSession::new(grid, 0, &mut simulation).advance_to_target(target, Some(&mut callback));
 
     assert_eq!(outcome.final_generation, target);
     assert_eq!(
@@ -308,8 +304,7 @@ fn oracle_runtime_target_matches_exact_gosper_metadata_at_moderate_target() {
         })
         .unwrap_or(0);
     let mut simulation = SimulationSession::new();
-    let outcome = OracleSession::new(grid, 0, Default::default(), &mut simulation)
-        .advance_runtime_target(target, None);
+    let outcome = OracleSession::new(grid, 0, &mut simulation).advance_runtime_target(target, None);
 
     assert_eq!(outcome.final_generation, target);
     assert!(matches!(
@@ -337,7 +332,7 @@ fn oracle_runtime_target_uses_emitter_cycle_at_hundred_million() {
         }
     };
 
-    let outcome = OracleSession::new(grid, 0, Default::default(), &mut simulation)
+    let outcome = OracleSession::new(grid, 0, &mut simulation)
         .advance_runtime_target(target, Some(&mut callback));
 
     assert_eq!(outcome.final_generation, target);
@@ -379,8 +374,8 @@ fn oracle_session_confirmed_cycle_does_not_schedule_diminishing_tail_jumps() {
         }
     };
 
-    let outcome = OracleSession::new(grid, 0, Default::default(), &mut simulation)
-        .advance_to_target(target, Some(&mut callback));
+    let outcome =
+        OracleSession::new(grid, 0, &mut simulation).advance_to_target(target, Some(&mut callback));
 
     assert_eq!(outcome.final_generation, target);
     let late_steps = planned_steps
@@ -545,9 +540,13 @@ fn huge_sparse_block_and_glider_root_advance_matches_segment_prefixes() {
         .or_invariant("test HashLife state should load");
 
     for step in segments {
-        session
-            .advance_hashlife_root(step)
-            .or_invariant("segmented sparse advance should complete");
+        let advance = session.advance_hashlife_root(step);
+        assert!(
+            advance.is_ok(),
+            "segmented sparse advance should complete: step={step} total_before={total} error={:?} stats={:?}",
+            advance.err(),
+            session.hashlife_runtime_stats()
+        );
         total += step;
         expected = expected_engine.advance(&expected, step);
         assert_eq!(
@@ -732,6 +731,7 @@ fn random_seed_420_billion_target_uses_bounded_constellation_projection() {
     let config = Config {
         pattern: "random".to_string(),
         steps: 1,
+        steps_explicit: true,
         max_generations: None,
         target_generation: Some(1_000_000_000),
         step_generations: 1,
@@ -740,6 +740,9 @@ fn random_seed_420_billion_target_uses_bounded_constellation_projection() {
         height: 24,
         classify_only: false,
         seed: 420,
+        run_mode: crate::cli::RunMode::Headless,
+        load: None,
+        bf: None,
     };
     let grid = initial_grid(&config);
     let mut simulation = SimulationSession::new();
@@ -751,7 +754,7 @@ fn random_seed_420_billion_target_uses_bounded_constellation_projection() {
             observed_metrics.push(metrics);
         }
     };
-    let outcome = OracleSession::new(grid, 0, Default::default(), &mut simulation)
+    let outcome = OracleSession::new(grid, 0, &mut simulation)
         .advance_runtime_target(1_000_000_000, Some(&mut callback));
     let hashlife_steps = planned_steps
         .iter()
@@ -825,7 +828,7 @@ fn random_seed_420_billion_target_uses_bounded_constellation_projection() {
 fn coarse_hashlife_extinction_does_not_claim_exact_die_out_generation() {
     let grid = crate::benchmark::oracle_extinction_seed_grid_for_tests();
     let mut simulation = SimulationSession::new();
-    let outcome = OracleSession::new(grid, 0, Default::default(), &mut simulation)
+    let outcome = OracleSession::new(grid, 0, &mut simulation)
         .advance_runtime_target(1_000_000_000_000, None);
 
     assert_eq!(outcome.final_generation, 1_000_000_000_000);
@@ -855,7 +858,7 @@ fn large_stable_pattern_uses_cycle_probe_to_reach_trillion_without_hashlife() {
         }
     };
 
-    let outcome = OracleSession::new(grid, 0, Default::default(), &mut simulation)
+    let outcome = OracleSession::new(grid, 0, &mut simulation)
         .advance_runtime_target(1_000_000_000_000, Some(&mut callback));
 
     assert_eq!(outcome.final_generation, 1_000_000_000_000);
@@ -886,7 +889,7 @@ fn hashlife_first_bounded_probes_run_before_large_target_jump() {
     let target = 1_000_000_000;
     let mut simulation = SimulationSession::new();
 
-    let outcome = OracleSession::new(grid, 0, Default::default(), &mut simulation)
+    let outcome = OracleSession::new(grid, 0, &mut simulation)
         .advance_runtime_target_hashlife_first(target, None);
 
     assert_eq!(outcome.final_generation, target);
@@ -930,8 +933,7 @@ fn runtime_oracle_reloads_exact_grid_over_stale_hashlife_session() {
     let blinker = pattern_by_name("blinker").or_invariant("required value");
     let expected = crate::life::step_grid(&blinker);
 
-    let outcome = OracleSession::new(blinker, 0, Default::default(), &mut simulation)
-        .advance_runtime_target(1, None);
+    let outcome = OracleSession::new(blinker, 0, &mut simulation).advance_runtime_target(1, None);
     let actual = simulation
         .sample_hashlife_state_grid(GridExtractionPolicy::FullGridIfUnder {
             max_population: u128::MAX,

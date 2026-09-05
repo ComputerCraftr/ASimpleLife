@@ -4,6 +4,13 @@ use crate::life::ChunkDiff;
 use std::collections::{HashSet, VecDeque};
 use std::io::{self, Write};
 
+pub(crate) mod activity;
+mod viewport;
+
+pub use viewport::{
+    ViewportController, ViewportError, ViewportMode, ViewportSample, ViewportSource,
+};
+
 #[derive(Clone, Debug)]
 pub struct TerminalBackbuffer {
     width: usize,
@@ -265,27 +272,16 @@ pub fn stable_viewport_origin(
     current: Option<Cell>,
     proposed: Cell,
     current_population: usize,
-    proposed_population: usize,
-    width: usize,
-    height: usize,
+    _proposed_population: usize,
+    _width: usize,
+    _height: usize,
 ) -> Cell {
     let Some(current) = current else {
         return proposed;
     };
-    let nearby_x = u128::from(current.0.abs_diff(proposed.0))
-        <= u128::try_from((width / 2).max(1)).or_invariant("viewport width should fit u128");
-    let nearby_y = u128::from(current.1.abs_diff(proposed.1))
-        <= u128::try_from(height.max(1)).or_invariant("viewport height should fit u128");
-    if current_population != 0 && current_population == proposed_population {
-        return current;
-    }
-    if nearby_x && nearby_y {
-        return proposed;
-    }
-
-    let current_score = current_population as u128;
-    let proposed_score = proposed_population as u128;
-    if current_score != 0 && current_score * 5 >= proposed_score * 4 {
+    // Population changes do not imply motion: distant oscillators can swap
+    // rankings every phase. Retain the occupied focus until it is lost.
+    if current_population != 0 {
         current
     } else {
         proposed

@@ -4,7 +4,7 @@ use super::*;
 impl HashLifeEngine {
     pub(crate) fn verify_overlap_batch_parity(&mut self, grid: &BitGrid) -> bool {
         let (root, _, _) = self.embed_grid_state(grid);
-        let mut nodes = [0; crate::simd_layout::SIMD_BATCH_LANES];
+        let mut nodes = [super::NodeId::ZERO; crate::simd_layout::SIMD_BATCH_LANES];
         let mut active = 0;
         let mut stack = vec![root];
 
@@ -33,11 +33,11 @@ impl HashLifeEngine {
 
     pub(crate) fn verify_canonical_overlap_batch_parity(&mut self, grid: &BitGrid) -> bool {
         let (root, _, _) = self.embed_grid_state(grid);
-        let mut nodes = [0; crate::simd_layout::SIMD_BATCH_LANES];
+        let mut nodes = [super::NodeId::ZERO; crate::simd_layout::SIMD_BATCH_LANES];
         let mut canonical_keys =
             [super::CanonicalJumpKey::empty(); crate::simd_layout::SIMD_BATCH_LANES];
-        let mut canonical_packed =
-            [super::PackedNodeKey::new(0, [0; 4]); crate::simd_layout::SIMD_BATCH_LANES];
+        let mut canonical_packed = [super::PackedNodeKey::new(0, [super::NodeId::ZERO; 4]);
+            crate::simd_layout::SIMD_BATCH_LANES];
         let mut active = 0;
         let mut stack = vec![root];
 
@@ -67,14 +67,14 @@ impl HashLifeEngine {
         if active == 0 {
             return true;
         }
-        let mut canonical_nodes = [0; crate::simd_layout::SIMD_BATCH_LANES];
+        let mut canonical_nodes = [super::NodeId::ZERO; crate::simd_layout::SIMD_BATCH_LANES];
         for lane in 0..active {
             canonical_nodes[lane] = self.materialize_packed_node_key(canonical_packed[lane]);
         }
         let raw = self.probe_and_build_overlaps_staged(&canonical_nodes, active);
         let mut identities = [super::CanonicalNodeIdentity {
-            packed: super::PackedNodeKey::new(0, [0; 4]),
-            structural: super::CanonicalStructKey::new(0, [0; 4]),
+            packed: super::PackedNodeKey::new(0, [super::NodeId::ZERO; 4]),
+            structural: super::CanonicalStructKey::leaf(false),
             symmetry: super::Symmetry::Identity,
         }; crate::simd_layout::SIMD_BATCH_LANES];
         let mut fingerprints = [0_u64; crate::simd_layout::SIMD_BATCH_LANES];
@@ -84,8 +84,7 @@ impl HashLifeEngine {
                 structural: canonical_keys[lane].structural,
                 symmetry: super::Symmetry::Identity,
             };
-            fingerprints[lane] =
-                crate::flat_table::FlatKey::fingerprint(&canonical_keys[lane].structural);
+            fingerprints[lane] = ProbeKey::fingerprint(&canonical_keys[lane].structural);
         }
         self.stats.scheduler.cache_probe_batches += 1;
         self.stats.scheduler.scheduler_probe_batches += 1;
@@ -126,7 +125,7 @@ impl HashLifeEngine {
             self.stats.result_cache.overlap_cache_misses,
             self.stats.simd.overlap_local_reuse_lanes,
         );
-        let mut nodes = [0; crate::simd_layout::SIMD_BATCH_LANES];
+        let mut nodes = [super::NodeId::ZERO; crate::simd_layout::SIMD_BATCH_LANES];
         nodes[0] = root;
         nodes[1] = root;
         let overlaps = self.probe_and_build_overlaps_staged(&nodes, 2);
@@ -141,7 +140,7 @@ impl HashLifeEngine {
         &mut self,
         grids: &[BitGrid; crate::simd_layout::SIMD_BATCH_LANES],
     ) -> (bool, bool, usize) {
-        let mut overlap_lanes = [[0; 9]; crate::simd_layout::SIMD_BATCH_LANES];
+        let mut overlap_lanes = [[super::NodeId::ZERO; 9]; crate::simd_layout::SIMD_BATCH_LANES];
         for (lane, grid) in grids.iter().enumerate() {
             let (root, _, _) = self.embed_grid_state(grid);
             overlap_lanes[lane] = self.overlapping_subnodes(root);

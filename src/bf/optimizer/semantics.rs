@@ -1,6 +1,32 @@
 use super::super::ir::ShiftDir;
 use super::super::{BF_C_TAPE_LEN, BF_LIFE_TAPE_LEN};
 
+/// Cells occupy at most 63 raw bits; zero-bit cells are always zero.
+pub const MAX_CELL_BITS: u32 = 63;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodegenOptsError {
+    CellWidth(u32),
+    InputWidth(u32),
+    OutputWidth(u32),
+}
+
+impl std::fmt::Display for CodegenOptsError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (field, width) = match self {
+            Self::CellWidth(width) => ("cell", width),
+            Self::InputWidth(width) => ("input", width),
+            Self::OutputWidth(width) => ("output", width),
+        };
+        write!(
+            out,
+            "unsupported BF {field} width {width}; expected 0..={MAX_CELL_BITS}"
+        )
+    }
+}
+
+impl std::error::Error for CodegenOptsError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoMode {
     Char,
@@ -20,6 +46,25 @@ pub struct CodegenOpts {
     pub input_bits: Option<u32>,
     pub output_bits: Option<u32>,
     pub cell_sign: CellSign,
+}
+
+impl CodegenOpts {
+    pub fn validate(self) -> Result<(), CodegenOptsError> {
+        if self.cell_bits > MAX_CELL_BITS {
+            return Err(CodegenOptsError::CellWidth(self.cell_bits));
+        }
+        if let Some(bits) = self.input_bits
+            && bits > MAX_CELL_BITS
+        {
+            return Err(CodegenOptsError::InputWidth(bits));
+        }
+        if let Some(bits) = self.output_bits
+            && bits > MAX_CELL_BITS
+        {
+            return Err(CodegenOptsError::OutputWidth(bits));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,17 +137,24 @@ impl OptimizerSemantics {
     }
 
     pub(super) fn multiply_coefficients(self, lhs: i32, rhs: i32) -> Option<i32> {
-        self.has_cells()
-            .then(|| i64::from(lhs).checked_mul(i64::from(rhs)))
-            .flatten()
-            .and_then(|product| i32::try_from(product).ok())
+        self.lower_coefficient(i128::from(lhs) * i128::from(rhs))
     }
 
     pub(super) fn in_place_scale_coeff(self, coeff: i32) -> Option<i32> {
-        self.has_cells()
-            .then(|| i64::from(coeff).checked_add(1))
-            .flatten()
-            .and_then(|scaled| i32::try_from(scaled).ok())
+        self.lower_coefficient(i128::from(coeff) + 1)
+    }
+
+    fn lower_coefficient(self, value: i128) -> Option<i32> {
+        let semantics = super::super::symbolic::PolynomialSemantics::new(
+            self.cell_bits,
+            self.cell_sign,
+            BF_C_TAPE_LEN,
+        )?;
+        // Preserve small positive coefficients for canonical shift recognition.
+        // Overflowing IR coefficients can still have an exact modular lowering.
+        i32::try_from(value)
+            .ok()
+            .or_else(|| i32::try_from(semantics.normalize_wide(value)?).ok())
     }
 
     pub(super) fn wrapping_modulus(self) -> Option<i128> {
@@ -112,14 +164,12 @@ impl OptimizerSemantics {
     }
 
     pub(super) fn wrap_coeff_to_i32(self, value: i128) -> Option<i32> {
-        let modulus = self.wrapping_modulus()?;
-        let reduced = value.rem_euclid(modulus);
-        let signed = if reduced >= modulus / 2 {
-            reduced - modulus
-        } else {
-            reduced
-        };
-        i32::try_from(signed).ok()
+        let semantics = super::super::symbolic::PolynomialSemantics::new(
+            self.cell_bits,
+            self.cell_sign,
+            BF_C_TAPE_LEN,
+        )?;
+        i32::try_from(semantics.normalize_wide(value)?).ok()
     }
 
     pub(super) fn multiplicative_inverse(self, value: i32) -> Option<i128> {

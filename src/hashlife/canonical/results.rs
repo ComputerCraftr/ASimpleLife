@@ -18,6 +18,7 @@ impl HashLifeEngine {
         if !self.record_active_jump_result(key, fingerprint, entry) {
             return;
         }
+        self.publish_future_jump_entry(key, entry);
         self.publish_optional_cache(
             |engine| &engine.result_caches.jump,
             |engine| &mut engine.result_caches.jump,
@@ -210,20 +211,20 @@ impl HashLifeEngine {
         if lanes.is_empty() {
             return;
         }
-        let Some(mut unique_lookup) =
-            self.try_transient_flat_table::<PackedSymmetryKey, usize>(lanes.len().max(4))
-        else {
-            return;
-        };
+        if lanes.len() > crate::simd_layout::SIMD_BATCH_LANES {
+            crate::invariant_failure!("phase-2 canonicalization exceeded SIMD lane workspace");
+        }
         let empty_entry = PackedSymmetryKey {
-            packed: PackedNodeKey::new(0, [0; 4]),
+            packed: PackedNodeKey::new(0, [NodeId::ZERO; 4]),
             symmetry: Symmetry::Identity,
         };
-        let Some(mut unique_inputs) =
-            self.try_transient_vec::<PackedCanonicalInputRecord>(lanes.len())
-        else {
-            return;
+        let empty_record = PackedCanonicalInputRecord {
+            input: empty_entry,
+            input_children: [CanonicalShapeId::DEAD; 4],
+            canonical_entry: empty_entry,
         };
+        let mut unique_inputs = [empty_record; crate::simd_layout::SIMD_BATCH_LANES];
+        let mut unique_count = 0;
         for lane in lanes.iter_mut() {
             let packed_input = lane.packed_input;
             if !lane.key.symmetry_admitted {
@@ -231,18 +232,20 @@ impl HashLifeEngine {
                 lane.canonical_entry = packed_input;
                 continue;
             }
-            if let Some(index) = unique_lookup.get(&packed_input) {
+            if let Some(index) = unique_inputs[..unique_count]
+                .iter()
+                .position(|record| record.input == packed_input)
+            {
                 lane.unique_input_index = index;
                 self.stats
                     .canonical_fallback
                     .canonical_result_batch_local_reuses += 1;
             } else {
-                lane.unique_input_index = unique_inputs.len();
-                let unique_index = unique_inputs.len();
-                let record = PackedCanonicalInputRecord {
+                lane.unique_input_index = unique_count;
+                unique_inputs[unique_count] = PackedCanonicalInputRecord {
                     input: packed_input,
                     input_children: if packed_input.packed.level == 0 {
-                        [0; 4]
+                        [CanonicalShapeId::DEAD; 4]
                     } else {
                         self.direct_parent_input_children(
                             packed_input.packed,
@@ -251,24 +254,16 @@ impl HashLifeEngine {
                     },
                     canonical_entry: empty_entry,
                 };
-                if !self.try_push_transient(&mut unique_inputs, record)
-                    || !self.try_insert_transient_table(
-                        &mut unique_lookup,
-                        packed_input,
-                        unique_index,
-                    )
-                {
-                    return;
-                }
+                unique_count += 1;
             }
         }
-        self.stats.canonical_fallback.canonical_result_unique_inputs += unique_inputs.len();
+        self.stats.canonical_fallback.canonical_result_unique_inputs += unique_count;
 
         let phase2_fallbacks_before = self
             .stats
             .canonical_fallback
             .canonical_result_batch_fallbacks;
-        self.canonical_packed_result_entries_for_unique_inputs(&mut unique_inputs);
+        self.canonical_packed_result_entries_for_unique_inputs(&mut unique_inputs[..unique_count]);
         self.stats.canonical_fallback.canonical_phase2_fallbacks += self
             .stats
             .canonical_fallback
@@ -290,17 +285,31 @@ impl HashLifeEngine {
             .result_caches
             .jump
             .get_with_fingerprint(&jump_probe.key, jump_probe.fingerprint);
-        let result = retained_result.or_else(|| {
+        let exact_result = retained_result.or_else(|| {
             self.active_jump_results
                 .get_with_fingerprint(&jump_probe.key, jump_probe.fingerprint)
-        })?;
+        });
+        let future_hit = exact_result.is_none();
+        let result = if let Some(result) = exact_result {
+            result
+        } else {
+            self.lookup_future_jump_result(jump_probe.key)?
+        };
         if retained_result.is_some() {
             self.stats.result_cache.jump_result_cache_hits += 1;
         }
         if jump_probe.node.symmetry != Symmetry::Identity {
             self.stats.result_cache.symmetric_jump_result_cache_hits += 1;
         }
-        Some(self.materialize_oriented_packed_result(result.packed, result.symmetry, inverse))
+        let materialized =
+            self.materialize_oriented_packed_result(result.packed, result.symmetry, inverse);
+        if self.allocation_failed() {
+            return None;
+        }
+        if future_hit {
+            self.stats.future.saved_jump_lookups += 1;
+        }
+        Some(materialized)
     }
 
     pub(in crate::hashlife) fn insert_jump_result(&mut self, key: (NodeId, u32), result: NodeId) {
@@ -396,6 +405,94 @@ impl HashLifeEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase2_canonicalization_respects_partial_lane_slice() {
+        let mut engine = HashLifeEngine::default();
+        let source = engine.empty(2);
+        let result = engine.empty(1);
+        let packed_input = PackedSymmetryKey {
+            packed: engine.node_columns.packed_key(result),
+            symmetry: Symmetry::Identity,
+        };
+        let key = engine.canonical_jump_probe((source, 0)).key;
+        let sentinel_entry = PackedSymmetryKey {
+            packed: PackedNodeKey::new(
+                0,
+                [engine.live_leaf, NodeId::ZERO, NodeId::ZERO, NodeId::ZERO],
+            ),
+            symmetry: Symmetry::Rotate180,
+        };
+        let sentinel = Phase2CommitLane {
+            key,
+            fallback: result,
+            result,
+            unique_input_index: 777,
+            packed_input,
+            canonical_entry: sentinel_entry,
+        };
+        let mut lanes = [sentinel; 8];
+        for lane in &mut lanes[..2] {
+            lane.unique_input_index = usize::MAX;
+        }
+
+        engine.canonicalize_phase2_commit_lanes(&mut lanes[..2]);
+
+        assert_eq!(lanes[0].canonical_entry, lanes[1].canonical_entry);
+        assert_eq!(lanes[0].unique_input_index, 0);
+        assert_eq!(lanes[1].unique_input_index, 0);
+        for lane in &lanes[2..] {
+            assert_eq!(lane.unique_input_index, 777);
+            assert_eq!(lane.canonical_entry, sentinel_entry);
+        }
+    }
+
+    #[test]
+    fn phase2_without_admitted_lanes_uses_no_transient_storage() {
+        let mut engine = HashLifeEngine::default();
+        let packed_input = PackedSymmetryKey {
+            packed: PackedNodeKey::new(
+                0,
+                [engine.live_leaf, NodeId::ZERO, NodeId::ZERO, NodeId::ZERO],
+            ),
+            symmetry: Symmetry::Rotate90,
+        };
+        let lane = Phase2CommitLane {
+            key: CanonicalJumpKey {
+                structural: CanonicalStructKey::leaf(false),
+                step_exp: 0,
+                symmetry_admitted: false,
+            },
+            fallback: engine.live_leaf,
+            result: engine.live_leaf,
+            unique_input_index: 0,
+            packed_input,
+            canonical_entry: PackedSymmetryKey {
+                packed: PackedNodeKey::new(0, [NodeId::ZERO; 4]),
+                symmetry: Symmetry::Identity,
+            },
+        };
+        let mut lanes = [lane; crate::simd_layout::SIMD_BATCH_LANES];
+        let bytes_before = engine.allocated_bytes();
+        let unique_before = engine
+            .stats
+            .canonical_fallback
+            .canonical_result_unique_inputs;
+
+        engine.canonicalize_phase2_commit_lanes(&mut lanes);
+
+        assert_eq!(engine.allocated_bytes(), bytes_before);
+        assert_eq!(
+            engine
+                .stats
+                .canonical_fallback
+                .canonical_result_unique_inputs,
+            unique_before
+        );
+        assert!(lanes.iter().all(|lane| {
+            lane.unique_input_index == usize::MAX && lane.canonical_entry == packed_input
+        }));
+    }
 
     #[test]
     fn pressured_optional_jump_publication_preserves_exact_active_result() {

@@ -28,8 +28,8 @@ impl HashLifeEngine {
             cold_attempts,
             cold_visits,
             cold_cost_bypasses,
-            self.stats.transform.d4_semantic_prefix_cache_bypasses
-                - before_warm.d4_semantic_prefix_cache_bypasses,
+            self.stats.transform.d4_semantic_prefix_attempts
+                - before_warm.d4_semantic_prefix_attempts,
             self.stats.transform.d4_semantic_prefix_leaf_visits
                 - before_warm.d4_semantic_prefix_leaf_visits,
         )
@@ -48,10 +48,10 @@ impl HashLifeEngine {
             self.dead_leaf,
             self.live_leaf,
         );
-        let ids_oppose_structure = full < sparse;
+        let ids_oppose_structure = full.raw() < sparse.raw();
         let root = self.join(full, sparse, full, full);
         let packed = self.node_columns.packed_key(root);
-        let (winner, _) = self.scan_canonical_transform_winner(
+        let (winner, _, _) = self.scan_canonical_transform_winner(
             packed,
             crate::symmetry::D4Symmetry::Identity,
             false,
@@ -386,7 +386,9 @@ impl HashLifeEngine {
                 .canonical_transform_root_reconstructions,
             self.stats.canonical_cache.direct_parent_winner_fallbacks,
         );
-        let first = self.canonicalize_packed_direct_for_tests(packed, Symmetry::Identity);
+        let first = self
+            .canonicalize_packed_direct(packed, Symmetry::Identity, false)
+            .node;
         let populate_delta = (
             self.stats.canonical_cache.direct_parent_cached_result_hits - before.0,
             self.stats
@@ -403,7 +405,9 @@ impl HashLifeEngine {
                 .canonical_transform_root_reconstructions,
             self.stats.canonical_cache.direct_parent_winner_fallbacks,
         );
-        let warm = self.canonicalize_packed_direct_for_tests(packed, Symmetry::Identity);
+        let warm = self
+            .canonicalize_packed_direct(packed, Symmetry::Identity, false)
+            .node;
         let warm_delta = (
             self.stats.canonical_cache.direct_parent_cached_result_hits - before.0,
             self.stats
@@ -424,7 +428,9 @@ impl HashLifeEngine {
                 .canonical_transform_root_reconstructions,
             self.stats.canonical_cache.direct_parent_winner_fallbacks,
         );
-        let second = self.canonicalize_packed_direct_for_tests(packed, Symmetry::Identity);
+        let second = self
+            .canonicalize_packed_direct(packed, Symmetry::Identity, false)
+            .node;
         let retained_delta = (
             self.stats.canonical_cache.direct_parent_cached_result_hits - before.0,
             self.stats
@@ -479,7 +485,7 @@ impl HashLifeEngine {
             unique_input_index: 0,
             packed_input,
             canonical_entry: PackedSymmetryKey {
-                packed: PackedNodeKey::new(0, [0; 4]),
+                packed: PackedNodeKey::new(0, [NodeId::ZERO; 4]),
                 symmetry: Symmetry::Identity,
             },
         }; 4];
@@ -575,7 +581,7 @@ impl HashLifeEngine {
                 }
 
                 let packed = self.node_columns.packed_key(transformed);
-                let (winner, _) = self.scan_canonical_transform_winner(
+                let (winner, _, _) = self.scan_canonical_transform_winner(
                     packed,
                     crate::symmetry::D4Symmetry::Identity,
                     false,
@@ -615,7 +621,7 @@ impl HashLifeEngine {
                 continue;
             }
             let packed = self.node_columns.packed_key(node);
-            let (winner, _) = self.scan_canonical_transform_winner(
+            let (winner, _, _) = self.scan_canonical_transform_winner(
                 packed,
                 crate::symmetry::D4Symmetry::Identity,
                 false,

@@ -13,12 +13,6 @@ pub struct HashLifeStateIdentity {
     pub(crate) level: u32,
 }
 
-impl HashLifeStateIdentity {
-    pub(crate) fn same_epoch(self, other: Self) -> bool {
-        self.session == other.session && self.epoch == other.epoch
-    }
-}
-
 /// A constant-time checkpoint over the current interned root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HashLifeStateCheckpoint {

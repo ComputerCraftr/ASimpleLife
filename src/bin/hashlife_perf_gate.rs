@@ -56,6 +56,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut native_d4_candidate_lanes = 0_usize;
     let mut native_d4_prefix_lanes = 0_usize;
     let mut native_d4_exact_winners = 0_usize;
+    let mut native_control_groups = 0_usize;
     for case in &corpus.cases {
         if pattern_filter
             .as_deref()
@@ -120,6 +121,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 native_d4_prefix_lanes.saturating_add(stats.native_d4_prefix_compare_lanes);
             native_d4_exact_winners =
                 native_d4_exact_winners.saturating_add(stats.native_d4_exact_winner_lanes);
+            native_control_groups = native_control_groups
+                .saturating_add(stats.native_avx2_control_groups)
+                .saturating_add(stats.native_neon_control_groups);
             executed_cases += 1;
             println!(
                 "pattern={} target={} population={population:?} allocated_bytes={} nodes={} gc_runs={}",
@@ -153,7 +157,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let elapsed = started.elapsed();
     println!(
-        "corpus_version={} executed_cases={executed_cases} runner={runner:?} elapsed_ms={} peak_rss_bytes={} peak_allocated_bytes={peak_allocated} native_kernel_lanes={native_kernel_lanes} d4_candidate_lanes={d4_candidate_lanes} native_d4_candidate_lanes={native_d4_candidate_lanes} native_d4_prefix_lanes={native_d4_prefix_lanes} native_d4_exact_winners={native_d4_exact_winners}",
+        "corpus_version={} executed_cases={executed_cases} runner={runner:?} elapsed_ms={} peak_rss_bytes={} peak_allocated_bytes={peak_allocated} native_kernel_lanes={native_kernel_lanes} native_control_groups={native_control_groups} d4_candidate_lanes={d4_candidate_lanes} native_d4_candidate_lanes={native_d4_candidate_lanes} native_d4_prefix_lanes={native_d4_prefix_lanes} native_d4_exact_winners={native_d4_exact_winners}",
         corpus.version,
         elapsed.as_millis(),
         peak_rss

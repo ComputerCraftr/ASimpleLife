@@ -620,7 +620,7 @@ pub(crate) fn normalize_offset_body(body: &[BfIr]) -> NormalizedBody {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SymbolicTransfer {
     pub ptr_delta: crate::bf::BfOffset,
     pub effects: BTreeMap<crate::bf::BfOffset, SymbolicPolynomial>,

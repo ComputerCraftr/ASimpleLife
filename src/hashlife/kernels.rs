@@ -37,6 +37,9 @@ pub(super) struct KernelAccounting {
     pub(super) native_d4_candidate_lanes: usize,
     pub(super) native_d4_prefix_compare_lanes: usize,
     pub(super) native_d4_exact_winner_lanes: usize,
+    pub(super) swar_control_groups: usize,
+    pub(super) native_avx2_control_groups: usize,
+    pub(super) native_neon_control_groups: usize,
 }
 
 impl KernelAccounting {
@@ -72,6 +75,9 @@ impl KernelAccounting {
         self.native_d4_candidate_lanes += other.native_d4_candidate_lanes;
         self.native_d4_prefix_compare_lanes += other.native_d4_prefix_compare_lanes;
         self.native_d4_exact_winner_lanes += other.native_d4_exact_winner_lanes;
+        self.swar_control_groups += other.swar_control_groups;
+        self.native_avx2_control_groups += other.native_avx2_control_groups;
+        self.native_neon_control_groups += other.native_neon_control_groups;
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -169,9 +175,12 @@ impl KernelSet {
         active_lanes: usize,
     ) -> ([u16; SIMD_BATCH_LANES], KernelAccounting) {
         if !self.use_native(active_lanes) {
+            let mut accounting =
+                KernelAccounting::portable(KernelOperation::ControlMatch, active_lanes);
+            accounting.swar_control_groups = 1;
             return (
-                contracts::scalar_control_matches(control, tags, active_lanes),
-                KernelAccounting::scalar(KernelOperation::ControlMatch, active_lanes),
+                contracts::swar_control_matches(control, tags, active_lanes),
+                accounting,
             );
         }
         match self.flavor {
@@ -182,8 +191,13 @@ impl KernelSet {
             #[cfg(target_arch = "aarch64")]
             KernelFlavor::Neon => neon::control_matches(control, tags, active_lanes),
             _ => (
-                contracts::scalar_control_matches(control, tags, active_lanes),
-                KernelAccounting::scalar(KernelOperation::ControlMatch, active_lanes),
+                contracts::swar_control_matches(control, tags, active_lanes),
+                {
+                    let mut accounting =
+                        KernelAccounting::portable(KernelOperation::ControlMatch, active_lanes);
+                    accounting.swar_control_groups = 1;
+                    accounting
+                },
             ),
         }
     }
@@ -192,11 +206,10 @@ impl KernelSet {
         self,
         batch: &D4PrefixBatch,
     ) -> (D4PrefixDecision, KernelAccounting) {
-        const CANDIDATES: usize = 8;
-        if !self.use_native(CANDIDATES) {
+        if !self.use_native(batch.active_lanes) {
             return (
                 contracts::scalar_d4_prefix(batch),
-                KernelAccounting::scalar(KernelOperation::D4SemanticPrefix, CANDIDATES),
+                KernelAccounting::scalar(KernelOperation::D4SemanticPrefix, batch.active_lanes),
             );
         }
         match self.flavor {
@@ -208,7 +221,7 @@ impl KernelSet {
             KernelFlavor::Neon => neon::d4_prefix(batch),
             _ => (
                 contracts::scalar_d4_prefix(batch),
-                KernelAccounting::scalar(KernelOperation::D4SemanticPrefix, CANDIDATES),
+                KernelAccounting::scalar(KernelOperation::D4SemanticPrefix, batch.active_lanes),
             ),
         }
     }
@@ -217,11 +230,10 @@ impl KernelSet {
         self,
         batch: &D4CandidateBatch,
     ) -> (D4CandidateBatchResult, KernelAccounting) {
-        const CANDIDATES: usize = 8;
-        if !self.use_native(CANDIDATES) {
+        if !self.use_native(batch.active_lanes) {
             return (
                 contracts::scalar_d4_candidates(batch),
-                KernelAccounting::scalar(KernelOperation::D4Candidate, CANDIDATES),
+                KernelAccounting::scalar(KernelOperation::D4Candidate, batch.active_lanes),
             );
         }
         match self.flavor {
@@ -233,7 +245,7 @@ impl KernelSet {
             KernelFlavor::Neon => neon::d4_candidates(batch),
             _ => (
                 contracts::scalar_d4_candidates(batch),
-                KernelAccounting::scalar(KernelOperation::D4Candidate, CANDIDATES),
+                KernelAccounting::scalar(KernelOperation::D4Candidate, batch.active_lanes),
             ),
         }
     }
@@ -310,6 +322,7 @@ impl KernelSet {
         self.flavor != KernelFlavor::Scalar && active_lanes >= VECTOR_BREAK_EVEN_LANES
     }
 
+    #[cfg(test)]
     pub(super) fn supports_native_d4_prefix(self) -> bool {
         match self.flavor {
             #[cfg(target_arch = "x86_64")]
@@ -524,6 +537,16 @@ mod tests {
                 "control match mismatch active_lanes={active_lanes}"
             );
             assert_eq!(accounting.operation, Some(KernelOperation::ControlMatch));
+            if accounting.native_avx2_lanes + accounting.native_neon_lanes == 0 {
+                assert_eq!(accounting.swar_control_groups, 1);
+                assert_eq!(accounting.portable_vector_lanes, active_lanes);
+            } else {
+                assert_eq!(accounting.swar_control_groups, 0);
+                assert_eq!(
+                    accounting.native_avx2_control_groups + accounting.native_neon_control_groups,
+                    1
+                );
+            }
         }
     }
 
@@ -536,6 +559,7 @@ mod tests {
         let batch = D4PrefixBatch {
             words: [[9, 7, 3, 3, 8, 6, 4, 5], [0, 0, 8, 8, 0, 0, 0, 0]],
             complete: false,
+            ..D4PrefixBatch::default()
         };
         let expected = contracts::scalar_d4_prefix(&batch);
         let (actual, accounting) = KernelSet::selected().compare_d4_prefixes(&batch);
@@ -571,6 +595,7 @@ mod tests {
         let all_symmetric = D4PrefixBatch {
             words: [[0x55aa; 8], [0xaa55; 8]],
             complete: true,
+            ..D4PrefixBatch::default()
         };
         let (actual, _) = KernelSet::selected().compare_d4_prefixes(&all_symmetric);
         assert!(actual.exact);
@@ -581,8 +606,20 @@ mod tests {
 
     #[test]
     fn d4_candidate_contract_constructs_every_orientation_without_ordering_ids() {
+        let oriented_children = std::array::from_fn(|candidate| {
+            std::array::from_fn(|child| {
+                u32::try_from(candidate * 100 + child * 7 + 1)
+                    .or_invariant("D4 fixture exceeds u32")
+            })
+        });
         let batch = D4CandidateBatch {
-            children: [u32::MAX, 7, 0x8000_0000, 1],
+            oriented_children,
+            permutations: crate::symmetry::D4Symmetry::ALL.map(|symmetry| {
+                symmetry
+                    .quadrant_perm()
+                    .map(|slot| u8::try_from(slot).or_invariant("quadrant exceeds u8"))
+            }),
+            ..D4CandidateBatch::default()
         };
         let expected = contracts::scalar_d4_candidates(&batch);
 
@@ -596,7 +633,9 @@ mod tests {
             for (index, symmetry) in crate::symmetry::D4Symmetry::ALL.into_iter().enumerate() {
                 assert_eq!(
                     actual.children[index],
-                    symmetry.quadrant_perm().map(|slot| batch.children[slot]),
+                    symmetry
+                        .quadrant_perm()
+                        .map(|slot| batch.oriented_children[index][slot]),
                     "D4 candidate permutation mismatch for {symmetry:?}"
                 );
             }
@@ -614,6 +653,146 @@ mod tests {
                 "the selected native kernel must account for all eight constructed candidates"
             );
         }
+    }
+
+    #[test]
+    fn d4_candidate_active_lane_contract_ignores_poisoned_tails() {
+        let reordered = [
+            crate::symmetry::D4Symmetry::MirrorXRotate270,
+            crate::symmetry::D4Symmetry::Rotate180,
+            crate::symmetry::D4Symmetry::Identity,
+            crate::symmetry::D4Symmetry::MirrorX,
+            crate::symmetry::D4Symmetry::Rotate270,
+            crate::symmetry::D4Symmetry::MirrorXRotate90,
+            crate::symmetry::D4Symmetry::Rotate90,
+            crate::symmetry::D4Symmetry::MirrorXRotate180,
+        ];
+        for active_lanes in [0, 3, 4, 7, 8] {
+            let mut batch = D4CandidateBatch {
+                active_lanes,
+                transforms: reordered,
+                oriented_children: std::array::from_fn(|lane| {
+                    std::array::from_fn(|child| {
+                        u32::try_from(lane * 100 + child + 1).or_invariant("D4 fixture exceeds u32")
+                    })
+                }),
+                permutations: [[u8::MAX; 4]; 8],
+            };
+            for (lane, transform) in reordered.iter().take(active_lanes).enumerate() {
+                batch.permutations[lane] = transform
+                    .quadrant_perm()
+                    .map(|slot| u8::try_from(slot).or_invariant("quadrant exceeds u8"));
+            }
+
+            let expected = contracts::scalar_d4_candidates(&batch);
+            let (scalar, scalar_accounting) =
+                KernelSet::with_flavor(KernelFlavor::Scalar).construct_d4_candidates(&batch);
+            let (selected, selected_accounting) =
+                KernelSet::selected().construct_d4_candidates(&batch);
+            assert_eq!(scalar, expected, "scalar mismatch lanes={active_lanes}");
+            assert_eq!(selected, expected, "selected mismatch lanes={active_lanes}");
+            assert!(
+                expected.children[active_lanes..]
+                    .iter()
+                    .all(|children| *children == [0; 4])
+            );
+            assert_eq!(scalar_accounting.scalar_lanes, active_lanes);
+            let native_lanes =
+                selected_accounting.native_avx2_lanes + selected_accounting.native_neon_lanes;
+            if KernelSet::selected().supports_native_d4_prefix() && active_lanes >= 4 {
+                assert_eq!(native_lanes, active_lanes);
+                assert_eq!(selected_accounting.native_d4_candidate_lanes, active_lanes);
+            } else {
+                assert_eq!(native_lanes, 0);
+                assert_eq!(selected_accounting.scalar_lanes, active_lanes);
+            }
+        }
+    }
+
+    #[test]
+    fn d4_prefix_active_lane_contract_maps_original_transforms() {
+        use crate::symmetry::D4Symmetry::{
+            Identity, MirrorX, MirrorXRotate90, MirrorXRotate180, MirrorXRotate270, Rotate90,
+            Rotate180, Rotate270,
+        };
+
+        let reordered = [
+            Rotate270,
+            MirrorX,
+            Rotate90,
+            Identity,
+            MirrorXRotate270,
+            Rotate180,
+            MirrorXRotate90,
+            MirrorXRotate180,
+        ];
+        let cases = [
+            D4PrefixBatch {
+                active_lanes: 0,
+                words: [[0; 8], [0; 8]],
+                transforms: reordered,
+                complete: true,
+            },
+            D4PrefixBatch {
+                active_lanes: 3,
+                words: [[8, 2, 4, 0, 0, 0, 0, 0], [0; 8]],
+                transforms: reordered,
+                complete: false,
+            },
+            D4PrefixBatch {
+                active_lanes: 4,
+                words: [[1, 9, 7, 1, 0, 0, 0, 0], [3, 0, 0, 3, 0, 0, 0, 0]],
+                transforms: reordered,
+                complete: false,
+            },
+            D4PrefixBatch {
+                active_lanes: 7,
+                words: [[5, 4, 3, 2, 7, 8, 1, 0], [0; 8]],
+                transforms: reordered,
+                complete: false,
+            },
+            D4PrefixBatch {
+                active_lanes: 8,
+                words: [[11; 8], [13; 8]],
+                transforms: reordered,
+                complete: true,
+            },
+        ];
+
+        for batch in cases {
+            let expected = contracts::scalar_d4_prefix(&batch);
+            let (scalar, scalar_accounting) =
+                KernelSet::with_flavor(KernelFlavor::Scalar).compare_d4_prefixes(&batch);
+            let (selected, selected_accounting) = KernelSet::selected().compare_d4_prefixes(&batch);
+            assert_eq!(scalar, expected, "scalar mismatch for {batch:?}");
+            assert_eq!(selected, expected, "selected mismatch for {batch:?}");
+            assert_eq!(scalar_accounting.scalar_lanes, batch.active_lanes);
+            let native_lanes =
+                selected_accounting.native_avx2_lanes + selected_accounting.native_neon_lanes;
+            if KernelSet::selected().supports_native_d4_prefix() && batch.active_lanes >= 4 {
+                assert_eq!(native_lanes, batch.active_lanes);
+                assert_eq!(
+                    selected_accounting.native_d4_prefix_compare_lanes,
+                    batch.active_lanes
+                );
+                assert_eq!(
+                    selected_accounting.native_d4_exact_winner_lanes,
+                    usize::from(expected.exact)
+                );
+            } else {
+                assert_eq!(native_lanes, 0);
+                assert_eq!(selected_accounting.scalar_lanes, batch.active_lanes);
+            }
+        }
+
+        assert_eq!(contracts::scalar_d4_prefix(&cases[0]).unresolved_mask, 0);
+        assert!(!contracts::scalar_d4_prefix(&cases[0]).exact);
+        let reordered_tie = contracts::scalar_d4_prefix(&cases[2]);
+        assert_eq!(reordered_tie.transform, Identity);
+        assert_eq!(reordered_tie.unresolved_mask, (1 << 0) | (1 << 3));
+        let full_tie = contracts::scalar_d4_prefix(&cases[4]);
+        assert_eq!(full_tie.transform, Identity);
+        assert_eq!(full_tie.unresolved_mask, u8::MAX);
     }
 
     #[test]

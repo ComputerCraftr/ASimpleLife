@@ -8,6 +8,9 @@ pub(crate) const SPLITMIX64_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 const MURMUR3_FMIX_MUL1: u64 = 0xFF51_AFD7_ED55_8CCD;
 const MURMUR3_FMIX_MUL2: u64 = 0xC4CE_B9FE_1A85_EC53;
 const MURMUR3_FMIX_SHIFT: u32 = 33;
+const STRUCTURAL_FP_LO_DOMAIN: u64 = 0x5354_5255_4354_4C4F;
+const STRUCTURAL_FP_HI_DOMAIN: u64 = 0x5354_5255_4354_4849;
+const STRUCTURAL_PROBE_DOMAIN: u64 = 0x5354_5255_4354_5052;
 const SPLITMIX64_MUL1: u64 = 0xBF58_476D_1CE4_E5B9;
 const SPLITMIX64_MUL2: u64 = 0x94D0_49BB_1331_11EB;
 const MORTON_MASK_16: u64 = 0x0000_FFFF_0000_FFFF;
@@ -63,6 +66,47 @@ pub(crate) fn hash_words(domain: u64, words: impl IntoIterator<Item = u64>) -> u
         state = fold_hash_word(state, word);
     }
     mix64(state)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StructuralFingerprint {
+    lo: u64,
+    hi: u64,
+}
+
+impl StructuralFingerprint {
+    pub(crate) fn probe_hash(self) -> u64 {
+        hash_words(STRUCTURAL_PROBE_DOMAIN, [self.lo, self.hi])
+    }
+
+    pub(crate) const fn words(self) -> [u64; 2] {
+        [self.lo, self.hi]
+    }
+}
+
+pub(crate) fn structural_leaf_fingerprint(alive: bool) -> StructuralFingerprint {
+    structural_fingerprint(0, [StructuralFingerprint::default(); 4], u64::from(alive))
+}
+
+pub(crate) fn structural_node_fingerprint(
+    level: u32,
+    children: [StructuralFingerprint; 4],
+) -> StructuralFingerprint {
+    structural_fingerprint(level, children, 0)
+}
+
+fn structural_fingerprint(
+    level: u32,
+    children: [StructuralFingerprint; 4],
+    leaf: u64,
+) -> StructuralFingerprint {
+    let words = std::iter::once(u64::from(level))
+        .chain(std::iter::once(leaf))
+        .chain(children.into_iter().flat_map(StructuralFingerprint::words));
+    StructuralFingerprint {
+        lo: hash_words(STRUCTURAL_FP_LO_DOMAIN, words.clone()),
+        hi: hash_words(STRUCTURAL_FP_HI_DOMAIN, words),
+    }
 }
 
 pub(crate) fn derive_seed(seed: u64, words: impl IntoIterator<Item = u64>) -> u64 {

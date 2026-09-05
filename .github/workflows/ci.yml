@@ -10,29 +10,36 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   cross-platform:
     name: Cross-platform (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, ubuntu-latest, windows-latest]
+        os: [macos-latest, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     env:
       RUSTDOCFLAGS: ${{ matrix.os == 'windows-latest' && '-C target-feature=+crt-static' || '' }}
+      ASIMPLELIFE_C_TEST_STATS: "1"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
       - name: Check every target and feature
         run: cargo check --workspace --all-targets --all-features
       - name: Run release tests
         run: cargo test --workspace --all-features --release -- --nocapture
+      - name: Verify ordinary binary coverage and static CRT artifacts
+        run: ${{ runner.os == 'Windows' && 'python' || 'python3' }} .github/scripts/verify_ci_binaries.py
 
   static-crt-musl:
     name: Static CRT (musl)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
         with:
           targets: x86_64-unknown-linux-musl
@@ -57,37 +64,6 @@ jobs:
             -type f -perm -111 -print)
           test "$count" -gt 0
 
-  static-crt-msvc:
-    name: Static CRT (MSVC)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/rust-setup
-      - name: Verify Cargo enables static CRT
-        shell: pwsh
-        run: |
-          $cfg = cargo rustc --lib --target x86_64-pc-windows-msvc -- --print cfg
-          if ($cfg -notcontains 'target_feature="crt-static"') {
-            throw 'Cargo did not enable the static MSVC CRT'
-          }
-      - name: Link release binaries against the static MSVC CRT
-        run: cargo build --workspace --all-features --release --target x86_64-pc-windows-msvc
-      - name: Reject dynamic MSVC CRT imports in every executable
-        shell: pwsh
-        run: |
-          $executables = Get-ChildItem target/x86_64-pc-windows-msvc/release/*.exe
-          if ($executables.Count -eq 0) {
-            throw 'MSVC build produced no executable artifacts'
-          }
-          foreach ($executable in $executables) {
-            $imports = llvm-readobj --coff-imports $executable.FullName
-            if ($LASTEXITCODE -ne 0) {
-              throw "failed to inspect $($executable.FullName)"
-            }
-            if ($imports -match '(?i)(vcruntime|msvcp|ucrtbase)[^\r\n]*\.dll') {
-              throw "dynamic MSVC CRT import found in $($executable.FullName)"
-            }
-          }
 
   native-kernels:
     name: Native kernels (${{ matrix.name }})
@@ -99,28 +75,34 @@ jobs:
             os: ubuntu-latest
             rustflags: -C target-feature=+avx2
           - name: AArch64 NEON
-            os: macos-14
+            os: macos-latest
             rustflags: -C target-feature=+neon
     runs-on: ${{ matrix.os }}
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
       - name: Differential-test native HashLife kernels
-        run: cargo test --release hashlife::kernels::tests -- --nocapture
+        run: cargo test --lib --release hashlife::kernels::tests -- --nocapture
+      - name: Differential-test compiler coefficient kernels
+        run: cargo test --lib --release bf::coefficient_kernels::tests -- --nocapture
+      - name: Differential-test generated polynomial and wide multiplication kernels
+        run: |
+          cargo test --lib --release bf::tests::polynomial_backend -- --nocapture
+          cargo test --lib --release bf::tests::c_super_runtime::wide_multiply -- --nocapture
       - name: Reject identity-order D4 canonicalization regressions
-        run: cargo test --release tests::hashlife_cache::hashlife_d4 -- --nocapture
+        run: cargo test --lib --release tests::hashlife_cache::hashlife_d4 -- --nocapture
       - name: Exercise generated-C native scan kernels
-        run: cargo test --release bf::tests::c_super_runtime::generated_c_scan_uses_the_runtime_selected_kernel -- --nocapture
+        run: cargo test --lib --release bf::tests::c_super_runtime::generated_c_scan_uses_the_runtime_selected_kernel -- --nocapture
       - name: Exercise generated-C native add and clear kernels
-        run: cargo test --release bf::tests::c_super_runtime::emitted_simd -- --nocapture
+        run: cargo test --lib --release bf::tests::c_super_runtime::emitted_simd -- --nocapture
       - name: Exercise generated-C native transfer kernels and alias fallback
-        run: cargo test --release bf::tests::c_super_runtime::emitted_distribute_uses_transfer_kernel_and_wrapped_aliases_fall_back -- --nocapture
+        run: cargo test --lib --release bf::tests::c_super_runtime::emitted_distribute_uses_transfer_kernel_and_wrapped_aliases_fall_back -- --nocapture
       - name: Exercise generated-C native summary and probe kernels
-        run: cargo test --release bf::tests::c_super_runtime::super_c_runtime_summary_and_probe_use_their_kernel_families -- --nocapture
+        run: cargo test --lib --release bf::tests::c_super_runtime::super_c_runtime_summary_and_probe_use_their_kernel_families -- --nocapture
       - name: Differential-test generated-C native kernels against scalar
-        run: cargo test --release bf::tests::c_super_runtime::generated_c_batched_kernels_match_forced_scalar_with_wrapped_addresses -- --nocapture
+        run: cargo test --lib --release bf::tests::c_super_runtime::generated_c_batched_kernels_match_forced_scalar_with_wrapped_addresses -- --nocapture
 
   scalar-fallback:
     name: Forced scalar fallback
@@ -128,29 +110,31 @@ jobs:
     env:
       ASIMPLELIFE_HASHLIFE_KERNEL: scalar
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
       - name: Run scalar kernel differential tests
-        run: cargo test --release hashlife::kernels::tests -- --nocapture
+        run: cargo test --lib --release hashlife::kernels::tests -- --nocapture
       - name: Run HashLife correctness under scalar dispatch
-        run: cargo test --release tests::hashlife_correctness -- --nocapture
+        run: cargo test --lib --release tests::hashlife_correctness -- --nocapture
 
   generated-c:
     name: Generated C strict and sanitizer gates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
       - name: Compile strict C23-compatible templates
-        run: cargo test template_compiles_standalone_under_strict_c23_compatibility_mode -- --nocapture
+        run: cargo test --lib template_compiles_standalone_under_strict_c23_compatibility_mode -- --nocapture
       - name: Run generated-C ASan and UBSan regressions
-        run: cargo test runtime_is_clean_under_asan_ubsan -- --nocapture
+        run: |
+          cargo test --lib runtime_is_clean_under_asan_ubsan -- --nocapture
+          cargo test --lib bf::tests::polynomial_backend -- --nocapture
 
   quality:
     name: Formatting, policies, and strict Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
         with:
           components: clippy, rustfmt
@@ -159,7 +143,7 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check source policies
-        run: cargo test --all-features source_shape -- --nocapture
+        run: cargo test --lib --all-features source_shape -- --nocapture
       - name: Run strict Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -171,7 +155,7 @@ jobs:
       MIRIFLAGS: -Zmiri-strict-provenance
       ASIMPLELIFE_HASHLIFE_KERNEL: scalar
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
         with:
           toolchain: nightly
@@ -185,6 +169,8 @@ jobs:
           cargo miri test --lib probe_table::tests::fallible_reserve_rejects_capacity_overflow_without_mutation -- --exact --test-threads=1
       - name: Check centralized scalar mixers
         run: cargo miri test --lib hashing::tests::murmur3_fmix64_matches_reference_vectors -- --exact --test-threads=1
+      - name: Check bounded compiler coefficient slice contracts
+        run: cargo miri test --lib bf::coefficient_kernels::tests -- --test-threads=1
       - name: Check bounded allocation, population, and scalar kernel contracts
         run: |
           cargo miri test --lib hashlife::memory::tests::replacement_reservation_does_not_charge_retained_bytes_twice -- --exact --test-threads=1

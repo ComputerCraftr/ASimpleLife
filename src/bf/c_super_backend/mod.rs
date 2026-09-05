@@ -1,14 +1,19 @@
 use crate::RequiredExt;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::c_support::normalized_c_offset;
 use super::ir::{BfIr, ShiftDir, validate_canonical_ir};
 use super::summary::SymbolicTransfer;
-use super::symbolic::{SYMBOLIC_TERM_MAX, SymbolicMonomial, SymbolicPolynomial};
+#[cfg(test)]
+use super::symbolic::SymbolicMonomial;
+use super::symbolic::{PolynomialSemantics, SubstitutionBudget, SymbolicPolynomial};
 
 mod analysis;
+mod budget;
 mod emit;
 mod planner;
+mod powers;
 
 pub use emit::emit_c_super;
 
@@ -143,7 +148,15 @@ pub(super) struct PoweredLoopAnalysis {
     pub(super) body: NodeId,
     pub(super) guard_offset: crate::bf::BfOffset,
     pub(super) guard_delta: i64,
-    pub(super) powers: Vec<SymbolicTransfer>,
+    pub(super) powers: Arc<[SymbolicTransfer]>,
+}
+
+impl PoweredLoopAnalysis {
+    pub(super) fn only_drains_guard(&self) -> bool {
+        self.powers.first().is_some_and(|power| {
+            power.effects.len() == 1 && power.effects.contains_key(&self.guard_offset)
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -193,16 +206,76 @@ pub(super) struct EmitterEngine {
     pub(super) exact_specs: HashMap<NodeId, Option<ExactMemoSpec>>,
     pub(super) loop_analyses: HashMap<NodeId, Option<LoopAnalysis>>,
     pub(super) plan_decisions: HashMap<NodeId, PlanDecision>,
+    pub(super) opts: super::CodegenOpts,
+    pub(super) polynomial_semantics: Option<PolynomialSemantics>,
+    pub(super) compile_work: CompileWork,
+    pub(super) power_cache: HashMap<SymbolicTransfer, Arc<[SymbolicTransfer]>>,
+}
+
+#[derive(Default, Debug)]
+pub(super) struct CompileWork {
+    pub(super) budget: budget::SymbolicBudget,
+    pub(super) compositions: usize,
+    pub(super) powers_built: usize,
+    pub(super) power_attempts: usize,
+    pub(super) expanded_products: usize,
+    pub(super) power_cache_hits: usize,
+    pub(super) coefficient_kernels: super::coefficient_kernels::CoefficientKernelAccounting,
+    pub(super) peak_scratch_lanes: usize,
+}
+
+impl CompileWork {
+    pub(super) fn admit_evaluation(&mut self, transfer: &SymbolicTransfer) -> bool {
+        self.budget.admit_evaluation(transfer)
+    }
+
+    fn record_substitution(&mut self, budget: &SubstitutionBudget) {
+        self.expanded_products += budget.products();
+        let kernels = budget.kernel_accounting();
+        self.coefficient_kernels.native_avx2_lanes += kernels.native_avx2_lanes;
+        self.coefficient_kernels.native_neon_lanes += kernels.native_neon_lanes;
+        self.coefficient_kernels.scalar_lanes += kernels.scalar_lanes;
+        self.peak_scratch_lanes = self.peak_scratch_lanes.max(budget.scratch_lanes());
+    }
 }
 
 impl EmitterEngine {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
+        Self::with_opts(super::CodegenOpts {
+            io_mode: super::IoMode::Char,
+            cell_bits: 63,
+            input_bits: None,
+            output_bits: None,
+            cell_sign: super::CellSign::Unsigned,
+        })
+    }
+
+    pub(super) fn with_opts(opts: super::CodegenOpts) -> Self {
+        Self::with_symbolic_limits(opts, budget::SymbolicLimits::default())
+    }
+
+    pub(super) fn with_symbolic_limits(
+        opts: super::CodegenOpts,
+        limits: budget::SymbolicLimits,
+    ) -> Self {
         Self {
             interner: Interner::default(),
             transfers: HashMap::new(),
             exact_specs: HashMap::new(),
             loop_analyses: HashMap::new(),
             plan_decisions: HashMap::new(),
+            opts,
+            polynomial_semantics: PolynomialSemantics::new(
+                opts.cell_bits,
+                opts.cell_sign,
+                SUPER_C_TAPE_LEN,
+            ),
+            compile_work: CompileWork {
+                budget: budget::SymbolicBudget::new(limits),
+                ..CompileWork::default()
+            },
+            power_cache: HashMap::new(),
         }
     }
 
@@ -323,4 +396,28 @@ impl EmitterEngine {
             }
         }
     }
+}
+
+#[cfg(test)]
+pub(super) fn summarize_c_region(
+    program: &[BfIr],
+    opts: super::CodegenOpts,
+) -> Option<SymbolicTransfer> {
+    summarize_c_region_with_work(program, opts, &mut CompileWork::default())
+}
+
+pub(super) fn summarize_c_region_with_work(
+    program: &[BfIr],
+    opts: super::CodegenOpts,
+    work: &mut CompileWork,
+) -> Option<SymbolicTransfer> {
+    let mut engine = EmitterEngine::with_opts(opts);
+    engine.compile_work = std::mem::take(work);
+    let root = engine.build_program(program);
+    engine.transfer(root);
+    *work = engine.compile_work;
+    engine
+        .transfers
+        .remove(&root)
+        .filter(|transfer| transfer.is_pure_windowed() && transfer.ptr_delta == 0)
 }

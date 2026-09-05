@@ -3,12 +3,12 @@ use crate::RequiredExt;
 use crate::bitgrid::BitGrid;
 use crate::bitgrid::Coord;
 use crate::cache_policy::should_run_active_hashlife_gc;
-use crate::flat_table::{FlatKey, FlatTable};
 use crate::hashing::{
-    hash_packed_jump_fingerprint, hash_packed_node_fingerprint, hash_u64_words_with_level,
-    hash_u64_words_with_level_batch, hash_words, mix64,
+    StructuralFingerprint, hash_packed_jump_fingerprint, hash_packed_node_fingerprint,
+    hash_u64_words_with_level, hash_u64_words_with_level_batch, hash_words, mix64,
+    structural_leaf_fingerprint, structural_node_fingerprint,
 };
-use crate::probe_table::{ProbeMode, ProbeTable};
+use crate::probe_table::{ProbeKey, ProbeMode, ProbeTable};
 use crate::simd_layout::{
     AlignedU32Batch, AlignedU64WordBatch4, AlignedU64WordBatch9, SIMD_BATCH_LANES,
 };
@@ -19,16 +19,19 @@ use wide::u64x8;
 
 mod advance;
 mod arena;
+mod cache_lifecycle;
 mod canonical;
 mod embed;
+mod future;
 mod gc;
 mod geometry;
+mod handles;
 mod kernels;
 mod memory;
 mod node;
 mod population;
 mod scheduler;
-mod session;
+pub(crate) mod session;
 mod session_types;
 mod signature;
 mod simd;
@@ -48,8 +51,10 @@ pub use session_types::{
 };
 pub use signature::{HashLifeStateCheckpoint, HashLifeStateIdentity};
 pub use snapshot::{
-    HashLifeSnapshotError, deserialize_to_grid as deserialize_snapshot_to_grid,
-    serialize_grid as serialize_grid_snapshot,
+    HashLifeSnapshotError, OwnedHashLifeSnapshot,
+    deserialize_from_reader as deserialize_snapshot_from_reader,
+    deserialize_to_grid as deserialize_snapshot_to_grid, serialize_grid as serialize_grid_snapshot,
+    serialize_grid_to_writer as serialize_grid_snapshot_to_writer,
 };
 use stats::*;
 #[cfg(test)]
@@ -63,9 +68,8 @@ pub use stats::{
     HASHLIFE_FULL_GRID_MAX_POPULATION,
 };
 
-type NodeId = u32;
-type PackedTransformId = u32;
-type CanonicalNodeRef = u32;
+use handles::{CanonicalShapeId, NodeId, PackedTransformId};
+type CanonicalNodeRef = CanonicalShapeId;
 use arena::NodeColumns;
 use memory::{EngineAllocationFailure, EngineIdCapacity};
 use population::PopulationStat;
@@ -114,27 +118,110 @@ impl Eq for CanonicalJumpKey {}
 impl CanonicalJumpKey {
     fn empty() -> Self {
         Self {
-            structural: CanonicalStructKey::new(0, [0; 4]),
+            structural: CanonicalStructKey::leaf(false),
             step_exp: 0,
             symmetry_admitted: false,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CanonicalStructKey {
     level: u32,
     children: [CanonicalNodeRef; 4],
+    fingerprint: StructuralFingerprint,
 }
 
 impl CanonicalStructKey {
-    fn new(level: u32, children: [CanonicalNodeRef; 4]) -> Self {
-        Self { level, children }
+    fn leaf(alive: bool) -> Self {
+        Self {
+            level: 0,
+            children: [
+                if alive {
+                    CanonicalShapeId::LIVE
+                } else {
+                    CanonicalShapeId::DEAD
+                },
+                CanonicalShapeId::DEAD,
+                CanonicalShapeId::DEAD,
+                CanonicalShapeId::DEAD,
+            ],
+            fingerprint: structural_leaf_fingerprint(alive),
+        }
     }
 
-    fn leaf(alive: bool) -> Self {
-        Self::new(0, [u32::from(alive), 0, 0, 0])
+    #[cfg(test)]
+    fn synthetic(level: u32, children: [CanonicalNodeRef; 4]) -> Self {
+        let child_fingerprints = children.map(|child| {
+            structural_node_fingerprint(
+                0,
+                [
+                    structural_leaf_fingerprint(child.raw() & 1 != 0),
+                    structural_leaf_fingerprint(child.raw() & 2 != 0),
+                    structural_leaf_fingerprint(child.raw() & 4 != 0),
+                    structural_leaf_fingerprint(child.raw() & 8 != 0),
+                ],
+            )
+        });
+        Self {
+            level,
+            children,
+            fingerprint: structural_node_fingerprint(level, child_fingerprints),
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SemanticPrefix {
+    words: [u64; 2],
+    bit_len: u16,
+    complete: bool,
+}
+
+impl SemanticPrefix {
+    const LIMIT: usize = 128;
+
+    fn leaf(alive: bool) -> Self {
+        Self {
+            words: [u64::from(alive) << 63, 0],
+            bit_len: 1,
+            complete: true,
+        }
+    }
+
+    fn parent(children: [Self; 4]) -> Self {
+        let mut result = Self::default();
+        let mut output_bit = 0_usize;
+        for child in children {
+            let child_len = usize::from(child.bit_len);
+            for child_bit in 0..child_len {
+                if output_bit == Self::LIMIT {
+                    break;
+                }
+                let bit = (child.words[child_bit / 64] >> (63 - child_bit % 64)) & 1;
+                result.words[output_bit / 64] |= bit << (63 - output_bit % 64);
+                output_bit += 1;
+            }
+            if output_bit == Self::LIMIT {
+                break;
+            }
+        }
+        result.bit_len = u16::try_from(output_bit).or_invariant("semantic prefix exceeds 128 bits");
+        result.complete = children.iter().all(|child| child.complete)
+            && children
+                .iter()
+                .map(|child| usize::from(child.bit_len))
+                .sum::<usize>()
+                <= Self::LIMIT;
+        result
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CanonicalShapeMeta {
+    key: CanonicalStructKey,
+    prefix: SemanticPrefix,
+    stabilizer: u8,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -157,20 +244,6 @@ impl PartialEq for PackedNodeKey {
 
 impl Eq for PackedNodeKey {}
 
-impl PartialOrd for PackedNodeKey {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for PackedNodeKey {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.level
-            .cmp(&other.level)
-            .then_with(|| self.children.cmp(&other.children))
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(test)]
 struct TransformCacheKey {
@@ -185,15 +258,9 @@ struct PackedSymmetryKey {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PackedTransformCompareKey {
-    left: PackedTransformId,
-    right: PackedTransformId,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PackedTransformShapeKey {
     level: u32,
-    children: [CanonicalNodeRef; 4],
+    children: [PackedTransformId; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,19 +274,8 @@ struct PackedTransformNode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PackedTransformOrderEntry {
     structural: CanonicalStructKey,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SymmetryRefKey {
-    node: NodeId,
-    symmetry: Symmetry,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DirectCanonicalParentKey {
-    level: u32,
-    symmetry: Symmetry,
-    children: [CanonicalNodeRef; 4],
+    aliases: u8,
+    stabilizer: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -296,20 +352,20 @@ pub(super) struct EmbedLayoutCacheKey {
     span: Coord,
 }
 
-impl FlatKey for PackedNodeKey {
+impl ProbeKey for PackedNodeKey {
     fn fingerprint(&self) -> u64 {
         hash_packed_node_fingerprint(self.level, self.children.map(u64::from))
     }
 }
 
-impl FlatKey for CanonicalStructKey {
+impl ProbeKey for CanonicalStructKey {
     fn fingerprint(&self) -> u64 {
-        hash_u64_words_with_level(self.level, self.children.map(u64::from))
+        self.fingerprint.probe_hash()
     }
 }
 
 #[cfg(test)]
-impl FlatKey for TransformCacheKey {
+impl ProbeKey for TransformCacheKey {
     fn fingerprint(&self) -> u64 {
         hash_words(
             0x5452_414E_5346_4F52,
@@ -318,7 +374,7 @@ impl FlatKey for TransformCacheKey {
     }
 }
 
-impl FlatKey for PackedSymmetryKey {
+impl ProbeKey for PackedSymmetryKey {
     fn fingerprint(&self) -> u64 {
         hash_words(
             0x5041_434B_5359_4D4D,
@@ -327,34 +383,13 @@ impl FlatKey for PackedSymmetryKey {
     }
 }
 
-impl FlatKey for DirectCanonicalParentKey {
-    fn fingerprint(&self) -> u64 {
-        hash_words(
-            0x4449_5245_4354_5041,
-            [
-                hash_u64_words_with_level(self.level, self.children.map(u64::from)),
-                self.symmetry.fingerprint_code(),
-            ],
-        )
-    }
-}
-
-impl FlatKey for PackedTransformCompareKey {
-    fn fingerprint(&self) -> u64 {
-        hash_words(
-            0x434F_4D50_4152_4521,
-            [u64::from(self.left), u64::from(self.right)],
-        )
-    }
-}
-
-impl FlatKey for PackedTransformShapeKey {
+impl ProbeKey for PackedTransformShapeKey {
     fn fingerprint(&self) -> u64 {
         hash_u64_words_with_level(self.level, self.children.map(u64::from))
     }
 }
 
-impl FlatKey for JumpQuery {
+impl ProbeKey for JumpQuery {
     fn fingerprint(&self) -> u64 {
         hash_words(
             0x4A55_4D50_5155_4552,
@@ -363,22 +398,19 @@ impl FlatKey for JumpQuery {
     }
 }
 
-impl FlatKey for NodeId {
+impl ProbeKey for NodeId {
     fn fingerprint(&self) -> u64 {
         mix64(u64::from(*self))
     }
 }
 
-impl FlatKey for SymmetryRefKey {
+impl ProbeKey for CanonicalShapeId {
     fn fingerprint(&self) -> u64 {
-        hash_words(
-            0x5359_4D4D_4554_5259,
-            [u64::from(self.node), self.symmetry.fingerprint_code()],
-        )
+        hash_words(0x5359_4D4D_4554_5259, [u64::from(*self)])
     }
 }
 
-impl FlatKey for ShellKey {
+impl ProbeKey for ShellKey {
     fn fingerprint(&self) -> u64 {
         hash_words(
             0x5348_454C_4C5F_4B45,
@@ -387,7 +419,7 @@ impl FlatKey for ShellKey {
     }
 }
 
-impl FlatKey for CanonicalJumpKey {
+impl ProbeKey for CanonicalJumpKey {
     fn fingerprint(&self) -> u64 {
         let fingerprint =
             hash_packed_jump_fingerprint(self.structural.fingerprint(), self.step_exp);
@@ -464,9 +496,8 @@ struct ResultCaches {
 #[derive(Debug)]
 struct TransformState {
     #[cfg(test)]
-    cache: FlatTable<TransformCacheKey, NodeId>,
+    cache: ProbeTable<TransformCacheKey, NodeId>,
     canonical_cache: ProbeTable<PackedSymmetryKey, PackedTransformId>,
-    compare_cache: ProbeTable<PackedTransformCompareKey, i8>,
     intern: ProbeTable<PackedTransformShapeKey, PackedTransformId>,
     nodes: Vec<PackedTransformNode>,
     materialized: Vec<Option<NodeId>>,
@@ -475,7 +506,9 @@ struct TransformState {
 
 #[derive(Debug)]
 struct CanonicalCaches {
+    shape_epoch: u64,
     shape_intern: ProbeTable<CanonicalStructKey, CanonicalNodeRef>,
+    shapes: Vec<CanonicalShapeMeta>,
     node: ProbeTable<NodeId, CanonicalNodeIdentity>,
     packed: ProbeTable<PackedNodeKey, CanonicalNodeIdentity>,
     hot_packed: ProbeTable<PackedNodeKey, CanonicalNodeIdentity>,
@@ -483,10 +516,10 @@ struct CanonicalCaches {
     oriented: ProbeTable<PackedSymmetryKey, CanonicalNodeIdentity>,
     hot_oriented: ProbeTable<PackedSymmetryKey, CanonicalNodeIdentity>,
     hot_oriented_budget: usize,
-    direct_parent: ProbeTable<DirectCanonicalParentKey, CanonicalNodeIdentity>,
-    hot_direct_parent: ProbeTable<DirectCanonicalParentKey, CanonicalNodeIdentity>,
+    direct_parent: ProbeTable<CanonicalStructKey, CanonicalNodeIdentity>,
+    hot_direct_parent: ProbeTable<CanonicalStructKey, CanonicalNodeIdentity>,
     hot_direct_parent_budget: usize,
-    symmetry_refs: ProbeTable<SymmetryRefKey, CanonicalNodeRef>,
+    symmetry_refs: ProbeTable<CanonicalShapeId, canonical::orientations::OrientationRecord>,
 }
 
 #[derive(Debug)]
@@ -498,6 +531,7 @@ pub struct HashLifeEngine {
     active_jump_results: ProbeTable<CanonicalJumpKey, PackedSymmetryKey>,
     transform_state: TransformState,
     canonical_caches: CanonicalCaches,
+    future_state: future::FutureState,
     embed_layout_cache: HashMap<EmbedLayoutCacheKey, Coord>,
     retained_roots: Vec<NodeId>,
     dead_leaf: NodeId,
@@ -509,6 +543,7 @@ pub struct HashLifeEngine {
     allocation_hard_limit: u128,
     allocation_transient_reserved: u128,
     allocation_failure: Option<EngineAllocationFailure>,
+    advance_cancellation: Option<[std::sync::Arc<std::sync::atomic::AtomicBool>; 2]>,
     id_capacity: EngineIdCapacity,
     #[cfg(test)]
     symmetry_gate_override: Option<(u32, u64)>,
@@ -547,16 +582,17 @@ impl Default for HashLifeEngine {
             active_jump_results: ProbeTable::new(ProbeMode::Mutable),
             transform_state: TransformState {
                 #[cfg(test)]
-                cache: FlatTable::with_capacity(64),
+                cache: ProbeTable::with_capacity(ProbeMode::Scratch, 64),
                 canonical_cache: ProbeTable::new(ProbeMode::RebuildOnGc),
-                compare_cache: ProbeTable::new(ProbeMode::RebuildOnGc),
                 intern: ProbeTable::new(ProbeMode::AppendOnly),
                 nodes: Vec::new(),
                 materialized: Vec::new(),
                 packed_roots: Vec::new(),
             },
             canonical_caches: CanonicalCaches {
+                shape_epoch: 0,
                 shape_intern: ProbeTable::new(ProbeMode::AppendOnly),
+                shapes: Vec::new(),
                 node: ProbeTable::new(ProbeMode::RebuildOnGc),
                 packed: ProbeTable::new(ProbeMode::RebuildOnGc),
                 hot_packed: ProbeTable::new(ProbeMode::Mutable),
@@ -569,10 +605,11 @@ impl Default for HashLifeEngine {
                 hot_direct_parent_budget: 0,
                 symmetry_refs: ProbeTable::new(ProbeMode::RebuildOnGc),
             },
+            future_state: future::FutureState::new(0),
             embed_layout_cache: HashMap::new(),
-            retained_roots: Vec::new(),
-            dead_leaf: 0,
-            live_leaf: 0,
+            retained_roots: Vec::with_capacity(1),
+            dead_leaf: NodeId::ZERO,
+            live_leaf: NodeId::ZERO,
             arena_epoch: 0,
             last_gc_nodes: 0,
             scheduler_active: false,
@@ -580,6 +617,7 @@ impl Default for HashLifeEngine {
             allocation_hard_limit: u128::MAX,
             allocation_transient_reserved: 0,
             allocation_failure: None,
+            advance_cancellation: None,
             id_capacity: EngineIdCapacity::FULL,
             #[cfg(test)]
             symmetry_gate_override: None,
@@ -592,144 +630,6 @@ impl Default for HashLifeEngine {
 }
 
 impl HashLifeEngine {
-    fn intern_canonical_shape(&mut self, structural: CanonicalStructKey) -> CanonicalNodeRef {
-        if let Some(existing) = self.canonical_caches.shape_intern.get(&structural) {
-            return existing;
-        }
-        if !self.prepare_mandatory_shape_growth() {
-            return 0;
-        }
-        let Ok(id) = CanonicalNodeRef::try_from(self.canonical_caches.shape_intern.len()) else {
-            self.reject_canonical_reference_exhaustion();
-            return 0;
-        };
-        if self
-            .canonical_caches
-            .shape_intern
-            .try_insert(structural, id)
-            .is_err()
-        {
-            self.reject_allocation(u128::MAX);
-            return 0;
-        }
-        id
-    }
-
-    fn rebuild_canonical_shapes(&mut self) {
-        self.canonical_caches.shape_intern.clear();
-        self.canonical_caches.symmetry_refs.clear();
-        let dead_shape = self.intern_canonical_shape(CanonicalStructKey::leaf(false));
-        let live_shape = self.intern_canonical_shape(CanonicalStructKey::leaf(true));
-        debug_assert_eq!((dead_shape, live_shape), (0, 1));
-        for index in 0..self.node_columns.len() {
-            let node =
-                NodeId::try_from(index).or_invariant("HashLife node arena exceeded u32 capacity");
-            let identity_ref = self.build_node_identity_ref(
-                self.node_columns.level(node),
-                self.node_columns.quadrants(node),
-                self.node_columns.population(node),
-            );
-            self.node_columns.set_identity_ref(node, identity_ref);
-        }
-    }
-
-    fn build_node_identity_ref(
-        &mut self,
-        level: u32,
-        children: [NodeId; 4],
-        population: u128,
-    ) -> CanonicalNodeRef {
-        if level == 0 {
-            return u32::from(population != 0);
-        }
-
-        let order_children = children.map(|child| self.node_columns.identity_ref(child));
-        self.intern_canonical_shape(CanonicalStructKey::new(level, order_children))
-    }
-
-    fn cached_symmetry_ref(&self, node: NodeId, symmetry: Symmetry) -> Option<CanonicalNodeRef> {
-        if symmetry == Symmetry::Identity || self.node_columns.level(node) == 0 {
-            return Some(self.node_columns.identity_ref(node));
-        }
-        self.canonical_caches
-            .symmetry_refs
-            .get(&SymmetryRefKey { node, symmetry })
-    }
-
-    fn symmetry_canonical_ref(&mut self, node: NodeId, symmetry: Symmetry) -> CanonicalNodeRef {
-        if let Some(cached) = self.cached_symmetry_ref(node, symmetry) {
-            return cached;
-        }
-
-        const MAX_SYMMETRY_STACK: usize = 256;
-        let mut stack = [(0, false); MAX_SYMMETRY_STACK];
-        stack[0] = (node, false);
-        let mut stack_len = 1;
-        while stack_len != 0 {
-            stack_len -= 1;
-            let (current, ready) = stack[stack_len];
-            if self.cached_symmetry_ref(current, symmetry).is_some() {
-                continue;
-            }
-            if !ready {
-                if stack_len + 5 > stack.len() {
-                    crate::invariant_failure!(
-                        "validated symmetry traversal depth exceeded fixed workspace"
-                    );
-                }
-                stack[stack_len] = (current, true);
-                stack_len += 1;
-                let children = self.node_columns.quadrants(current);
-                for child in children {
-                    if self.cached_symmetry_ref(child, symmetry).is_none() {
-                        stack[stack_len] = (child, false);
-                        stack_len += 1;
-                    }
-                }
-                continue;
-            }
-
-            let children = self.node_columns.quadrants(current);
-            let permutation = symmetry.quadrant_perm();
-            let order_children = permutation.map(|child_index| {
-                self.cached_symmetry_ref(children[child_index], symmetry)
-                    .or_invariant("child symmetry reference should be resolved")
-            });
-            let structural =
-                CanonicalStructKey::new(self.node_columns.level(current), order_children);
-            let canonical_ref = self.intern_canonical_shape(structural);
-            if !self.record_mandatory_symmetry_ref(
-                SymmetryRefKey {
-                    node: current,
-                    symmetry,
-                },
-                canonical_ref,
-            ) {
-                return 0;
-            }
-        }
-
-        match self.cached_symmetry_ref(node, symmetry) {
-            Some(reference) => reference,
-            None if self.allocation_failed() => 0,
-            None => crate::invariant_failure!("requested symmetry reference should be resolved"),
-        }
-    }
-
-    fn symmetry_entry(&mut self, node: NodeId, symmetry: Symmetry) -> PackedTransformOrderEntry {
-        let level = self.node_columns.level(node);
-        if level == 0 {
-            let structural = CanonicalStructKey::leaf(self.node_columns.population(node) != 0);
-            return PackedTransformOrderEntry { structural };
-        }
-        let children = self.node_columns.quadrants(node);
-        let permutation = symmetry.quadrant_perm();
-        let order_children = permutation
-            .map(|child_index| self.symmetry_canonical_ref(children[child_index], symmetry));
-        let structural = CanonicalStructKey::new(level, order_children);
-        PackedTransformOrderEntry { structural }
-    }
-
     fn record_fingerprint_probe(&mut self, used_cached_fingerprint: bool, count: usize) {
         if used_cached_fingerprint {
             self.stats.canonical_fallback.cached_fingerprint_probes += count;
@@ -754,41 +654,13 @@ impl HashLifeEngine {
     }
 
     fn allocated_bytes(&self) -> usize {
-        let result_cache_bytes = self.result_caches.jump.allocated_bytes()
-            + self.result_caches.root.allocated_bytes()
-            + self.result_caches.overlap.allocated_bytes()
-            + self.result_caches.oriented.allocated_bytes()
-            + self.result_caches.materialized_packed.allocated_bytes()
-            + self.result_caches.structural_fast_path.allocated_bytes()
-            + self
-                .result_caches
-                .packed_structural_fast_path
-                .allocated_bytes();
-        let result_cache_bytes = result_cache_bytes
-            + self.result_caches.shells.allocated_bytes()
-            + self.result_caches.bounds.allocated_bytes()
-            + self.active_jump_results.allocated_bytes();
-        let canonical_cache_bytes = self.canonical_caches.shape_intern.allocated_bytes()
-            + self.canonical_caches.node.allocated_bytes()
-            + self.canonical_caches.packed.allocated_bytes()
-            + self.canonical_caches.hot_packed.allocated_bytes()
-            + self.canonical_caches.oriented.allocated_bytes()
-            + self.canonical_caches.hot_oriented.allocated_bytes()
-            + self.canonical_caches.direct_parent.allocated_bytes()
-            + self.canonical_caches.hot_direct_parent.allocated_bytes()
-            + self.canonical_caches.symmetry_refs.allocated_bytes();
-        let transform_bytes = self.transform_state.canonical_cache.allocated_bytes()
-            + self.transform_state.compare_cache.allocated_bytes()
-            + self.transform_state.intern.allocated_bytes()
-            + self.transform_state.nodes.capacity() * std::mem::size_of::<PackedTransformNode>()
-            + self.transform_state.materialized.capacity() * std::mem::size_of::<Option<NodeId>>()
-            + self.transform_state.packed_roots.capacity()
-                * std::mem::size_of::<Option<PackedNodeKey>>();
         self.node_columns.allocated_bytes()
             + self.intern.allocated_bytes()
-            + result_cache_bytes
-            + canonical_cache_bytes
-            + transform_bytes
+            + self.result_caches.allocated_bytes()
+            + self.active_jump_results.allocated_bytes()
+            + self.canonical_caches.allocated_bytes()
+            + self.transform_state.allocated_bytes()
+            + self.future_state.allocated_bytes()
             + self.empty_by_level.capacity() * std::mem::size_of::<NodeId>()
             + self.retained_roots.capacity() * std::mem::size_of::<NodeId>()
             + self.embed_layout_cache.capacity()
@@ -808,7 +680,9 @@ impl HashLifeEngine {
             .or_invariant("HashLife node arena exceeded u32 capacity");
         if level != 0 {
             debug_assert!(
-                [nw, ne, sw, se].into_iter().all(|child| child < node_id),
+                [nw, ne, sw, se]
+                    .into_iter()
+                    .all(|child| child.precedes(node_id)),
                 "HashLife arena topology requires every child id to precede its parent"
             );
         }
@@ -820,6 +694,14 @@ impl HashLifeEngine {
     }
 
     fn packed_leaf_key(alive: bool) -> PackedNodeKey {
-        PackedNodeKey::new(0, [u32::from(alive), 0, 0, 0])
+        PackedNodeKey::new(
+            0,
+            [
+                NodeId::from(alive),
+                NodeId::ZERO,
+                NodeId::ZERO,
+                NodeId::ZERO,
+            ],
+        )
     }
 }

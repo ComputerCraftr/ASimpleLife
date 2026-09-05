@@ -73,17 +73,20 @@ pub(super) struct NodeColumns {
 }
 
 impl NodeColumns {
-    pub(super) fn growth_reservation_bytes(&self) -> u128 {
-        if self.len < self.capacity() {
-            return 0;
-        }
-        let segment_bytes = NodeSegment::allocated_bytes() as u128;
-        let header_bytes = if self.segments.len() == self.segments.capacity() {
-            size_of::<NodeSegment>() as u128
-        } else {
-            0
-        };
-        segment_bytes + header_bytes
+    pub(super) fn growth_reservation_bytes_for(&self, additional: usize) -> u128 {
+        let required = self.len.saturating_add(additional);
+        let missing_rows = required.saturating_sub(self.capacity());
+        let missing_segments = missing_rows.div_ceil(NODE_SEGMENT_LEN);
+        let segment_bytes =
+            (missing_segments as u128).saturating_mul(NodeSegment::allocated_bytes() as u128);
+        let missing_headers = self
+            .segments
+            .len()
+            .saturating_add(missing_segments)
+            .saturating_sub(self.segments.capacity());
+        segment_bytes.saturating_add(
+            (missing_headers as u128).saturating_mul(size_of::<NodeSegment>() as u128),
+        )
     }
 
     pub(super) fn len(&self) -> usize {
@@ -104,13 +107,16 @@ impl NodeColumns {
             + self.segments.capacity() * size_of::<NodeSegment>()
     }
 
-    pub(super) fn try_reserve_node(&mut self) -> Result<(), TryReserveError> {
-        if self.len < self.capacity() {
+    pub(super) fn try_reserve_nodes(&mut self, additional: usize) -> Result<(), TryReserveError> {
+        let required = self.len.saturating_add(additional);
+        if required <= self.capacity() {
             return Ok(());
         }
-        let segment = NodeSegment::try_new()?;
-        self.segments.try_reserve_exact(1)?;
-        self.segments.push(segment);
+        let missing_segments = (required - self.capacity()).div_ceil(NODE_SEGMENT_LEN);
+        self.segments.try_reserve_exact(missing_segments)?;
+        for _ in 0..missing_segments {
+            self.segments.push(NodeSegment::try_new()?);
+        }
         Ok(())
     }
 
@@ -147,7 +153,7 @@ impl NodeColumns {
     }
 
     pub(super) fn level(&self, node: NodeId) -> u32 {
-        let (segment, row) = self.location(node as usize);
+        let (segment, row) = self.location(node.index());
         u32::from(segment.levels[row])
     }
 
@@ -156,7 +162,7 @@ impl NodeColumns {
     }
 
     pub(super) fn population_stat(&self, node: NodeId) -> PopulationStat {
-        let (segment, row) = self.location(node as usize);
+        let (segment, row) = self.location(node.index());
         PopulationStat {
             lo: segment.population_los[row],
             hi: segment.population_his[row],
@@ -169,7 +175,7 @@ impl NodeColumns {
     }
 
     pub(super) fn quadrants(&self, node: NodeId) -> [NodeId; 4] {
-        let (segment, row) = self.location(node as usize);
+        let (segment, row) = self.location(node.index());
         [
             segment.nws[row],
             segment.nes[row],
@@ -179,7 +185,7 @@ impl NodeColumns {
     }
 
     pub(super) fn set_quadrants(&mut self, node: NodeId, children: [NodeId; 4]) {
-        let (segment, row) = self.location_mut(node as usize);
+        let (segment, row) = self.location_mut(node.index());
         let [nw, ne, sw, se] = children;
         segment.nws[row] = nw;
         segment.nes[row] = ne;
@@ -188,28 +194,36 @@ impl NodeColumns {
     }
 
     pub(super) fn fingerprint(&self, node: NodeId) -> u64 {
-        let (segment, row) = self.location(node as usize);
+        let (segment, row) = self.location(node.index());
         segment.fingerprints[row]
     }
 
     pub(super) fn set_fingerprint(&mut self, node: NodeId, fingerprint: u64) {
-        let (segment, row) = self.location_mut(node as usize);
+        let (segment, row) = self.location_mut(node.index());
         segment.fingerprints[row] = fingerprint;
     }
 
     pub(super) fn identity_ref(&self, node: NodeId) -> CanonicalNodeRef {
-        let (segment, row) = self.location(node as usize);
+        let (segment, row) = self.location(node.index());
         segment.identity_refs[row]
     }
 
     pub(super) fn set_identity_ref(&mut self, node: NodeId, identity: CanonicalNodeRef) {
-        let (segment, row) = self.location_mut(node as usize);
+        let (segment, row) = self.location_mut(node.index());
         segment.identity_refs[row] = identity;
     }
 
     pub(super) fn packed_key(&self, node: NodeId) -> PackedNodeKey {
         if self.level(node) == 0 {
-            return PackedNodeKey::new(0, [u32::from(self.population_stat(node).lo != 0), 0, 0, 0]);
+            return PackedNodeKey::new(
+                0,
+                [
+                    NodeId::from(self.population_stat(node).lo != 0),
+                    NodeId::ZERO,
+                    NodeId::ZERO,
+                    NodeId::ZERO,
+                ],
+            );
         }
         PackedNodeKey::new(self.level(node), self.quadrants(node))
     }
@@ -258,7 +272,7 @@ impl NodeColumns {
     }
 
     pub(super) fn mark(&mut self, node: NodeId) {
-        let index = node as usize;
+        let index = node.index();
         if node == NodeId::MAX || index >= self.len {
             return;
         }
@@ -301,7 +315,7 @@ impl NodeColumns {
     }
 
     pub(super) fn remap(&self, old_node: NodeId) -> Option<NodeId> {
-        let index = old_node as usize;
+        let index = old_node.index();
         if index >= self.capacity() {
             return None;
         }
@@ -337,14 +351,18 @@ mod tests {
 
     fn push_leaf(columns: &mut NodeColumns, alive: bool) {
         columns
-            .try_reserve_node()
+            .try_reserve_nodes(1)
             .or_invariant("test segment allocation failed");
         let id = node_id(columns.len());
         columns.push(
             0,
             PopulationStat::exact(u128::from(alive)),
             [id; 4],
-            u32::from(alive),
+            if alive {
+                CanonicalNodeRef::LIVE
+            } else {
+                CanonicalNodeRef::DEAD
+            },
         );
     }
 

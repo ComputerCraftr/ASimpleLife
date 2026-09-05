@@ -2,13 +2,16 @@ mod c_backend;
 mod c_super_backend;
 mod c_support;
 mod cli;
+pub(crate) mod coefficient_kernels;
 mod ir;
+mod ir_format;
 mod ir_report;
 mod life_assets;
 mod life_backend;
 mod life_macro_library;
 mod lowered_ir;
 mod optimizer;
+mod polynomial_emit;
 mod summary;
 mod symbolic;
 mod tape;
@@ -18,10 +21,11 @@ mod tests;
 pub(super) const BF_C_TAPE_LEN: usize = 30_000;
 pub(super) const BF_LIFE_TAPE_LEN: usize = 64;
 
-pub use c_backend::{emit_c, format_ir};
+pub use c_backend::emit_c;
 pub use c_super_backend::emit_c_super;
 pub use cli::run;
 pub use ir::{BfIr, BfOffset, Parser, ShiftDir};
+pub use ir_format::format_ir;
 pub use life_assets::{
     AssetBlocker, AssetBounds, AssetComponent, AssetManifest, AssetPattern, AssetPort,
     AssetRegistry, ComponentKind, Isolation, LifeAssetError, PatternFormat, PortDirection,
@@ -40,7 +44,9 @@ pub use life_macro_library::{
     instantiate_macro_cells, life_macro_template, life_macro_templates, transform_cell,
 };
 pub use lowered_ir::{PhysicalBfInstr, expand_distribute_to_primitive, lower_bf_control_flow};
-pub use optimizer::{CellSign, CodegenOpts, IoMode, optimize_with_opts};
+pub use optimizer::{
+    CellSign, CodegenOpts, CodegenOptsError, IoMode, MAX_CELL_BITS, optimize_with_opts,
+};
 pub use summary::{
     DynamicLoopMetadata, LoopId, LoopSummary, SummaryEffect, SummaryGuard, SummaryProvenance,
 };

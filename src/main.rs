@@ -1,24 +1,21 @@
 use a_simple_life::RequiredExt;
-use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 use std::{io::Write, io::stdout};
 
 use a_simple_life::app::initial_grid;
 use a_simple_life::bitgrid::{BitGrid, Coord};
-use a_simple_life::classify::{ClassificationLimits, classify_seed};
 use a_simple_life::cli;
 use a_simple_life::engine::{SimulationSession, should_use_exact_simd_repeat_skip};
 use a_simple_life::hashlife::{
     GridExtractionPolicy, HASHLIFE_FULL_GRID_MAX_CHUNKS, HASHLIFE_FULL_GRID_MAX_POPULATION,
 };
 use a_simple_life::life::GameOfLife;
-use a_simple_life::memo::Memo;
-use a_simple_life::oracle::{OracleRuntimeState, OracleSession};
 use a_simple_life::render::{
     TerminalBackbuffer, compute_origin_for_bounds, resized_viewport_origin, stable_viewport_origin,
 };
 use a_simple_life::term::terminal_size;
+use a_simple_life::tui;
 
 fn main() {
     let config = match cli::parse_args() {
@@ -34,57 +31,54 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if tui::should_run_tui(&config) {
+        match tui::run(config) {
+            Ok(tui::TuiExit::Completed) => return,
+            Ok(exit) => std::process::exit(exit.process_code()),
+            Err(error) => {
+                eprintln!("interactive session failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if config.load.is_some() || config.bf.is_some() || config.classify_only {
+        if let Err(error) = tui::run_headless_source(&config) {
+            eprintln!("headless session failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let initial = initial_grid(&config);
     let start_generation = config.target_generation.unwrap_or(0);
+    let classification = "not_requested".to_string();
     let mut startup_simulation = (start_generation > 0).then(SimulationSession::new);
     let mut startup_population = None;
-    let mut startup_state_materialized = true;
-    let mut startup_generation = 0;
-    let mut runtime_unknown_tracks_generation = false;
-    let classification = if start_generation == 0 {
-        let mut memo = Memo::default();
-        let mut limits = ClassificationLimits::default();
-        if let Some(max_generations) = config.max_generations {
-            limits.max_generations = max_generations;
-        }
-        classify_seed(&initial, &limits, &mut memo).to_string()
-    } else {
-        let simulation = startup_simulation
-            .as_mut()
-            .or_invariant("startup target generation should create a simulation session");
-        let outcome = OracleSession::new(initial.clone(), 0, HashMap::new(), simulation)
-            .advance_runtime_target(start_generation, None);
-        if let Some(failure) = outcome.failure {
-            eprintln!(
-                "failed to reach target generation {start_generation}: stopped at generation {}: {failure:?}",
-                outcome.final_generation
-            );
+    let startup_state_materialized = true;
+    let startup_generation = start_generation;
+    let runtime_unknown_tracks_generation = false;
+    if let Some(simulation) = startup_simulation.as_mut() {
+        if let Err(error) = simulation.try_load_hashlife_state(&initial) {
+            eprintln!("failed to load target source: {error:?}");
             std::process::exit(1);
         }
-        if outcome.final_generation != start_generation {
-            eprintln!(
-                "failed to reach target generation {start_generation}: stopped at generation {}",
-                outcome.final_generation
-            );
-            std::process::exit(1);
+        match simulation.advance_hashlife_root(start_generation) {
+            Ok(stats) if stats.reached_generation == start_generation => {
+                startup_population = simulation.hashlife_population_count().map(|population| {
+                    usize::try_from(population.lower_bound()).unwrap_or(usize::MAX)
+                });
+            }
+            Ok(stats) => {
+                eprintln!(
+                    "failed to reach target generation {start_generation}: stopped at generation {}",
+                    stats.reached_generation
+                );
+                std::process::exit(1);
+            }
+            Err(error) => {
+                eprintln!("failed to reach target generation {start_generation}: {error:?}");
+                std::process::exit(1);
+            }
         }
-        startup_population = Some(outcome.population);
-        startup_state_materialized = outcome.state == OracleRuntimeState::RetainedHashLife;
-        startup_generation = outcome.final_generation;
-        runtime_unknown_tracks_generation = matches!(
-            outcome.classification,
-            a_simple_life::classify::Classification::Unknown { .. }
-        );
-        let classification = outcome.classification.to_string();
-        if outcome.state == OracleRuntimeState::RetainedHashLife {
-            classification
-        } else {
-            format!("{classification} state=modeled view=unavailable")
-        }
-    };
-    if config.classify_only {
-        println!("{classification}");
-        return;
     }
 
     let grid = (start_generation == 0).then_some(initial);
@@ -612,7 +606,7 @@ mod tests {
         let initial = random_soup(60, 40, 35, 420);
         let target_generation = 100_000;
         let mut simulation = SimulationSession::new();
-        let outcome = OracleSession::new(initial, 0, Default::default(), &mut simulation)
+        let outcome = OracleSession::new(initial, 0, &mut simulation)
             .advance_runtime_target(target_generation, None);
 
         assert_eq!(outcome.final_generation, target_generation);
@@ -633,7 +627,7 @@ mod tests {
         let initial = pattern_by_name("pulsar").or_invariant("required value");
         let target_generation = 1_000_000;
         let mut simulation = SimulationSession::new();
-        let outcome = OracleSession::new(initial, 0, Default::default(), &mut simulation)
+        let outcome = OracleSession::new(initial, 0, &mut simulation)
             .advance_runtime_target(target_generation, None);
 
         assert_eq!(outcome.final_generation, target_generation);
@@ -799,7 +793,7 @@ mod tests {
         let initial = pattern_by_name("r_pentomino").or_invariant("required value");
         let target_generation = 100_000_000;
         let mut simulation = SimulationSession::new();
-        let outcome = OracleSession::new(initial, 0, Default::default(), &mut simulation)
+        let outcome = OracleSession::new(initial, 0, &mut simulation)
             .advance_runtime_target(target_generation, None);
         assert_eq!(outcome.final_generation, target_generation);
 

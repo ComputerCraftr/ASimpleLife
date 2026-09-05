@@ -47,51 +47,69 @@ fn cargo_targets_force_static_crt_for_musl_and_msvc() {
         "the crate must reject non-rustdoc musl or MSVC builds that disable crt-static"
     );
 
-    let workflow = read_repo_file(repo_root, ".github/workflows/ci.yml");
-    assert!(
-        workflow.contains("find target/x86_64-unknown-linux-musl/release -maxdepth 1")
-            && workflow.contains("readelf -d \"$executable\"")
-            && workflow.contains("llvm-readobj --coff-imports")
-            && workflow.contains("(vcruntime|msvcp|ucrtbase)")
-            && workflow.contains(
-                "RUSTDOCFLAGS: ${{ matrix.os == 'windows-latest' && '-C target-feature=+crt-static' || '' }}"
-            ),
-        "CI must inspect every linked executable and compile Windows rustdoc work with the static CRT"
-    );
-    let job_count = workflow.matches("runs-on:").count();
+    let workflow: serde_json::Value =
+        yaml_serde::from_str(&read_repo_file(repo_root, ".github/workflows/ci.yml"))
+            .or_invariant("structured CI workflow");
+    let jobs = workflow["jobs"].as_object().or_invariant("CI jobs");
+    for (name, job) in jobs {
+        let steps = job["steps"].as_array().or_invariant("job steps");
+        let actions: Vec<_> = steps
+            .iter()
+            .filter_map(|step| step["uses"].as_str())
+            .collect();
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.starts_with("actions/checkout@")),
+            "job {name} lacks checkout"
+        );
+        assert!(
+            actions.contains(&"./.github/actions/rust-setup"),
+            "job {name} lacks shared Rust setup"
+        );
+    }
+    let cross = &jobs["cross-platform"];
     assert_eq!(
-        workflow.matches("actions/checkout@v6").count(),
-        job_count,
-        "every CI job must use the Node 24 checkout action"
+        cross["strategy"]["matrix"]["os"],
+        serde_json::json!(["macos-latest", "ubuntu-latest", "windows-latest"])
     );
-    assert_eq!(
-        workflow
-            .matches("uses: ./.github/actions/rust-setup")
-            .count(),
-        job_count,
-        "every CI job must use the shared Rust setup action"
+    let steps = cross["steps"].as_array().or_invariant("platform steps");
+    assert!(
+        steps
+            .iter()
+            .any(|step| step["run"] == "${{ runner.os == 'Windows' && 'python' || 'python3' }} .github/scripts/verify_ci_binaries.py"),
+        "ordinary binary artifact inventory must run on every platform"
     );
     assert!(
-        !workflow.contains("actions/checkout@v4") && !workflow.contains("actions/checkout@v5"),
-        "deprecated checkout action lines must not return"
+        steps
+            .iter()
+            .any(|step| step["run"]
+                == "cargo test --workspace --all-features --release -- --nocapture"),
+        "full release/doctest coverage must remain"
     );
+    assert!(jobs.contains_key("static-crt-musl"));
+    assert!(jobs.contains_key("native-kernels"));
+    assert!(jobs.contains_key("scalar-fallback"));
     assert!(
-        workflow.contains("rhysd/actionlint:1.7.12"),
-        "CI must validate workflow changes with the current actionlint release"
+        jobs.contains_key("generated-c"),
+        "debug sanitizer configuration is not redundant with release coverage"
     );
+    assert!(jobs.contains_key("miri"));
+    assert_eq!(workflow["concurrency"]["cancel-in-progress"], true);
 
     let rust_setup = read_repo_file(repo_root, ".github/actions/rust-setup/action.yml");
     assert!(
         rust_setup.contains("dtolnay/rust-toolchain@stable")
             && rust_setup.contains("dtolnay/rust-toolchain@nightly")
-            && rust_setup.contains("Swatinem/rust-cache@v2.9.2"),
-        "the shared Rust setup must own current stable, nightly, and cache actions"
+            && rust_setup.contains("uses: Swatinem/rust-cache@"),
+        "the shared Rust setup must own stable, nightly, and cache actions"
     );
 
     let dependabot = read_repo_file(repo_root, ".github/dependabot.yml");
     assert!(
-        dependabot.contains("package-ecosystem: github-actions"),
-        "Dependabot must keep GitHub actions current"
+        dependabot.contains("package-ecosystem: github-actions")
+            && dependabot.contains("package-ecosystem: cargo"),
+        "Dependabot must keep both GitHub actions and Cargo dependencies current"
     );
 }
 

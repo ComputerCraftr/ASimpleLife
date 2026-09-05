@@ -26,17 +26,38 @@ impl HashLifeEngine {
         soft_memory_bytes: u128,
         hard_memory_bytes: u128,
     ) -> Option<NodeId> {
-        let root = current_root?;
-        let active_gc_needed = super::memory::wide_allocated_bytes(self.allocated_bytes())
-            >= soft_memory_bytes
-            && should_run_active_hashlife_gc(self.node_count(), self.last_gc_nodes);
+        let allocated = super::memory::wide_allocated_bytes(self.allocated_bytes());
+        let near_hard_limit = allocated >= hard_memory_bytes.saturating_sub(hard_memory_bytes / 5);
+        let changed = self.node_count() != self.last_gc_nodes
+            || self.retained_roots.last().copied() != current_root
+            || self.canonical_caches.shapes.len() > self.node_count();
+        if near_hard_limit && !changed && self.at_gc_safepoint() {
+            // Cache-only pressure needs no repeated graph traversal or epoch change.
+            self.release_optional_cache_storage();
+            return current_root;
+        }
+        let urgent = near_hard_limit && (changed || allocated > hard_memory_bytes);
+        let active_gc_needed = urgent
+            || (allocated >= soft_memory_bytes
+                && should_run_active_hashlife_gc(self.node_count(), self.last_gc_nodes));
         if !active_gc_needed {
-            return Some(root);
+            return current_root;
         }
 
-        self.record_retained_root(root);
+        if let Some(root) = current_root {
+            self.record_retained_root(root);
+        } else {
+            self.retained_roots.clear();
+        }
         self.stats.gc.jump_cache_before_clear = self.result_caches.jump.len();
-        self.maybe_garbage_collect_with_budget("growth_threshold", hard_memory_bytes);
+        self.maybe_garbage_collect_with_budget(
+            if urgent {
+                "budget_pressure"
+            } else {
+                "growth_threshold"
+            },
+            hard_memory_bytes,
+        );
         self.retained_roots.last().copied()
     }
 
@@ -89,7 +110,11 @@ impl HashLifeEngine {
             let step_limit = remaining.min(safe_jump.max(1));
             let step_exp = 63 - step_limit.leading_zeros();
             let step = 1_u64 << step_exp;
-            let (next, root) = self.advance_power_of_two(current_grid, bounds, step_exp);
+            let Some((next, root)) = self.advance_power_of_two(current_grid, bounds, step_exp)
+            else {
+                debug_assert!(self.allocation_failed());
+                return (current_grid.clone(), last_root);
+            };
             current = Some(next);
             last_root = Some(root);
             remaining -= step;
@@ -102,20 +127,33 @@ impl HashLifeEngine {
         grid: &BitGrid,
         bounds: (Coord, Coord, Coord, Coord),
         step_exp: u32,
-    ) -> (BitGrid, NodeId) {
+    ) -> Option<(BitGrid, NodeId)> {
         if grid.is_empty() {
-            return (BitGrid::empty(), self.empty(0));
+            let root = self.empty(0);
+            return (!self.allocation_failed()).then_some((BitGrid::empty(), root));
         }
         let embedded = self.embed_for_jump_with_bounds(grid, bounds, step_exp);
+        if self.allocation_failed() {
+            return None;
+        }
         let cache_key = (embedded.root, step_exp);
         let advanced = if let Some(cached) = self.cached_root_result(cache_key) {
+            if self.allocation_failed() {
+                return None;
+            }
             cached
         } else {
             let result = self.advance_pow2(embedded.root, step_exp);
+            if self.allocation_failed() {
+                return None;
+            }
             self.insert_root_result(cache_key, result);
             result
         };
-        (self.extract_embedded_result(embedded, advanced), advanced)
+        if self.allocation_failed() {
+            return None;
+        }
+        Some((self.extract_embedded_result(embedded, advanced), advanced))
     }
 }
 
@@ -175,4 +213,78 @@ pub(super) fn quadrant_end(
 ) -> usize {
     let upper = quadrant + 1;
     start + cells[start..end].partition_point(|cell| ((cell.key >> bit_shift) & 0b11) < upper)
+}
+
+#[cfg(test)]
+mod mandatory_failure_tests {
+    use super::*;
+
+    fn node_from_4x4_bits(engine: &mut HashLifeEngine, bits: u16) -> NodeId {
+        let quadrants: [NodeId; 4] = std::array::from_fn(|quadrant| {
+            let origin_x = (quadrant % 2) * 2;
+            let origin_y = (quadrant / 2) * 2;
+            let leaves: [NodeId; 4] = std::array::from_fn(|child| {
+                let x = origin_x + child % 2;
+                let y = origin_y + child / 2;
+                if bits & (1_u16 << (y * 4 + x)) == 0 {
+                    engine.dead_leaf
+                } else {
+                    engine.live_leaf
+                }
+            });
+            engine.join(leaves[0], leaves[1], leaves[2], leaves[3])
+        });
+        engine.join(quadrants[0], quadrants[1], quadrants[2], quadrants[3])
+    }
+
+    fn node_from_8x8_bits(engine: &mut HashLifeEngine, bits: u64) -> NodeId {
+        let quadrants: [NodeId; 4] = std::array::from_fn(|quadrant| {
+            let origin_x = (quadrant % 2) * 4;
+            let origin_y = (quadrant / 2) * 4;
+            let mut quadrant_bits = 0_u16;
+            for y in 0..4 {
+                for x in 0..4 {
+                    if bits & (1_u64 << ((origin_y + y) * 8 + origin_x + x)) != 0 {
+                        quadrant_bits |= 1_u16 << (y * 4 + x);
+                    }
+                }
+            }
+            node_from_4x4_bits(engine, quadrant_bits)
+        });
+        engine.join(quadrants[0], quadrants[1], quadrants[2], quadrants[3])
+    }
+
+    #[test]
+    fn embedding_failure_does_not_extract_or_publish_a_sentinel() {
+        let mut engine = HashLifeEngine::default();
+        let grid = BitGrid::from_cells(&[(0, 0)]);
+        let bounds = grid.bounds().or_invariant("single-cell bounds");
+        let retained = crate::hashlife::memory::wide_allocated_bytes(engine.allocated_bytes());
+        engine.begin_allocation_transaction(retained);
+
+        assert_eq!(engine.advance_power_of_two(&grid, bounds, 0), None);
+        assert!(engine.allocation_failed());
+        assert_eq!(engine.result_caches.root.len(), 0);
+        assert_eq!(engine.result_caches.materialized_packed.len(), 0);
+
+        let mut segmented = HashLifeEngine::default();
+        let retained = crate::hashlife::memory::wide_allocated_bytes(segmented.allocated_bytes());
+        segmented.begin_allocation_transaction(retained);
+        let (preserved, last_root) = segmented.advance_segment(&grid, 1);
+        assert_eq!(preserved, grid);
+        assert_eq!(last_root, None);
+    }
+
+    #[test]
+    fn scheduler_scratch_failure_does_not_publish_a_sentinel() {
+        let mut engine = HashLifeEngine::default();
+        let source = node_from_8x8_bits(&mut engine, 1_u64 << (3 * 8 + 3));
+        let retained = crate::hashlife::memory::wide_allocated_bytes(engine.allocated_bytes());
+        engine.begin_allocation_transaction(retained);
+
+        assert_eq!(engine.advance_pow2(source, 0), engine.dead_leaf);
+        assert!(engine.allocation_failed());
+        assert_eq!(engine.active_jump_results.len(), 0);
+        assert_eq!(engine.result_caches.jump.len(), 0);
+    }
 }

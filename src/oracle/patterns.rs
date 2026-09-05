@@ -1,5 +1,6 @@
 use super::*;
 use crate::RequiredExt;
+use crate::recurrence::{ExactRecurrenceTracker, Lineage, Observation, ObserveOutcome};
 
 pub(super) fn build_emitter_macro_model(
     seed: Option<&BitGrid>,
@@ -20,7 +21,26 @@ pub(super) fn build_emitter_macro_model(
     let next_grid = advance_exact_steps(seed, BASELINE_GENERATION + PERIOD);
     let baseline_state = extract_gosper_state(&baseline_grid)?;
     let next_state = extract_gosper_state(&next_grid)?;
-    if normalize(&baseline_state.core).0 != normalize(&next_state.core).0 {
+    let lineage = Lineage::fresh();
+    let mut recurrence = ExactRecurrenceTracker::new(lineage);
+    if !matches!(
+        recurrence.observe_result(Observation::from_grid(
+            lineage,
+            BASELINE_GENERATION,
+            &baseline_state.core,
+        )),
+        ObserveOutcome::Recorded
+    ) {
+        return None;
+    }
+    let ObserveOutcome::Repeated(certificate) = recurrence.observe_result(Observation::from_grid(
+        lineage,
+        BASELINE_GENERATION + PERIOD,
+        &next_state.core,
+    )) else {
+        return None;
+    };
+    if certificate.period() != PERIOD || certificate.delta() != (0, 0) {
         return None;
     }
     if next_state.gliders.len() != baseline_state.gliders.len() + 1 {

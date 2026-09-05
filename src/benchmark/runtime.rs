@@ -125,7 +125,7 @@ fn reference_classify_to_generation_target(
             None,
         );
     }
-    let session = OracleSession::new(seed, 0, HashMap::new(), oracle_simulation);
+    let session = OracleSession::new(seed, 0, oracle_simulation);
     if let Some(progress_logger) = progress {
         let mut step_logger = |plan: OracleStepPlan, metrics: OracleStateMetrics| {
             if plan.step_span == 0 {

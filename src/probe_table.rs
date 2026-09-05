@@ -1,12 +1,7 @@
 use std::collections::TryReserveError;
 use std::mem::MaybeUninit;
 
-use bytemuck::must_cast;
-use wide::u8x16;
-
 use crate::RequiredExt;
-use crate::flat_table::FlatKey;
-use crate::hashing::mix64;
 
 const GROUP_WIDTH: usize = 16;
 const EMPTY: u8 = 0x80;
@@ -14,10 +9,11 @@ const DELETED: u8 = 0xfe;
 const MAX_LOAD_NUMERATOR: usize = 7;
 const MAX_LOAD_DENOMINATOR: usize = 8;
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProbeReserveError {
     CapacityOverflow,
     Allocation,
+    Full,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,16 +21,11 @@ pub(crate) enum ProbeMode {
     AppendOnly,
     RebuildOnGc,
     Mutable,
+    Scratch,
 }
 
 pub(crate) trait ProbeKey: Copy + Eq {
     fn fingerprint(&self) -> u64;
-}
-
-impl<T: FlatKey> ProbeKey for T {
-    fn fingerprint(&self) -> u64 {
-        FlatKey::fingerprint(self)
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -53,15 +44,45 @@ impl ControlGroup {
 
     #[inline]
     fn matching(self, byte: u8) -> u16 {
-        let controls: u8x16 = must_cast(self.0);
-        let matches: [u8; GROUP_WIDTH] = must_cast(controls.simd_eq(u8x16::splat(byte)));
-        matches
-            .into_iter()
-            .enumerate()
-            .fold(0, |mask, (lane, matched)| {
-                mask | (u16::from(matched != 0) << lane)
-            })
+        match_control_byte_swar(&self.0, byte)
     }
+}
+
+pub(crate) fn match_control_groups_swar<const N: usize>(
+    control: &[u8; GROUP_WIDTH],
+    tags: &[u8; N],
+    active_lanes: usize,
+) -> [u16; N] {
+    let mut matches = [0_u16; N];
+    for lane in 0..active_lanes.min(N) {
+        matches[lane] = match_control_byte_swar(control, tags[lane]);
+    }
+    matches
+}
+
+#[inline]
+fn match_control_byte_swar(control: &[u8; GROUP_WIDTH], byte: u8) -> u16 {
+    u16::from(swar_match_8(
+        control[..8].try_into().or_invariant("low control half"),
+        byte,
+    )) | (u16::from(swar_match_8(
+        control[8..].try_into().or_invariant("high control half"),
+        byte,
+    )) << 8)
+}
+
+#[inline]
+fn swar_match_8(bytes: [u8; 8], byte: u8) -> u8 {
+    let word = u64::from_le_bytes(bytes);
+    let repeated = u64::from(byte).wrapping_mul(0x0101_0101_0101_0101);
+    let different = word ^ repeated;
+    // This exact per-byte zero test avoids the cross-byte borrow false
+    // positives of the usual "has any zero byte" expression.
+    let high_bits = !(((different & 0x7f7f_7f7f_7f7f_7f7f).wrapping_add(0x7f7f_7f7f_7f7f_7f7f))
+        | different
+        | 0x7f7f_7f7f_7f7f_7f7f)
+        & 0x8080_8080_8080_8080;
+    ((high_bits >> 7).wrapping_mul(0x0102_0408_1020_4080)).to_le_bytes()[7]
 }
 
 pub(crate) struct ProbeTable<K: Copy + Eq, V: Copy> {
@@ -91,7 +112,9 @@ impl<K: Copy + Eq, V: Copy> Clone for ProbeTable<K, V> {
                 continue;
             }
             let entry = *self.entry(index);
-            cloned.insert_no_grow(entry.key, entry.fingerprint, entry.value);
+            cloned
+                .insert_no_grow(entry.key, entry.fingerprint, entry.value)
+                .or_invariant("cloned probe table retained insufficient capacity");
         }
         cloned
     }
@@ -130,6 +153,12 @@ impl<K: Copy + Eq, V: Copy> ProbeTable<K, V> {
         })
     }
 
+    pub(crate) fn allocation_bytes_for_capacity(
+        capacity: usize,
+    ) -> Result<u128, ProbeReserveError> {
+        table_allocation_bytes::<K, V>(slots_for_capacity_checked(capacity)?)
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.len
     }
@@ -151,18 +180,7 @@ impl<K: Copy + Eq, V: Copy> ProbeTable<K, V> {
     }
 
     pub(crate) fn reservation_bytes(&self, additional: usize) -> Result<u128, ProbeReserveError> {
-        let required = self
-            .len
-            .checked_add(additional)
-            .ok_or(ProbeReserveError::CapacityOverflow)?;
-        let required_slots = slots_for_capacity_checked(required)?;
-        let rehash_slots = if required_slots > self.entries.len() {
-            required_slots
-        } else if self.len + self.deleted + additional > self.capacity()
-            && !(self.mode == ProbeMode::AppendOnly && self.deleted >= additional)
-        {
-            self.entries.len()
-        } else {
+        let Some(rehash_slots) = self.rehash_slots_for(additional)? else {
             return Ok(0);
         };
         table_allocation_bytes::<K, V>(rehash_slots)
@@ -198,17 +216,8 @@ impl<K: Copy + Eq, V: Copy> ProbeTable<K, V> {
     }
 
     pub(crate) fn try_reserve(&mut self, additional: usize) -> Result<(), ProbeReserveError> {
-        let required = self
-            .len
-            .checked_add(additional)
-            .ok_or(ProbeReserveError::CapacityOverflow)?;
-        let required_slots = slots_for_capacity_checked(required)?;
-        if required_slots > self.entries.len() {
-            self.try_rehash(required_slots)?;
-        } else if self.len + self.deleted + additional > self.capacity()
-            && !(self.mode == ProbeMode::AppendOnly && self.deleted >= additional)
-        {
-            self.try_rehash(self.entries.len())?;
+        if let Some(rehash_slots) = self.rehash_slots_for(additional)? {
+            self.try_rehash(rehash_slots)?;
         }
         Ok(())
     }
@@ -217,9 +226,8 @@ impl<K: Copy + Eq, V: Copy> ProbeTable<K, V> {
         if self.controls.is_empty() {
             return None;
         }
-        let mixed = mix64(fingerprint);
-        let tag = tag(mixed);
-        let mut group = group_index(mixed, self.controls.len());
+        let tag = tag(fingerprint);
+        let mut group = group_index(fingerprint, self.controls.len());
 
         for _ in 0..self.controls.len() {
             let controls = self.controls[group];
@@ -251,14 +259,7 @@ impl<K: Copy + Eq, V: Copy> ProbeTable<K, V> {
             keys,
             fingerprints,
             active_lanes,
-            |controls, tags, lanes| {
-                let group = ControlGroup(*controls);
-                let mut matches = [0_u16; N];
-                for lane in 0..lanes {
-                    matches[lane] = group.matching(tags[lane]);
-                }
-                matches
-            },
+            match_control_groups_swar,
         )
     }
 
@@ -274,8 +275,7 @@ impl<K: Copy + Eq, V: Copy> ProbeTable<K, V> {
         if self.controls.is_empty() {
             return values;
         }
-        let mixed = fingerprints.map(mix64);
-        let mut groups = mixed.map(|hash| group_index(hash, self.controls.len()));
+        let mut groups = fingerprints.map(|hash| group_index(hash, self.controls.len()));
         let mut probes = [0_usize; N];
         let mut pending = [false; N];
         pending[..active_lanes].fill(true);
@@ -290,6 +290,7 @@ impl<K: Copy + Eq, V: Copy> ProbeTable<K, V> {
             let controls = self.controls[group];
             let has_empty = controls.matching(EMPTY) != 0;
             let mut grouped_lanes = [0_usize; N];
+            let mut grouped_query = [0_usize; N];
             let mut grouped_tags = [0_u8; N];
             let mut grouped_count = 0;
 
@@ -297,26 +298,42 @@ impl<K: Copy + Eq, V: Copy> ProbeTable<K, V> {
                 if !pending[lane] || groups[lane] != group {
                     continue;
                 }
-                grouped_lanes[grouped_count] = lane;
-                grouped_tags[grouped_count] = tag(mixed[lane]);
-                grouped_count += 1;
+                let query = (0..grouped_count).find(|&query| {
+                    let representative = grouped_lanes[query];
+                    fingerprints[representative] == fingerprints[lane]
+                        && keys[representative] == keys[lane]
+                });
+                grouped_query[lane] = query.unwrap_or_else(|| {
+                    let query = grouped_count;
+                    grouped_lanes[query] = lane;
+                    grouped_tags[query] = tag(fingerprints[lane]);
+                    grouped_count += 1;
+                    query
+                });
             }
             let grouped_matches = match_controls(&controls.0, &grouped_tags, grouped_count);
+            let mut grouped_values = [None; N];
 
-            for grouped_lane in 0..grouped_count {
-                let lane = grouped_lanes[grouped_lane];
-                let mut candidates = grouped_matches[grouped_lane];
+            for query in 0..grouped_count {
+                let lane = grouped_lanes[query];
+                let mut candidates = grouped_matches[query];
                 while candidates != 0 {
                     let control_lane = candidates.trailing_zeros() as usize;
                     let index = group * GROUP_WIDTH + control_lane;
                     let entry = self.entry(index);
                     if entry.fingerprint == fingerprints[lane] && entry.key == keys[lane] {
-                        values[lane] = Some(entry.value);
+                        grouped_values[query] = Some(entry.value);
                         break;
                     }
                     candidates &= candidates - 1;
                 }
+            }
 
+            for lane in 0..active_lanes {
+                if !pending[lane] || groups[lane] != group {
+                    continue;
+                }
+                values[lane] = grouped_values[grouped_query[lane]];
                 probes[lane] += 1;
                 if values[lane].is_some() || has_empty || probes[lane] == self.controls.len() {
                     pending[lane] = false;
@@ -335,14 +352,16 @@ impl<K: Copy + Eq, V: Copy> ProbeTable<K, V> {
         fingerprint: u64,
         value: V,
     ) -> Option<V> {
-        if let Err(error) = self.try_reserve(1) {
-            if self.mode == ProbeMode::AppendOnly {
-                Result::<(), _>::Err(error)
-                    .or_invariant("mandatory append-only probe table allocation failed");
+        match self.try_insert_with_fingerprint(key, fingerprint, value) {
+            Ok(previous) => previous,
+            Err(error) => {
+                if self.mode == ProbeMode::AppendOnly {
+                    Result::<(), _>::Err(error)
+                        .or_invariant("mandatory append-only probe table allocation failed");
+                }
+                None
             }
-            return None;
         }
-        self.insert_no_grow(key, fingerprint, value)
     }
 
     pub(crate) fn try_insert_with_fingerprint(
@@ -351,12 +370,20 @@ impl<K: Copy + Eq, V: Copy> ProbeTable<K, V> {
         fingerprint: u64,
         value: V,
     ) -> Result<Option<V>, ProbeReserveError> {
+        if self.rehash_slots_for(1)?.is_some()
+            && let Some(index) = self.find_index(&key, fingerprint)
+        {
+            let entry = self.entry_mut(index);
+            let previous = entry.value;
+            entry.value = value;
+            return Ok(Some(previous));
+        }
         self.try_reserve(1)?;
-        Ok(self.insert_no_grow(key, fingerprint, value))
+        self.insert_no_grow(key, fingerprint, value)
     }
 
     pub(crate) fn remove_with_fingerprint(&mut self, key: &K, fingerprint: u64) -> Option<V> {
-        if self.mode != ProbeMode::Mutable {
+        if !matches!(self.mode, ProbeMode::Mutable | ProbeMode::Scratch) {
             return None;
         }
         let index = self.find_index(key, fingerprint)?;
@@ -401,6 +428,8 @@ impl<K: Copy + Eq, V: Copy> ProbeTable<K, V> {
         }
     }
 
+    /// Iterates in physical bucket order, which is deliberately not stable.
+    /// Callers requiring deterministic output must impose semantic ordering.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (K, V)> + '_ {
         (0..self.entries.len())
             .filter(|&index| is_full(self.control(index)))
@@ -414,9 +443,8 @@ impl<K: Copy + Eq, V: Copy> ProbeTable<K, V> {
         if self.controls.is_empty() {
             return None;
         }
-        let mixed = mix64(fingerprint);
-        let mut group = group_index(mixed, self.controls.len());
-        let expected_tag = tag(mixed);
+        let mut group = group_index(fingerprint, self.controls.len());
+        let expected_tag = tag(fingerprint);
         for _ in 0..self.controls.len() {
             let controls = self.controls[group];
             let mut candidates = controls.matching(expected_tag);
@@ -437,10 +465,14 @@ impl<K: Copy + Eq, V: Copy> ProbeTable<K, V> {
         None
     }
 
-    fn insert_no_grow(&mut self, key: K, fingerprint: u64, value: V) -> Option<V> {
-        let mixed = mix64(fingerprint);
-        let expected_tag = tag(mixed);
-        let mut group = group_index(mixed, self.controls.len());
+    fn insert_no_grow(
+        &mut self,
+        key: K,
+        fingerprint: u64,
+        value: V,
+    ) -> Result<Option<V>, ProbeReserveError> {
+        let expected_tag = tag(fingerprint);
+        let mut group = group_index(fingerprint, self.controls.len());
         let mut first_deleted = None;
 
         for _ in 0..self.controls.len() {
@@ -453,7 +485,7 @@ impl<K: Copy + Eq, V: Copy> ProbeTable<K, V> {
                 if entry.fingerprint == fingerprint && entry.key == key {
                     let previous = entry.value;
                     entry.value = value;
-                    return Some(previous);
+                    return Ok(Some(previous));
                 }
                 candidates &= candidates - 1;
             }
@@ -477,12 +509,14 @@ impl<K: Copy + Eq, V: Copy> ProbeTable<K, V> {
                     },
                     expected_tag,
                 );
-                return None;
+                return Ok(None);
             }
             group = (group + 1) & (self.controls.len() - 1);
         }
 
-        let index = first_deleted.or_invariant("probe table must retain insertion capacity");
+        let Some(index) = first_deleted else {
+            return Err(ProbeReserveError::Full);
+        };
         self.write_entry(
             index,
             Entry {
@@ -492,7 +526,7 @@ impl<K: Copy + Eq, V: Copy> ProbeTable<K, V> {
             },
             expected_tag,
         );
-        None
+        Ok(None)
     }
 
     fn write_entry(&mut self, index: usize, entry: Entry<K, V>, control: u8) {
@@ -515,10 +549,32 @@ impl<K: Copy + Eq, V: Copy> ProbeTable<K, V> {
                 continue;
             }
             let entry = *self.entry(index);
-            rebuilt.insert_no_grow(entry.key, entry.fingerprint, entry.value);
+            rebuilt.insert_no_grow(entry.key, entry.fingerprint, entry.value)?;
         }
         *self = rebuilt;
         Ok(())
+    }
+
+    fn rehash_slots_for(&self, additional: usize) -> Result<Option<usize>, ProbeReserveError> {
+        let required = self
+            .len
+            .checked_add(additional)
+            .ok_or(ProbeReserveError::CapacityOverflow)?;
+        let required_slots = slots_for_capacity_checked(required)?;
+        if required_slots > self.entries.len() {
+            return Ok(Some(required_slots));
+        }
+        let occupied = self
+            .len
+            .checked_add(self.deleted)
+            .and_then(|value| value.checked_add(additional))
+            .ok_or(ProbeReserveError::CapacityOverflow)?;
+        if occupied > self.capacity()
+            && !(self.mode == ProbeMode::AppendOnly && self.deleted >= additional)
+        {
+            return Ok(Some(self.entries.len()));
+        }
+        Ok(None)
     }
 
     #[inline]
@@ -549,6 +605,10 @@ impl<K: Copy + Eq, V: Copy> ProbeTable<K, V> {
 impl<K: ProbeKey, V: Copy> ProbeTable<K, V> {
     pub(crate) fn get(&self, key: &K) -> Option<V> {
         self.get_with_fingerprint(key, key.fingerprint())
+    }
+
+    pub(crate) fn contains_key(&self, key: &K) -> bool {
+        self.get(key).is_some()
     }
 
     pub(crate) fn insert(&mut self, key: K, value: V) -> Option<V> {
@@ -609,231 +669,4 @@ fn tag(hash: u64) -> u8 {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use crate::RequiredExt;
-
-    use super::{ControlGroup, ProbeKey, ProbeMode, ProbeReserveError, ProbeTable};
-
-    impl ProbeKey for u64 {
-        fn fingerprint(&self) -> u64 {
-            *self
-        }
-    }
-
-    #[test]
-    fn control_group_matches_all_equal_lanes() {
-        let group = ControlGroup([3, 9, 3, 0, 3, 9, 7, 3, 1, 2, 3, 4, 5, 6, 3, 3]);
-        assert_eq!(group.matching(3), 0b1100_0100_1001_0101);
-        assert_eq!(group.matching(8), 0);
-    }
-
-    #[test]
-    fn collision_heavy_batch_lookup_checks_full_keys() {
-        const N: usize = 32;
-        let n = u64::try_from(N).or_invariant("test batch width exceeds u64");
-        let mut table = ProbeTable::with_capacity(ProbeMode::AppendOnly, N);
-        for key in 0..n {
-            table.insert_with_fingerprint(key, 0xdead_beef, key * 11);
-        }
-        assert_eq!(table.get_with_fingerprint(&17, 0xdead_beef), Some(187));
-
-        let keys = std::array::from_fn(|lane| {
-            (u64::try_from(lane).or_invariant("test lane exceeds u64") * 7) % 41
-        });
-        let fingerprints = [0xdead_beef; N];
-        let found = table.get_many_with_fingerprints(&keys, &fingerprints, 29);
-        for lane in 0..29 {
-            assert_eq!(found[lane], (keys[lane] < n).then_some(keys[lane] * 11));
-        }
-        assert!(found[29..].iter().all(Option::is_none));
-    }
-
-    #[test]
-    fn mutable_table_matches_hash_map_under_adversarial_operations() {
-        #[cfg(miri)]
-        const STEPS: u64 = 1_000;
-        #[cfg(not(miri))]
-        const STEPS: u64 = 40_000;
-        let mut table = ProbeTable::with_capacity(ProbeMode::Mutable, 1);
-        let mut expected = HashMap::new();
-        let mut state = 0x1234_5678_9abc_def0_u64;
-
-        for step in 0..STEPS {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            let key = state % 997;
-            let fingerprint = key & 7;
-            match state >> 61 {
-                0..=3 => {
-                    let value = state ^ step;
-                    assert_eq!(
-                        table.insert_with_fingerprint(key, fingerprint, value),
-                        expected.insert(key, value)
-                    );
-                }
-                4..=5 => assert_eq!(
-                    table.remove_with_fingerprint(&key, fingerprint),
-                    expected.remove(&key)
-                ),
-                6 => {
-                    let additional = usize::try_from((state >> 8) & 31)
-                        .or_invariant("bounded reserve count exceeds usize");
-                    assert!(
-                        table.try_reserve(additional).is_ok(),
-                        "adversarial mutable-table reserve failed additional={additional}"
-                    );
-                }
-                _ => assert_eq!(
-                    table.get_with_fingerprint(&key, fingerprint),
-                    expected.get(&key).copied()
-                ),
-            }
-
-            if step % 257 == 0 {
-                assert_eq!(table.len(), expected.len());
-                for (&key, &value) in &expected {
-                    assert_eq!(table.get_with_fingerprint(&key, key & 7), Some(value));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn gc_filter_keeps_probe_storage_and_removes_dead_entries_in_place() {
-        let mut table = ProbeTable::with_capacity(ProbeMode::RebuildOnGc, 128);
-        for key in 0..96_u64 {
-            table.insert(key, key * 3);
-        }
-        let bytes_before = table.allocated_bytes();
-        table.retain(|key, _| key % 3 == 0);
-        assert_eq!(table.len(), 32);
-        assert_eq!(table.allocated_bytes(), bytes_before);
-        for key in 0..96_u64 {
-            assert_eq!(table.get(&key), (key % 3 == 0).then_some(key * 3));
-        }
-    }
-
-    #[test]
-    fn append_only_gc_tombstones_are_reused_without_rehash_allocation() {
-        let mut table = ProbeTable::with_capacity(ProbeMode::AppendOnly, 64);
-        let initial_capacity = table.capacity();
-        for key in 0..initial_capacity {
-            let key = u64::try_from(key).or_invariant("test key exceeds u64");
-            table.insert(key, key);
-        }
-        let bytes_before = table.allocated_bytes();
-        table.retain_for_gc(|key, _| key % 2 == 0);
-
-        for key in 0..initial_capacity / 2 {
-            let key = u64::try_from(initial_capacity + key).or_invariant("test key exceeds u64");
-            table.insert(key, key);
-        }
-
-        assert_eq!(
-            table.allocated_bytes(),
-            bytes_before,
-            "mandatory append-only index rehashed instead of reusing GC tombstones"
-        );
-    }
-
-    #[test]
-    fn fallible_reserve_rejects_capacity_overflow_without_mutation() {
-        let mut table = ProbeTable::with_capacity(ProbeMode::AppendOnly, 16);
-        table.insert(7_u64, 11_u64);
-        let bytes_before = table.allocated_bytes();
-
-        let result = table.try_reserve(usize::MAX);
-
-        assert!(matches!(result, Err(ProbeReserveError::CapacityOverflow)));
-        assert_eq!(table.get(&7), Some(11));
-        assert_eq!(table.allocated_bytes(), bytes_before);
-    }
-
-    #[test]
-    fn rebuild_on_gc_filters_and_purges_without_losing_entries() {
-        let mut table = ProbeTable::new(ProbeMode::RebuildOnGc);
-        for key in 0..500_u64 {
-            table.insert(key, key + 1);
-        }
-        table.retain(|key, _| key % 3 == 0);
-        assert_eq!(table.len(), 167);
-        for key in 0..500_u64 {
-            assert_eq!(table.get(&key), (key % 3 == 0).then_some(key + 1));
-        }
-        assert_eq!(table.iter().count(), table.len());
-    }
-
-    #[test]
-    fn clear_reuses_all_modes() {
-        for mode in [
-            ProbeMode::AppendOnly,
-            ProbeMode::RebuildOnGc,
-            ProbeMode::Mutable,
-        ] {
-            let mut table = ProbeTable::new(mode);
-            table.insert(1_u64, 2_u64);
-            assert_eq!(table.get(&1_u64), Some(2_u64));
-            table.clear();
-            assert_eq!(table.len(), 0);
-            assert_eq!(table.insert(3_u64, 4_u64), None);
-            assert_eq!(table.get(&3_u64), Some(4_u64));
-        }
-    }
-
-    #[test]
-    fn released_optional_storage_is_empty_and_reallocates_lazily() {
-        let mut table = ProbeTable::with_capacity(ProbeMode::Mutable, 512);
-        table.insert(1_u64, 2_u64);
-        assert!(table.allocated_bytes() > 0);
-
-        table.release_storage();
-        assert_eq!(table.allocated_bytes(), 0);
-        assert_eq!(table.get(&1), None);
-
-        table.insert(3, 4);
-        assert_eq!(table.get(&3), Some(4));
-    }
-
-    #[test]
-    fn append_only_rejects_removal_without_mutation() {
-        let mut table = ProbeTable::new(ProbeMode::AppendOnly);
-        table.insert(1_u64, 2_u64);
-        assert_eq!(table.remove(&1), None);
-        assert_eq!(table.get(&1), Some(2));
-    }
-
-    #[test]
-    fn append_only_rejects_filtered_rebuild_without_mutation() {
-        let mut table = ProbeTable::<u64, u64>::new(ProbeMode::AppendOnly);
-        table.insert(1, 2);
-        assert!(!table.retain(|_, _| false));
-        assert_eq!(table.get(&1), Some(2));
-    }
-
-    #[test]
-    fn miri_probe_table_storage_lifecycle_preserves_initialized_slots() {
-        let mut table = ProbeTable::with_capacity(ProbeMode::Mutable, 1);
-        for key in 0..128_u64 {
-            table.insert_with_fingerprint(key, key & 3, key + 10);
-        }
-        for key in (0..128_u64).step_by(2) {
-            assert_eq!(table.remove_with_fingerprint(&key, key & 3), Some(key + 10));
-        }
-        assert!(
-            table.try_reserve(256).is_ok(),
-            "Miri probe-table reserve failed"
-        );
-        let cloned = table.clone();
-        for key in 0..128_u64 {
-            let expected = (key % 2 == 1).then_some(key + 10);
-            assert_eq!(table.get_with_fingerprint(&key, key & 3), expected);
-            assert_eq!(cloned.get_with_fingerprint(&key, key & 3), expected);
-        }
-        table.clear();
-        table.insert(900, 901);
-        assert_eq!(table.get(&900), Some(901));
-    }
-}
+mod tests;

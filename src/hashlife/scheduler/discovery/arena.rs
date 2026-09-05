@@ -22,7 +22,7 @@ impl HashLifeEngine {
         &mut self,
         compacted: [CompactedDiscoveredTask; N],
         unique_count: usize,
-        task_index: &FlatTable<CanonicalJumpKey, usize>,
+        task_index: &ProbeTable<CanonicalJumpKey, usize>,
     ) -> [ChunkChildState; N] {
         let mut keys = [CanonicalJumpKey::empty(); N];
         for lane in 0..unique_count {
@@ -33,8 +33,8 @@ impl HashLifeEngine {
             compacted: CompactedDiscoveredTask {
                 task: DiscoveredJumpTask {
                     key: CanonicalJumpKey::empty(),
-                    source_node: 0,
-                    canonical_packed: PackedNodeKey::new(0, [0; 4]),
+                    source_node: NodeId::ZERO,
+                    canonical_packed: PackedNodeKey::new(0, [NodeId::ZERO; 4]),
                 },
                 duplicate_count: 0,
             },
@@ -59,7 +59,7 @@ impl HashLifeEngine {
         &mut self,
         states: &mut [ChunkChildState; N],
         unique_count: usize,
-        task_index: &FlatTable<CanonicalJumpKey, usize>,
+        task_index: &ProbeTable<CanonicalJumpKey, usize>,
     ) {
         let mut keys = [CanonicalJumpKey::empty(); N];
         for lane in 0..unique_count {
@@ -78,7 +78,7 @@ impl HashLifeEngine {
         discovered: DiscoveredJumpTask,
         result: NodeId,
         tasks: &mut [Option<TaskRecord>],
-        dependents: &mut FlatTable<CanonicalJumpKey, usize>,
+        dependents: &mut ProbeTable<CanonicalJumpKey, usize>,
         dependent_edges: &[DependentEdge],
         ready: &mut Vec<usize>,
     ) {
@@ -102,8 +102,8 @@ impl HashLifeEngine {
         let mut compacted = [CompactedDiscoveredTask {
             task: DiscoveredJumpTask {
                 key: CanonicalJumpKey::empty(),
-                source_node: 0,
-                canonical_packed: PackedNodeKey::new(0, [0; 4]),
+                source_node: NodeId::ZERO,
+                canonical_packed: PackedNodeKey::new(0, [NodeId::ZERO; 4]),
             },
             duplicate_count: 0,
         }; N];
@@ -132,8 +132,8 @@ impl HashLifeEngine {
     ) -> bool {
         let parent_count = parent_records.len();
         let mut identities = [CanonicalNodeIdentity {
-            packed: PackedNodeKey::new(0, [0; 4]),
-            structural: CanonicalStructKey::new(0, [0; 4]),
+            packed: PackedNodeKey::new(0, [NodeId::ZERO; 4]),
+            structural: CanonicalStructKey::leaf(false),
             symmetry: Symmetry::Identity,
         }; DISCOVER_BATCH];
         let mut fingerprints = [0_u64; DISCOVER_BATCH];
@@ -161,7 +161,7 @@ impl HashLifeEngine {
     pub(super) fn build_recursive_parent_chunk_child_states<const C: usize>(
         &mut self,
         parent_records: &mut [RecursiveParentBatchRecord],
-        task_index: &FlatTable<CanonicalJumpKey, usize>,
+        task_index: &ProbeTable<CanonicalJumpKey, usize>,
         child_arena: &mut Vec<RecursiveParentChildRef>,
     ) -> ([ChunkChildState; C], usize) {
         let parent_count = parent_records.len();
@@ -169,8 +169,8 @@ impl HashLifeEngine {
             compacted: CompactedDiscoveredTask {
                 task: DiscoveredJumpTask {
                     key: CanonicalJumpKey::empty(),
-                    source_node: 0,
-                    canonical_packed: PackedNodeKey::new(0, [0; 4]),
+                    source_node: NodeId::ZERO,
+                    canonical_packed: PackedNodeKey::new(0, [NodeId::ZERO; 4]),
                 },
                 duplicate_count: 0,
             },
@@ -179,7 +179,7 @@ impl HashLifeEngine {
             enqueued: false,
         }; C];
         let mut chunk_queries = [JumpQuery {
-            node: 0,
+            node: NodeId::ZERO,
             step_exp: 0,
         }; C];
         let mut chunk_unique_count = 0usize;
@@ -277,8 +277,8 @@ impl HashLifeEngine {
     ) -> [DiscoveredJumpTask; N] {
         let mut child_keys = [DiscoveredJumpTask {
             key: CanonicalJumpKey::empty(),
-            source_node: 0,
-            canonical_packed: PackedNodeKey::new(0, [0; 4]),
+            source_node: NodeId::ZERO,
+            canonical_packed: PackedNodeKey::new(0, [NodeId::ZERO; 4]),
         }; N];
         for lane in 0..N {
             let child = child_nodes[lane];

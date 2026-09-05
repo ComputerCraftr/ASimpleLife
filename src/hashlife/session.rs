@@ -10,9 +10,15 @@ use super::{
 };
 use crate::RequiredExt;
 use crate::bitgrid::{BitGrid, Coord};
+use std::io::{Cursor, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod cancellation;
+pub(crate) mod capture;
+mod collection;
 mod conversion;
+mod inspection;
+mod recurrence;
 
 const MAX_COORD_STEP_EXP: u32 = MAX_COORD_ROOT_LEVEL - 2;
 
@@ -57,7 +63,10 @@ impl Default for HashLifeSession {
     fn default() -> Self {
         static NEXT_CHECKPOINT_SESSION: AtomicU64 = AtomicU64::new(1);
 
-        let engine = HashLifeEngine::default();
+        let engine = HashLifeEngine {
+            allocation_hard_limit: DEFAULT_HARD_MEMORY_BYTES,
+            ..HashLifeEngine::default()
+        };
         let retained = wide_allocated_bytes(engine.allocated_bytes());
         let mut memory_budget = HashLifeMemoryBudget::new(DEFAULT_HARD_MEMORY_BYTES);
         memory_budget.sync_retained(retained);
@@ -93,13 +102,7 @@ impl HashLifeSession {
 
     pub fn with_limits(limits: HashLifeLimits) -> Self {
         let mut session = Self::default();
-        session.limits = HashLifeLimits {
-            soft_memory_bytes: limits.soft_memory_bytes.min(limits.hard_memory_bytes),
-            hard_memory_bytes: limits.hard_memory_bytes,
-        };
-        session
-            .memory_budget
-            .set_hard_limit(session.limits.hard_memory_bytes);
+        session.set_limits(limits);
         session
     }
 
@@ -114,6 +117,7 @@ impl HashLifeSession {
         };
         self.memory_budget
             .set_hard_limit(self.limits.hard_memory_bytes);
+        self.engine.allocation_hard_limit = self.limits.hard_memory_bytes;
     }
 
     pub fn allocated_bytes(&self) -> u128 {
@@ -153,6 +157,9 @@ impl HashLifeSession {
                 .simd
                 .kernel
                 .native_d4_exact_winner_lanes,
+            swar_control_groups: self.engine.stats.simd.kernel.swar_control_groups,
+            native_avx2_control_groups: self.engine.stats.simd.kernel.native_avx2_control_groups,
+            native_neon_control_groups: self.engine.stats.simd.kernel.native_neon_control_groups,
         }
     }
 
@@ -218,7 +225,9 @@ impl HashLifeSession {
     }
 
     pub(crate) fn unload(&mut self) {
-        self.finish_active_run();
+        self.active_run = false;
+        self.previous_root = None;
+        self.engine.retained_roots.clear();
         self.current_root = None;
         self.current_generation = 0;
         self.current_origin_x = 0;
@@ -282,46 +291,6 @@ impl HashLifeSession {
         Ok(())
     }
 
-    pub(crate) fn skip_generations(
-        &mut self,
-        generations: u64,
-    ) -> Result<SessionAdvanceStats, HashLifeAdvanceError> {
-        let starting_generation = self.current_generation;
-        if self.current_root.is_none() || generations == 0 {
-            return if generations == 0 {
-                Ok(SessionAdvanceStats {
-                    requested_generations: 0,
-                    completed_generations: 0,
-                    starting_generation,
-                    reached_generation: starting_generation,
-                })
-            } else {
-                Err(HashLifeAdvanceError::NotLoaded {
-                    starting_generation,
-                    requested_delta: generations,
-                    completed_generations: 0,
-                    reached_generation: starting_generation,
-                })
-            };
-        }
-        let reached_generation = starting_generation.checked_add(generations).ok_or(
-            HashLifeAdvanceError::GenerationOverflow {
-                starting_generation,
-                requested_delta: generations,
-                completed_generations: 0,
-                reached_generation: starting_generation,
-            },
-        )?;
-        self.current_generation = reached_generation;
-        self.clear_cached_samples();
-        Ok(SessionAdvanceStats {
-            requested_generations: generations,
-            completed_generations: generations,
-            starting_generation,
-            reached_generation,
-        })
-    }
-
     pub fn advance_root(
         &mut self,
         generations: u64,
@@ -351,6 +320,7 @@ impl HashLifeSession {
                 reached_generation: starting_generation,
             },
         )?;
+        self.collect_before_allocation();
         let allocated_bytes = wide_allocated_bytes(self.engine.allocated_bytes());
         if allocated_bytes > self.limits.hard_memory_bytes {
             return Err(HashLifeAdvanceError::MemoryBudgetExceeded {
@@ -366,6 +336,7 @@ impl HashLifeSession {
         self.ensure_active_run();
         let mut remaining = generations;
         while remaining != 0 {
+            self.collect_before_allocation();
             if self
                 .allocation_gate
                 .check(HashLifeAllocationClass::ArenaGrowth, 1)
@@ -601,12 +572,19 @@ impl HashLifeSession {
         starting_generation: u64,
         requested_delta: u64,
     ) -> Option<HashLifeAdvanceError> {
+        self.engine.poll_advance_cancellation();
         let failure = self.engine.take_allocation_failure()?;
         let (root, origin_x, origin_y, generation, centered) = saved;
         self.restore_segment_state(root, origin_x, origin_y, generation, centered);
         self.engine.clear_transient_state(false);
         let completed_generations = generation - starting_generation;
         Some(match failure {
+            EngineAllocationFailure::Cancelled => HashLifeAdvanceError::Cancelled {
+                starting_generation,
+                requested_delta,
+                completed_generations,
+                reached_generation: generation,
+            },
             EngineAllocationFailure::Allocation { requested_bytes } => {
                 HashLifeAdvanceError::AllocationFailed {
                     starting_generation,
@@ -838,8 +816,30 @@ impl HashLifeSession {
     }
 
     pub fn export_snapshot_string(&mut self) -> Result<Option<String>, HashLifeSnapshotError> {
-        let Some(root) = self.current_root else {
+        let Some(snapshot) = self.export_snapshot_owned()? else {
             return Ok(None);
+        };
+        String::from_utf8(snapshot.into_bytes())
+            .map(Some)
+            .map_err(|_| HashLifeSnapshotError::new("snapshot writer emitted invalid UTF-8"))
+    }
+
+    pub fn export_snapshot_owned(
+        &mut self,
+    ) -> Result<Option<super::OwnedHashLifeSnapshot>, HashLifeSnapshotError> {
+        let mut bytes = Vec::new();
+        if !self.write_snapshot(&mut bytes)? {
+            return Ok(None);
+        }
+        Ok(Some(super::OwnedHashLifeSnapshot { bytes }))
+    }
+
+    pub fn write_snapshot(
+        &mut self,
+        writer: &mut impl Write,
+    ) -> Result<bool, HashLifeSnapshotError> {
+        let Some(root) = self.current_root else {
+            return Ok(false);
         };
         let estimated_bytes = (self.engine.node_count() as u128)
             .saturating_mul(256)
@@ -849,22 +849,24 @@ impl HashLifeSession {
             .map_err(|_| HashLifeSnapshotError::allocation(estimated_bytes))?;
         self.engine
             .begin_allocation_transaction(self.limits.hard_memory_bytes);
-        let exported = self.engine.export_snapshot_string(
+        let exported = self.engine.write_snapshot(
             root,
             self.current_origin_x,
             self.current_origin_y,
             self.current_generation,
+            writer,
         );
         let failure = self.engine.take_allocation_failure();
         if let Some(failure) = failure {
             let requested_bytes = match failure {
                 EngineAllocationFailure::Allocation { requested_bytes } => requested_bytes,
-                EngineAllocationFailure::NodeIdExhausted
+                EngineAllocationFailure::Cancelled
+                | EngineAllocationFailure::NodeIdExhausted
                 | EngineAllocationFailure::CanonicalReferenceExhausted => 0,
             };
             return Err(HashLifeSnapshotError::allocation(requested_bytes));
         }
-        exported.map(Some)
+        exported.map(|()| true)
     }
 
     pub fn extract_grid(
@@ -910,6 +912,7 @@ impl HashLifeSession {
 
     pub fn finish(&mut self) {
         self.finish_active_run();
+        self.engine.retained_roots.clear();
         self.current_root = None;
         self.current_generation = 0;
         self.checkpoint_level = None;
@@ -950,11 +953,5 @@ fn default_full_grid_policy() -> GridExtractionPolicy {
         max_population: u128::from(HASHLIFE_FULL_GRID_MAX_POPULATION),
         max_chunks: HASHLIFE_FULL_GRID_MAX_CHUNKS,
         max_bounds_span: Coord::MAX,
-    }
-}
-
-impl Drop for HashLifeSession {
-    fn drop(&mut self) {
-        self.finish();
     }
 }

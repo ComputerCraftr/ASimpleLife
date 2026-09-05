@@ -10,6 +10,7 @@ const BENCHMARK_FAMILY_HELP: &str = "iid,structured,clustered,smallbox,smallbox_
 pub struct Config {
     pub pattern: String,
     pub steps: usize,
+    pub steps_explicit: bool,
     pub max_generations: Option<u64>,
     pub target_generation: Option<u64>,
     pub step_generations: u64,
@@ -18,6 +19,16 @@ pub struct Config {
     pub height: usize,
     pub classify_only: bool,
     pub seed: u64,
+    pub run_mode: RunMode,
+    pub load: Option<String>,
+    pub bf: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunMode {
+    Auto,
+    Tui,
+    Headless,
 }
 
 impl Default for Config {
@@ -25,6 +36,7 @@ impl Default for Config {
         Self {
             pattern: "glider".to_string(),
             steps: 200,
+            steps_explicit: false,
             max_generations: None,
             target_generation: None,
             step_generations: 1,
@@ -33,6 +45,9 @@ impl Default for Config {
             height: 24,
             classify_only: false,
             seed: 1,
+            run_mode: RunMode::Auto,
+            load: None,
+            bf: None,
         }
     }
 }
@@ -74,11 +89,23 @@ where
 {
     let mut config = Config::default();
     let mut args = args.into_iter();
+    let mut source_flag: Option<&'static str> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--pattern" => config.pattern = next_string(&mut args, "--pattern")?,
-            "--steps" => config.steps = next_parsed(&mut args, "--steps")?,
+            "--pattern" => {
+                if source_flag.is_some() {
+                    return Err(CliAction::Error(
+                        "--pattern, --load, and --bf are mutually exclusive".to_string(),
+                    ));
+                }
+                source_flag = Some("--pattern");
+                config.pattern = next_string(&mut args, "--pattern")?;
+            }
+            "--steps" => {
+                config.steps = next_parsed(&mut args, "--steps")?;
+                config.steps_explicit = true;
+            }
             "--max-generations" => {
                 config.max_generations = Some(next_parsed(&mut args, "--max-generations")?)
             }
@@ -93,6 +120,40 @@ where
             "--height" => config.height = next_parsed(&mut args, "--height")?,
             "--seed" => config.seed = next_parsed(&mut args, "--seed")?,
             "--classify" => config.classify_only = true,
+            "--tui" => {
+                if config.run_mode == RunMode::Headless {
+                    return Err(CliAction::Error(
+                        "--tui and --headless are mutually exclusive".to_string(),
+                    ));
+                }
+                config.run_mode = RunMode::Tui;
+            }
+            "--headless" => {
+                if config.run_mode == RunMode::Tui {
+                    return Err(CliAction::Error(
+                        "--tui and --headless are mutually exclusive".to_string(),
+                    ));
+                }
+                config.run_mode = RunMode::Headless;
+            }
+            "--load" => {
+                if source_flag.is_some() {
+                    return Err(CliAction::Error(
+                        "--pattern, --load, and --bf are mutually exclusive".to_string(),
+                    ));
+                }
+                source_flag = Some("--load");
+                config.load = Some(next_string(&mut args, "--load")?);
+            }
+            "--bf" => {
+                if source_flag.is_some() {
+                    return Err(CliAction::Error(
+                        "--pattern, --load, and --bf are mutually exclusive".to_string(),
+                    ));
+                }
+                source_flag = Some("--bf");
+                config.bf = Some(next_string(&mut args, "--bf")?);
+            }
             "--help" | "-h" => return Err(CliAction::Help),
             _ => return Err(CliAction::Error(format!("unknown argument: {arg}"))),
         }
@@ -169,6 +230,11 @@ where
 }
 
 fn validate(config: Config) -> Result<Config, CliAction> {
+    if config.classify_only && config.run_mode == RunMode::Tui {
+        return Err(CliAction::Error(
+            "--classify and --tui are mutually exclusive; use c inside the TUI".to_string(),
+        ));
+    }
     if config.width == 0 {
         return Err(CliAction::Error(
             "--width must be greater than zero".to_string(),
@@ -192,7 +258,14 @@ fn validate(config: Config) -> Result<Config, CliAction> {
     if config.pattern.trim().is_empty() {
         return Err(CliAction::Error("--pattern must not be empty".to_string()));
     }
-    if config.pattern != "random"
+    let explicit_sources = usize::from(config.load.is_some()) + usize::from(config.bf.is_some());
+    if explicit_sources > 1 {
+        return Err(CliAction::Error(
+            "--load and --bf are mutually exclusive".to_string(),
+        ));
+    }
+    if explicit_sources == 0
+        && config.pattern != "random"
         && pattern_by_name(&config.pattern).is_none()
         && !std::path::Path::new(&config.pattern).exists()
     {
@@ -246,6 +319,10 @@ pub fn print_help() {
     println!("ASimpleLife");
     println!("  --pattern <name>   {APP_PATTERN_HELP}");
     println!("  --steps <n>        number of generations to run");
+    println!("  --tui              force the interactive TUI");
+    println!("  --headless         force finite noninteractive rendering");
+    println!("  --load <file>      load a Life grid or HashLife snapshot");
+    println!("  --bf <src|file>    compile Brainfuck into a Life universe");
     println!("  --max-generations <n>  classifier generation horizon");
     println!("  --target-generation <n>  start rendering/classifying at generation n");
     println!("  --step-generations <n>  generations to advance per rendered frame");
@@ -300,6 +377,7 @@ mod tests {
 
         assert_eq!(config.pattern, "gosper_glider_gun");
         assert_eq!(config.steps, 10);
+        assert!(config.steps_explicit);
         assert_eq!(config.max_generations, None);
         assert_eq!(config.target_generation, Some(64));
         assert_eq!(config.step_generations, 1);
@@ -397,6 +475,49 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.width, 80);
         assert_eq!(config.height, 24);
+        assert!(!config.steps_explicit);
+        assert_eq!(config.run_mode, super::RunMode::Auto);
+    }
+
+    #[test]
+    fn tui_and_headless_are_mutually_exclusive() {
+        let error = parse_from(vec!["--tui".to_string(), "--headless".to_string()])
+            .error_or_invariant("expected run-mode conflict");
+        assert_eq!(
+            error,
+            CliAction::Error("--tui and --headless are mutually exclusive".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_and_tui_are_mutually_exclusive() {
+        let error = parse_from(vec!["--tui".to_string(), "--classify".to_string()])
+            .error_or_invariant("expected classification mode conflict");
+        assert_eq!(
+            error,
+            CliAction::Error(
+                "--classify and --tui are mutually exclusive; use c inside the TUI".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn parses_snapshot_and_bf_sources_exclusively() {
+        let snapshot = parse_from(vec!["--load".to_string(), "state.hls".to_string()])
+            .or_invariant("snapshot source");
+        assert_eq!(snapshot.load.as_deref(), Some("state.hls"));
+
+        let error = parse_from(vec![
+            "--load".to_string(),
+            "state.hls".to_string(),
+            "--bf".to_string(),
+            "+.".to_string(),
+        ])
+        .error_or_invariant("expected source conflict");
+        assert_eq!(
+            error,
+            CliAction::Error("--pattern, --load, and --bf are mutually exclusive".to_string())
+        );
     }
 
     #[test]

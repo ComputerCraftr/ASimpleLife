@@ -17,28 +17,30 @@ impl HashLifeEngine {
 
     pub(in crate::hashlife) fn release_packed_transform_state(&mut self) {
         self.transform_state.canonical_cache.release_storage();
-        self.transform_state.compare_cache.release_storage();
         self.transform_state.intern.release_storage();
         self.transform_state.nodes = Vec::new();
         self.transform_state.materialized = Vec::new();
         self.transform_state.packed_roots = Vec::new();
         #[cfg(test)]
         {
-            self.transform_state.cache = crate::flat_table::FlatTable::with_capacity(1);
+            self.transform_state.cache.release_storage();
         }
     }
 
-    pub(in crate::hashlife) fn reset_packed_transform_state(&mut self) {
+    pub(in crate::hashlife) fn clear_packed_transform_state(&mut self) {
         #[cfg(test)]
         {
-            self.transform_state.cache = crate::flat_table::FlatTable::with_capacity(64);
+            self.transform_state.cache.clear();
         }
         self.transform_state.canonical_cache.reset();
-        self.transform_state.compare_cache.reset();
         self.transform_state.intern.reset();
         self.transform_state.nodes.clear();
         self.transform_state.materialized.clear();
         self.transform_state.packed_roots.clear();
+    }
+
+    pub(in crate::hashlife) fn reset_packed_transform_state(&mut self) {
+        self.clear_packed_transform_state();
         if !self.prepare_mandatory_transform_growth(2) {
             return;
         }
@@ -52,8 +54,12 @@ impl HashLifeEngine {
             self.transform_state.nodes.push(PackedTransformNode {
                 level: 0,
                 leaf_population: population,
-                children: [0; 4],
-                canonical_ref: u32::from(alive),
+                children: [PackedTransformId::ZERO; 4],
+                canonical_ref: if alive {
+                    CanonicalShapeId::LIVE
+                } else {
+                    CanonicalShapeId::DEAD
+                },
             });
             self.transform_state.materialized.push(Some(if alive {
                 self.live_leaf
@@ -62,14 +68,27 @@ impl HashLifeEngine {
             }));
             self.transform_state
                 .packed_roots
-                .push(Some(PackedNodeKey::new(0, [u32::from(alive), 0, 0, 0])));
+                .push(Some(PackedNodeKey::new(
+                    0,
+                    [
+                        NodeId::from(alive),
+                        NodeId::ZERO,
+                        NodeId::ZERO,
+                        NodeId::ZERO,
+                    ],
+                )));
             if self
                 .transform_state
                 .intern
                 .try_insert(
                     PackedTransformShapeKey {
                         level: 0,
-                        children: [u32::from(alive), 0, 0, 0],
+                        children: [
+                            PackedTransformId::from(alive),
+                            PackedTransformId::ZERO,
+                            PackedTransformId::ZERO,
+                            PackedTransformId::ZERO,
+                        ],
                     },
                     leaf_id,
                 )
@@ -83,7 +102,7 @@ impl HashLifeEngine {
 
     #[inline]
     fn leaf_transform_id(&self, alive: bool) -> PackedTransformId {
-        u32::from(alive)
+        PackedTransformId::from(alive)
     }
 
     fn intern_packed_transform_node(
@@ -96,18 +115,18 @@ impl HashLifeEngine {
             return existing;
         }
         if !self.prepare_mandatory_transform_growth(1) {
-            return 0;
+            return PackedTransformId::ZERO;
         }
         let Ok(id) = PackedTransformId::try_from(self.transform_state.nodes.len()) else {
             self.reject_allocation(u128::MAX);
-            return 0;
+            return PackedTransformId::ZERO;
         };
         let order_children =
-            children.map(|child| self.transform_state.nodes[child as usize].canonical_ref);
-        let structural = CanonicalStructKey::new(level, order_children);
+            children.map(|child| self.transform_state.nodes[child.index()].canonical_ref);
+        let structural = self.canonical_parent_key(level, order_children);
         let canonical_ref = self.intern_canonical_shape(structural);
         if self.allocation_failed() {
-            return 0;
+            return PackedTransformId::ZERO;
         }
         self.transform_state.nodes.push(PackedTransformNode {
             level,
@@ -118,8 +137,11 @@ impl HashLifeEngine {
         self.transform_state.materialized.push(None);
         self.transform_state.packed_roots.push(None);
         if self.transform_state.intern.try_insert(shape, id).is_err() {
+            self.transform_state.nodes.pop();
+            self.transform_state.materialized.pop();
+            self.transform_state.packed_roots.pop();
             self.reject_allocation(1);
-            return 0;
+            return PackedTransformId::ZERO;
         }
         id
     }
@@ -131,10 +153,10 @@ impl HashLifeEngine {
     ) -> PackedTransformId {
         self.ensure_packed_transform_state();
         if self.allocation_failed() {
-            return 0;
+            return PackedTransformId::ZERO;
         }
         if packed.level == 0 {
-            return self.leaf_transform_id(packed.children[0] != 0);
+            return self.leaf_transform_id(packed.children[0] != NodeId::ZERO);
         }
         let root_key = PackedSymmetryKey { packed, symmetry };
         if let Some(transformed) = self.transform_state.canonical_cache.get(&root_key) {
@@ -145,7 +167,7 @@ impl HashLifeEngine {
         let empty_frame = TransformFrame {
             packed,
             next_child: 0,
-            child_ids: [0; 4],
+            child_ids: [PackedTransformId::ZERO; 4],
         };
         let mut stack = [empty_frame; 64];
         let mut stack_len = 1;
@@ -166,7 +188,7 @@ impl HashLifeEngine {
                 stack[stack_len - 1].next_child += 1;
                 let child = self.node_columns.packed_key(current.children[child_index]);
                 let child_id = if child.level == 0 {
-                    Some(self.leaf_transform_id(child.children[0] != 0))
+                    Some(self.leaf_transform_id(child.children[0] != NodeId::ZERO))
                 } else {
                     self.transform_state
                         .canonical_cache
@@ -185,7 +207,7 @@ impl HashLifeEngine {
                 stack[stack_len] = TransformFrame {
                     packed: child,
                     next_child: 0,
-                    child_ids: [0; 4],
+                    child_ids: [PackedTransformId::ZERO; 4],
                 };
                 stack_len += 1;
                 descended = true;
@@ -221,35 +243,17 @@ impl HashLifeEngine {
         crate::invariant_failure!("transform traversal produced no root")
     }
 
+    #[cfg(test)]
     pub(in crate::hashlife) fn compare_packed_transform_ids(
-        &mut self,
+        &self,
         left: PackedTransformId,
         right: PackedTransformId,
     ) -> std::cmp::Ordering {
         if left == right {
             return std::cmp::Ordering::Equal;
         }
-        let (key, invert) = if left < right {
-            (PackedTransformCompareKey { left, right }, false)
-        } else {
-            (
-                PackedTransformCompareKey {
-                    left: right,
-                    right: left,
-                },
-                true,
-            )
-        };
-        if let Some(cached) = self.transform_state.compare_cache.get(&key) {
-            return match (cached, invert) {
-                (0, _) => std::cmp::Ordering::Equal,
-                (-1, false) | (1, true) => std::cmp::Ordering::Less,
-                (1, false) | (-1, true) => std::cmp::Ordering::Greater,
-                _ => crate::invariant_failure!("invalid packed transform compare cache entry"),
-            };
-        }
         let mut ordering = std::cmp::Ordering::Equal;
-        let mut stack = [(key.left, key.right, 0_usize); 128];
+        let mut stack = [(left, right, 0_usize); 128];
         let mut stack_len = 1;
         while stack_len != 0 {
             stack_len -= 1;
@@ -257,8 +261,8 @@ impl HashLifeEngine {
             if current_left == current_right {
                 continue;
             }
-            let left_node = self.transform_state.nodes[current_left as usize];
-            let right_node = self.transform_state.nodes[current_right as usize];
+            let left_node = self.transform_state.nodes[current_left.index()];
+            let right_node = self.transform_state.nodes[current_right.index()];
             let node_ordering = left_node.level.cmp(&right_node.level).then_with(|| {
                 if left_node.level == 0 {
                     left_node.leaf_population.cmp(&right_node.leaf_population)
@@ -287,45 +291,14 @@ impl HashLifeEngine {
                 }
             }
         }
-        let cached_value = match ordering {
-            std::cmp::Ordering::Less => -1,
-            std::cmp::Ordering::Equal => 0,
-            std::cmp::Ordering::Greater => 1,
-        };
-        self.publish_optional_cache(
-            |engine| &engine.transform_state.compare_cache,
-            |engine| &mut engine.transform_state.compare_cache,
-            key,
-            key.fingerprint(),
-            cached_value,
-        );
-        if invert { ordering.reverse() } else { ordering }
-    }
-
-    pub(in crate::hashlife) fn transformed_order_entry(
-        &mut self,
-        packed: PackedNodeKey,
-        symmetry: Symmetry,
-    ) -> PackedTransformOrderEntry {
-        if let Some(existing) = self.intern.get(&packed) {
-            return self.symmetry_entry(existing, symmetry);
-        }
-        if packed.level == 0 {
-            let structural = CanonicalStructKey::leaf(packed.children[0] != 0);
-            return PackedTransformOrderEntry { structural };
-        }
-        let perm = symmetry.quadrant_perm();
-        let order_children =
-            perm.map(|index| self.symmetry_canonical_ref(packed.children[index], symmetry));
-        let structural = CanonicalStructKey::new(packed.level, order_children);
-        PackedTransformOrderEntry { structural }
+        ordering
     }
 }
 
 #[cfg(test)]
 impl HashLifeEngine {
     fn materialize_packed_transform_node_internal(&mut self, id: PackedTransformId) -> NodeId {
-        if let Some(node) = self.transform_state.materialized[id as usize] {
+        if let Some(node) = self.transform_state.materialized[id.index()] {
             return node;
         }
         let mut stack = [(id, false); 256];
@@ -333,10 +306,10 @@ impl HashLifeEngine {
         while stack_len != 0 {
             stack_len -= 1;
             let (current, ready) = stack[stack_len];
-            if self.transform_state.materialized[current as usize].is_some() {
+            if self.transform_state.materialized[current.index()].is_some() {
                 continue;
             }
-            let transform_node = self.transform_state.nodes[current as usize];
+            let transform_node = self.transform_state.nodes[current.index()];
             debug_assert!(transform_node.level != 0);
             if !ready {
                 if stack_len + 5 > stack.len() {
@@ -347,11 +320,11 @@ impl HashLifeEngine {
                 stack[stack_len] = (current, true);
                 stack_len += 1;
                 for child in transform_node.children {
-                    if self.transform_state.materialized[child as usize].is_none() {
-                        if self.transform_state.nodes[child as usize].level == 0 {
+                    if self.transform_state.materialized[child.index()].is_none() {
+                        if self.transform_state.nodes[child.index()].level == 0 {
                             let alive =
-                                self.transform_state.nodes[child as usize].leaf_population != 0;
-                            self.transform_state.materialized[child as usize] = Some(if alive {
+                                self.transform_state.nodes[child.index()].leaf_population != 0;
+                            self.transform_state.materialized[child.index()] = Some(if alive {
                                 self.live_leaf
                             } else {
                                 self.dead_leaf
@@ -365,21 +338,21 @@ impl HashLifeEngine {
                 continue;
             }
             let children = transform_node.children.map(|child| {
-                self.transform_state.materialized[child as usize].or_invariant(
+                self.transform_state.materialized[child.index()].or_invariant(
                     "iterative transform materialization must resolve child before parent",
                 )
             });
             let node = self.join(children[0], children[1], children[2], children[3]);
-            self.transform_state.materialized[current as usize] = Some(node);
+            self.transform_state.materialized[current.index()] = Some(node);
         }
-        self.transform_state.materialized[id as usize]
+        self.transform_state.materialized[id.index()]
             .or_invariant("iterative transform materialization must resolve target")
     }
 }
 
 impl HashLifeEngine {
     pub(super) fn packed_root_from_transform_id(&mut self, id: PackedTransformId) -> PackedNodeKey {
-        if let Some(packed) = self.transform_state.packed_roots[id as usize] {
+        if let Some(packed) = self.transform_state.packed_roots[id.index()] {
             return packed;
         }
         let mut stack = [(id, false); 256];
@@ -387,10 +360,10 @@ impl HashLifeEngine {
         while stack_len != 0 {
             stack_len -= 1;
             let (current, ready) = stack[stack_len];
-            if self.transform_state.packed_roots[current as usize].is_some() {
+            if self.transform_state.packed_roots[current.index()].is_some() {
                 continue;
             }
-            let transform_node = self.transform_state.nodes[current as usize];
+            let transform_node = self.transform_state.nodes[current.index()];
             debug_assert!(transform_node.level != 0);
             if !ready {
                 if stack_len + 5 > stack.len() {
@@ -401,13 +374,20 @@ impl HashLifeEngine {
                 stack[stack_len] = (current, true);
                 stack_len += 1;
                 for child in transform_node.children {
-                    if self.transform_state.packed_roots[child as usize].is_none() {
-                        if self.transform_state.nodes[child as usize].level == 0 {
+                    if self.transform_state.packed_roots[child.index()].is_none() {
+                        if self.transform_state.nodes[child.index()].level == 0 {
                             let leaf_population =
-                                self.transform_state.nodes[child as usize].leaf_population;
-                            self.transform_state.packed_roots[child as usize] = Some(
-                                PackedNodeKey::new(0, [u32::from(leaf_population != 0), 0, 0, 0]),
-                            );
+                                self.transform_state.nodes[child.index()].leaf_population;
+                            self.transform_state.packed_roots[child.index()] =
+                                Some(PackedNodeKey::new(
+                                    0,
+                                    [
+                                        NodeId::from(leaf_population != 0),
+                                        NodeId::ZERO,
+                                        NodeId::ZERO,
+                                        NodeId::ZERO,
+                                    ],
+                                ));
                         } else {
                             stack[stack_len] = (child, false);
                             stack_len += 1;
@@ -417,16 +397,16 @@ impl HashLifeEngine {
                 continue;
             }
             let child_roots = transform_node.children.map(|child| {
-                self.transform_state.packed_roots[child as usize]
+                self.transform_state.packed_roots[child.index()]
                     .or_invariant("iterative packed roots must resolve children before parent")
             });
             let packed = PackedNodeKey::new(
                 transform_node.level,
                 child_roots.map(|child| self.materialize_packed_node_key_internal(child)),
             );
-            self.transform_state.packed_roots[current as usize] = Some(packed);
+            self.transform_state.packed_roots[current.index()] = Some(packed);
         }
-        self.transform_state.packed_roots[id as usize]
+        self.transform_state.packed_roots[id.index()]
             .or_invariant("iterative packed root must resolve target")
     }
 }
@@ -589,7 +569,7 @@ impl HashLifeEngine {
             return nodes;
         }
 
-        let mut transformed = [0; N];
+        let mut transformed = [NodeId::ZERO; N];
         for lane in 0..N {
             let node = nodes[lane];
             if self.node_columns.level(node) == 0 {
@@ -656,7 +636,6 @@ mod allocation_tests {
         assert_eq!(engine.take_allocation_failure(), None);
 
         engine.transform_state.canonical_cache.release_storage();
-        engine.transform_state.compare_cache.release_storage();
         let retained = super::super::super::memory::wide_allocated_bytes(engine.allocated_bytes());
         engine.begin_allocation_transaction(retained);
         let transformed = engine.transform_packed_node_key(packed, Symmetry::Rotate90);
@@ -664,6 +643,5 @@ mod allocation_tests {
         assert_eq!(engine.take_allocation_failure(), None);
         assert_eq!(transformed, expected);
         assert_eq!(engine.transform_state.canonical_cache.len(), 0);
-        assert_eq!(engine.transform_state.compare_cache.len(), 0);
     }
 }

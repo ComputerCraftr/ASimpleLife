@@ -1,7 +1,10 @@
 use crate::RequiredExt;
-use crate::benchmark::effective_generation_limit;
 use crate::bitgrid::BitGrid;
-use crate::classify::{Classification, ClassificationLimits, classify_seed};
+use crate::classify::{
+    Classification, ClassificationCache, ClassificationCertainty, ClassificationEvidence,
+    ClassificationGrowthKind, ClassificationLimits, ClassificationOutcome, classify_seed,
+    classify_seed_report_cached, effective_generation_limit,
+};
 use crate::engine::SimulationSession;
 use crate::generators::pattern_by_name;
 use crate::memo::Memo;
@@ -85,20 +88,143 @@ fn hashlife_checkpoint_repeat_reports_fundamental_period() {
 fn classification_cache_rejects_limit_dependent_outcomes() {
     let grid = separated_blocks(1, 4);
     let signature = normalize(&grid).0;
-    let mut memo = Memo::default();
-    memo.insert_classification(
+    let mut cache = ClassificationCache::default();
+    cache.insert(
         signature.clone(),
+        crate::classify::ClassificationReport {
+            outcome: ClassificationOutcome::Expanding,
+            certainty: ClassificationCertainty::Heuristic,
+            observed_through: 512,
+            evidence: ClassificationEvidence::PersistentGrowth {
+                kind: ClassificationGrowthKind::PersistentExpansion,
+                detected_at: 512,
+            },
+        },
+    );
+
+    assert!(
+        cache.is_empty(),
+        "heuristic classifications must not leak across classification horizons"
+    );
+    assert_eq!(cache.get(&signature), None);
+}
+
+#[test]
+fn classification_cache_is_independent_from_transition_cache_collection() {
+    let grid = separated_blocks(1, 4);
+    let signature = normalize(&grid).0;
+    let mut classification_cache = ClassificationCache::default();
+    let mut transition_memo = Memo::default();
+    let report = classify_seed_report_cached(
+        &grid,
+        &ClassificationLimits::default(),
+        &mut transition_memo,
+        &mut classification_cache,
+    );
+
+    transition_memo.force_collect_transition_caches();
+
+    assert_eq!(
+        classification_cache.get(&signature),
+        Some(report),
+        "transition-cache collection must not own or invalidate classifier results"
+    );
+}
+
+#[test]
+fn typed_report_distinguishes_still_life_from_oscillator() {
+    let mut cache = ClassificationCache::default();
+    let still_life = classify_seed_report_cached(
+        &separated_blocks(1, 4),
+        &ClassificationLimits::default(),
+        &mut Memo::default(),
+        &mut cache,
+    );
+    let oscillator = classify_seed_report_cached(
+        &pattern_by_name("blinker").or_invariant("blinker fixture should exist"),
+        &ClassificationLimits::default(),
+        &mut Memo::default(),
+        &mut cache,
+    );
+
+    assert_eq!(still_life.outcome, ClassificationOutcome::StillLife);
+    assert_eq!(still_life.certainty, ClassificationCertainty::Exact);
+    assert_eq!(
+        still_life.evidence,
+        ClassificationEvidence::Recurrence {
+            period: 1,
+            first_seen: 0,
+            displacement: (0, 0),
+            detected_at: 1,
+        }
+    );
+    assert_eq!(oscillator.outcome, ClassificationOutcome::Oscillator);
+    assert_eq!(oscillator.certainty, ClassificationCertainty::Exact);
+    assert!(
+        matches!(
+            oscillator.evidence,
+            ClassificationEvidence::Recurrence {
+                period: 2,
+                displacement: (0, 0),
+                ..
+            }
+        ),
+        "blinker should carry exact period-two recurrence evidence: {oscillator:?}"
+    );
+    assert_eq!(cache.len(), 2, "both exact reports should be cached");
+    assert_eq!(
+        still_life.to_legacy(),
+        Classification::Repeats {
+            period: 1,
+            first_seen: 0,
+        }
+    );
+}
+
+#[test]
+fn classifier_and_oracle_share_exact_recurrence_semantics() {
+    for name in ["block", "blinker", "glider"] {
+        let grid = pattern_by_name(name).or_invariant("recurrence fixture should exist");
+        let limits = ClassificationLimits {
+            max_generations: 64,
+        };
+        let classified = classify_seed(&grid, &limits, &mut Memo::default());
+        let mut simulation = SimulationSession::new();
+        let oracle = OracleSession::new(grid, 0, &mut simulation)
+            .classify_continuation(64, limits.max_generations);
+        assert_eq!(classified, oracle, "repeat semantics diverged for {name}");
+    }
+}
+
+#[test]
+fn typed_reports_round_trip_legacy_classifier_results() {
+    let cases = [
+        Classification::DiesOut { at_generation: 7 },
+        Classification::Repeats {
+            period: 3,
+            first_seen: 5,
+        },
+        Classification::Spaceship {
+            period: 4,
+            first_seen: 0,
+            delta: (1, -1),
+            detected_at: 4,
+        },
         Classification::LikelyInfinite {
             reason: "persistent_expansion",
             detected_at: 512,
         },
-    );
+        Classification::Unknown { simulated: 128 },
+    ];
 
-    assert_eq!(
-        memo.get_classification(&signature),
-        None,
-        "heuristic classifications must not leak across classification horizons"
-    );
+    for classification in cases {
+        let report = crate::classify::ClassificationReport::from_legacy(&classification);
+        assert_eq!(
+            report.to_legacy(),
+            classification,
+            "typed compatibility conversion changed classifier semantics: {report:?}"
+        );
+    }
 }
 
 #[test]

@@ -27,8 +27,9 @@ fn assert_checkpoint_state_eq(
         "{context}: population"
     );
     assert_eq!(actual.root_span, expected.root_span, "{context}: root span");
-    assert!(
-        !actual.identity.same_epoch(expected.identity),
+    assert_ne!(
+        (actual.identity.session, actual.identity.epoch),
+        (expected.identity.session, expected.identity.epoch),
         "{context}: independently loaded sessions must not share root-id identity"
     );
 }
@@ -208,9 +209,16 @@ fn hashlife_memory_error_preserves_last_completed_generation() {
     assert_eq!(requested_generation, 10);
     assert_eq!(reached_generation, 0);
     assert_eq!(session.generation(), reached_generation);
-    assert_eq!(allocated_bytes, allocated_before);
-    assert_eq!(session.allocated_bytes(), allocated_before);
-    assert!(allocated_before > limit_bytes);
+    assert_eq!(
+        allocated_bytes,
+        session.allocated_bytes(),
+        "failure must report post-reclamation retained bytes"
+    );
+    assert!(
+        allocated_bytes <= allocated_before,
+        "failed advancement grew retained storage"
+    );
+    assert!(allocated_bytes > limit_bytes);
     assert_eq!(limit_bytes, 1);
 
     session.set_limits(HashLifeLimits::default());
@@ -358,6 +366,54 @@ fn hashlife_snapshot_roundtrips_session_state() {
             .sample_grid()
             .or_invariant("restored snapshot should be materializable"),
         &expected_grid,
+    );
+}
+
+#[test]
+fn hashlife_streaming_snapshot_roundtrips_generation_and_root_without_materialization() {
+    let initial = pattern_by_name("glider").or_invariant("glider fixture");
+    let mut source = HashLifeSession::new();
+    source
+        .try_load_grid(&initial)
+        .or_invariant("streaming snapshot fixture should load");
+    source
+        .advance_root(GEN_SNAPSHOT)
+        .or_invariant("streaming snapshot fixture should advance");
+
+    let mut encoded = Vec::new();
+    assert!(
+        source
+            .write_snapshot(&mut encoded)
+            .or_invariant("streaming snapshot should write"),
+        "loaded session unexpectedly reported no snapshot"
+    );
+    assert_eq!(
+        source.sample_materializations(),
+        0,
+        "direct DAG snapshot export materialized the source grid"
+    );
+
+    let mut restored = HashLifeSession::new();
+    restored
+        .load_snapshot_reader(std::io::Cursor::new(&encoded))
+        .or_invariant("streaming snapshot should load directly");
+    let mut reencoded = Vec::new();
+    assert!(
+        restored
+            .write_snapshot(&mut reencoded)
+            .or_invariant("restored snapshot should write"),
+        "restored session unexpectedly reported no snapshot"
+    );
+
+    assert_eq!(restored.generation(), GEN_SNAPSHOT);
+    assert_eq!(
+        reencoded, encoded,
+        "direct snapshot load changed the canonical root serialization"
+    );
+    assert_eq!(
+        restored.sample_materializations(),
+        0,
+        "direct DAG snapshot import or re-export materialized a grid"
     );
 }
 

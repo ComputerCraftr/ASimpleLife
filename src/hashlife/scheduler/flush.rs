@@ -15,22 +15,19 @@ impl HashLifeEngine {
             return;
         }
 
-        let Some(mut provisional_candidates) =
-            self.try_transient_vec::<SimdProvisionalRecord>(provisional_candidate_keys.len())
+        let active = provisional_candidate_keys.len();
+        let Some(provisional_candidates) =
+            self.build_step0_provisional_records_staged(provisional_candidate_keys)
         else {
             return;
         };
-        self.build_step0_provisional_records_staged(
-            provisional_candidate_keys,
-            &mut provisional_candidates,
-        );
         provisional_candidate_keys.clear();
 
         self.stats.simd.step0_kernel_candidate_batches += 1;
-        self.stats.simd.step0_kernel_candidate_lanes += provisional_candidates.len();
-        let packed = Self::pack_simd_batch(&provisional_candidates);
+        self.stats.simd.step0_kernel_candidate_lanes += active;
+        let packed = Self::pack_simd_batch(&provisional_candidates[..active]);
         let batch_result = self.evaluate_simd_batch(&packed);
-        for (lane, provisional) in provisional_candidates.drain(..).enumerate() {
+        for (lane, &provisional) in provisional_candidates[..active].iter().enumerate() {
             self.schedule_step0_provisional_task(provisional, batch_result.lanes[lane], state);
         }
     }
@@ -126,7 +123,7 @@ impl HashLifeEngine {
             provisional: provisional_candidates[0],
             task_id: 0,
             next_exp: 0,
-            next_children: [0; 4],
+            next_children: [NodeId::ZERO; 4],
         }; SIMD_BATCH_LANES];
         let mut intents = [[None; SIMD_BATCH_LANES]; 4];
         for lane in 0..active {
@@ -143,7 +140,7 @@ impl HashLifeEngine {
                 provisional,
                 task_id,
                 next_exp,
-                next_children: [0; 4],
+                next_children: [NodeId::ZERO; 4],
             };
             let level = provisional.level;
             let centered = match provisional.inputs {
@@ -252,14 +249,14 @@ impl HashLifeEngine {
         let mut lanes = [Phase2CommitLane {
             key: seed.cache_key,
             fallback: self.dead_leaf,
-            result: 0,
+            result: NodeId::ZERO,
             unique_input_index: usize::MAX,
             packed_input: PackedSymmetryKey {
-                packed: PackedNodeKey::new(0, [0; 4]),
+                packed: PackedNodeKey::new(0, [NodeId::ZERO; 4]),
                 symmetry: Symmetry::Identity,
             },
             canonical_entry: PackedSymmetryKey {
-                packed: PackedNodeKey::new(0, [0; 4]),
+                packed: PackedNodeKey::new(0, [NodeId::ZERO; 4]),
                 symmetry: Symmetry::Identity,
             },
         }; SIMD_BATCH_LANES];
@@ -289,14 +286,14 @@ impl HashLifeEngine {
             lanes[lane] = Phase2CommitLane {
                 key: provisional.cache_key,
                 fallback,
-                result: 0,
+                result: NodeId::ZERO,
                 unique_input_index: usize::MAX,
                 packed_input: PackedSymmetryKey {
-                    packed: PackedNodeKey::new(0, [0; 4]),
+                    packed: PackedNodeKey::new(0, [NodeId::ZERO; 4]),
                     symmetry: Symmetry::Identity,
                 },
                 canonical_entry: PackedSymmetryKey {
-                    packed: PackedNodeKey::new(0, [0; 4]),
+                    packed: PackedNodeKey::new(0, [NodeId::ZERO; 4]),
                     symmetry: Symmetry::Identity,
                 },
             };
@@ -326,7 +323,7 @@ impl HashLifeEngine {
             self.stats.simd.scalar_commit_lanes += 1;
         }
         provisional_candidates.clear();
-        self.canonicalize_phase2_commit_lanes(&mut lanes);
+        self.canonicalize_phase2_commit_lanes(&mut lanes[..active]);
         for lane in &lanes[..active] {
             let fingerprint = lane.key.fingerprint();
             self.record_and_publish_jump_entry(lane.key, fingerprint, lane.canonical_entry);

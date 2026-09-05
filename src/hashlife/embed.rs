@@ -61,11 +61,16 @@ fn translated_embedded_cells(
     };
 
     for ((chunk_x, chunk_y), mut bits) in grid.occupied_chunks() {
+        if bits == 0 {
+            continue;
+        }
+        let base_x = chunk_x * 8;
+        let base_y = chunk_y * 8;
         while bits != 0 {
             let bit = bits.trailing_zeros();
             let local_x = i64::from(bit % 8);
             let local_y = i64::from(bit / 8);
-            cell_batch[batch_len] = (chunk_x * 8 + local_x, chunk_y * 8 + local_y);
+            cell_batch[batch_len] = (base_x + local_x, base_y + local_y);
             batch_len += 1;
             bits &= bits - 1;
             if batch_len == SIMD_BATCH_LANES {

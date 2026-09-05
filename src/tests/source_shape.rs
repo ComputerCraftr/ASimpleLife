@@ -23,7 +23,6 @@ use source_policy_narrowing::rust_wide_narrowing_violations;
 const MAX_SOURCE_LINES_EXCLUSIVE: usize = 1000;
 const MAX_STRUCT_FIELDS: usize = 24;
 const SOURCE_POLICY_EXTENSIONS: &[&str] = &["rs", "c", "h"];
-const EXCLUDED_SOURCE_DIRS: &[&str] = &[".git", "target", "vendor"];
 const ALLOWED_IGNORED_TESTS: &[(&str, &str)] = &[
     (
         "exhaustive_all_5x5_patterns_reference_check",
@@ -72,38 +71,7 @@ const ALLOWED_IGNORED_TESTS: &[(&str, &str)] = &[
 ];
 
 fn collect_source_files(root: &Path, extensions: &[&str]) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut dirs = vec![root.to_path_buf()];
-    while let Some(dir) = dirs.pop() {
-        let mut entries = fs::read_dir(&dir)
-            .unwrap_or_else(|err| {
-                crate::invariant_failure!("failed to read {}: {err}", dir.display())
-            })
-            .map(|entry| entry.or_invariant("required value"))
-            .collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.path());
-
-        for entry in entries.into_iter().rev() {
-            let path = entry.path();
-            if path.is_dir() {
-                if !path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| EXCLUDED_SOURCE_DIRS.contains(&name))
-                {
-                    dirs.push(path);
-                }
-            } else if path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| extensions.contains(&ext))
-            {
-                out.push(path);
-            }
-        }
-    }
-    out.sort();
-    out
+    crate::test_support::source_files(root, extensions).or_invariant("discover policy sources")
 }
 
 fn parse_source_functions(path: &Path, source: &str) -> Vec<SourceFunction> {
@@ -666,19 +634,21 @@ fn source_files_stay_under_1000_lines() {
 }
 
 #[test]
-fn hashlife_embedding_iterates_borrowed_chunks_without_materializing_live_cells() {
+fn hashlife_cell_translation_borrows_chunks_without_a_live_cell_copy() {
     let repository = RustRepository::discover(Path::new(env!("CARGO_MANIFEST_DIR")))
         .or_invariant("parsed repository Rust sources");
     let source = repository
-        .source_containing_callable("try_embed_grid_state")
-        .or_invariant("unique HashLife grid embedding source");
+        .source_containing_callable("translated_embedded_cells")
+        .or_invariant("unique HashLife cell translation source");
     assert_eq!(
-        source.method_call_count("live_cells"),
-        0,
+        source.callable_method_count("translated_embedded_cells", "live_cells"),
+        Some(0),
         "HashLife embedding must borrow occupied storage instead of allocating a full live-cell copy"
     );
     assert!(
-        source.method_call_count("occupied_chunks") > 0,
+        source
+            .callable_method_count("translated_embedded_cells", "occupied_chunks")
+            .is_some_and(|count| count > 0),
         "HashLife embedding no longer uses the borrowed occupied-chunk API"
     );
 }

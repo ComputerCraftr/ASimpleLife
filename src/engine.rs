@@ -7,21 +7,21 @@ use crate::hashlife::{
 };
 use crate::life::{CellStepWorkspace, step_grid_state_only_with_workspace};
 use crate::memo::Memo;
-use crate::normalize::{NormalizedGridSignature, normalize};
-use std::collections::HashMap;
+use crate::recurrence::{
+    ExactRecurrenceTracker, Lineage, Observation, ObserveOutcome, PeriodicCertificate,
+    RecurrenceUnavailable,
+};
 use std::fmt;
+use std::io::{Cursor, Read, Write};
+
+#[cfg(test)]
+mod recurrence_tests;
 
 const HYBRID_PREFIX_LIMIT: u64 = 64;
 const EXACT_REPEAT_SKIP_GENERATION_LIMIT: u64 = 4_096;
 const CELL_PROBES_PER_CHUNK_GENERATION: u128 = 81;
 const HASHLIFE_SETUP_BASE_WORK: u128 = 4_096;
 const HASHLIFE_WORK_PER_CHUNK_LEVEL: u128 = 16;
-const REPEAT_MAX_CELLS: usize = 4_096;
-const REPEAT_MAX_CHUNKS: usize = 1_024;
-const REPEAT_MAX_ENTRIES: usize = 4_096;
-const REPEAT_MAX_BYTES: usize = 8 * 1024 * 1024;
-
-type SeenStates = HashMap<NormalizedGridSignature, (u64, (Coord, Coord))>;
 
 #[derive(Debug, Default)]
 enum SimulationAuthority {
@@ -39,6 +39,7 @@ pub enum SimulationConversionError {
     HashLife(HashLifeConversionError),
     Extraction(GridExtractionError),
     NoAuthoritativeState,
+    PartialExtractionCannotBecomeAuthoritative,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -80,7 +81,8 @@ pub struct SimulationSession {
     state_revision: u64,
     cell_memo: Memo,
     cell_workspace: CellStepWorkspace,
-    seen_states: SeenStates,
+    recurrence_lineage: Lineage,
+    cell_recurrence: Option<ExactRecurrenceTracker>,
 }
 
 pub fn select_backend(grid: &BitGrid, generations: u64) -> SimulationBackend {
@@ -132,6 +134,18 @@ fn planned_backend_for_work(
 }
 
 impl SimulationSession {
+    pub(crate) fn capture_analysis(
+        &self,
+        region: Option<crate::bitgrid::Bounds>,
+        limits: crate::hashlife::session::capture::CaptureLimits,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<
+        crate::hashlife::session::capture::OwnedDag,
+        crate::hashlife::session::capture::CaptureError,
+    > {
+        self.hashlife_session
+            .capture_analysis(region, limits, cancelled)
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -161,6 +175,7 @@ impl SimulationSession {
     pub fn load_cell_state(&mut self, grid: BitGrid, generation: u64) {
         self.hashlife_session.unload();
         self.authority = SimulationAuthority::Cell { grid, generation };
+        self.recurrence_lineage = Lineage::fresh();
         self.preferred_backend = Some(SimulationBackend::SimdChunk);
         self.state_revision = self.state_revision.wrapping_add(1);
     }
@@ -193,6 +208,10 @@ impl SimulationSession {
         &mut self,
         policy: GridExtractionPolicy,
     ) -> Result<(), SimulationConversionError> {
+        // Clipped samples are inspection data, never a replacement universe.
+        if !matches!(policy, GridExtractionPolicy::FullGridIfUnder { .. }) {
+            return Err(SimulationConversionError::PartialExtractionCannotBecomeAuthoritative);
+        }
         if matches!(self.authority, SimulationAuthority::Cell { .. }) {
             return Ok(());
         }
@@ -226,6 +245,7 @@ impl SimulationSession {
         grid: &BitGrid,
     ) -> Result<(), HashLifeConversionError> {
         self.hashlife_session.try_load_grid(grid)?;
+        self.recurrence_lineage = Lineage::fresh();
         self.preferred_backend = Some(SimulationBackend::HashLife);
         self.authority = SimulationAuthority::HashLife;
         self.state_revision = self.state_revision.wrapping_add(1);
@@ -239,6 +259,7 @@ impl SimulationSession {
     ) -> Result<(), HashLifeConversionError> {
         self.hashlife_session
             .try_load_grid_at_generation(grid, generation)?;
+        self.recurrence_lineage = Lineage::fresh();
         self.preferred_backend = Some(SimulationBackend::HashLife);
         self.authority = SimulationAuthority::HashLife;
         self.state_revision = self.state_revision.wrapping_add(1);
@@ -249,10 +270,33 @@ impl SimulationSession {
         &mut self,
         generations: u64,
     ) -> Result<AdvanceStats, HashLifeAdvanceError> {
-        let advanced = self.hashlife_session.advance_root(generations)?;
+        self.advance_hashlife_root_controlled(generations, None)
+    }
+
+    pub(crate) fn advance_hashlife_root_controlled(
+        &mut self,
+        generations: u64,
+        cancelled: Option<(
+            &std::sync::Arc<std::sync::atomic::AtomicBool>,
+            &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        )>,
+    ) -> Result<AdvanceStats, HashLifeAdvanceError> {
+        let starting_generation = self.hashlife_session.generation();
+        let result = match cancelled {
+            Some((token, stop)) => {
+                self.hashlife_session
+                    .advance_root_interruptible(generations, token, stop)
+            }
+            None => self.hashlife_session.advance_root(generations),
+        };
+        // Failed requests may have committed earlier segments. Revision follows
+        // authoritative progress, never only the success/error category.
+        if self.hashlife_session.generation() != starting_generation {
+            self.state_revision = self.state_revision.wrapping_add(1);
+        }
+        let advanced = result?;
         self.preferred_backend = Some(SimulationBackend::HashLife);
         self.authority = SimulationAuthority::HashLife;
-        self.state_revision = self.state_revision.wrapping_add(1);
         Ok(AdvanceStats {
             backend: SimulationBackend::HashLife,
             requested_generations: advanced.requested_generations,
@@ -274,7 +318,27 @@ impl SimulationSession {
         &mut self,
         snapshot: &str,
     ) -> Result<(), HashLifeConversionError> {
-        self.hashlife_session.load_snapshot_string(snapshot)?;
+        self.load_hashlife_snapshot_reader(Cursor::new(snapshot.as_bytes()))
+    }
+
+    pub fn load_hashlife_snapshot_reader(
+        &mut self,
+        reader: impl Read,
+    ) -> Result<(), HashLifeConversionError> {
+        self.hashlife_session.load_snapshot_reader(reader)?;
+        self.recurrence_lineage = Lineage::fresh();
+        self.preferred_backend = Some(SimulationBackend::HashLife);
+        self.authority = SimulationAuthority::HashLife;
+        self.state_revision = self.state_revision.wrapping_add(1);
+        Ok(())
+    }
+
+    pub fn load_hashlife_snapshot_owned(
+        &mut self,
+        snapshot: &crate::hashlife::OwnedHashLifeSnapshot,
+    ) -> Result<(), HashLifeConversionError> {
+        self.hashlife_session.load_snapshot_owned(snapshot)?;
+        self.recurrence_lineage = Lineage::fresh();
         self.preferred_backend = Some(SimulationBackend::HashLife);
         self.authority = SimulationAuthority::HashLife;
         self.state_revision = self.state_revision.wrapping_add(1);
@@ -284,7 +348,51 @@ impl SimulationSession {
     pub fn export_hashlife_snapshot(
         &mut self,
     ) -> Result<Option<String>, crate::hashlife::HashLifeSnapshotError> {
-        self.hashlife_session.export_snapshot_string()
+        let Some(snapshot) = self.export_hashlife_snapshot_owned()? else {
+            return Ok(None);
+        };
+        String::from_utf8(snapshot.into_bytes())
+            .map(Some)
+            .map_err(|_| {
+                crate::hashlife::HashLifeSnapshotError::new("snapshot writer emitted invalid UTF-8")
+            })
+    }
+
+    pub fn export_hashlife_snapshot_owned(
+        &mut self,
+    ) -> Result<
+        Option<crate::hashlife::OwnedHashLifeSnapshot>,
+        crate::hashlife::HashLifeSnapshotError,
+    > {
+        let mut bytes = Vec::new();
+        if !self.write_hashlife_snapshot(&mut bytes)? {
+            return Ok(None);
+        }
+        Ok(Some(crate::hashlife::OwnedHashLifeSnapshot::from_bytes(
+            bytes,
+        )))
+    }
+
+    pub fn write_hashlife_snapshot(
+        &mut self,
+        writer: &mut impl Write,
+    ) -> Result<bool, crate::hashlife::HashLifeSnapshotError> {
+        match &self.authority {
+            SimulationAuthority::Unloaded => Ok(false),
+            SimulationAuthority::HashLife => self.hashlife_session.write_snapshot(writer),
+            SimulationAuthority::Cell { grid, generation } => {
+                let mut snapshot_session =
+                    HashLifeSession::with_limits(self.hashlife_session.limits());
+                snapshot_session
+                    .try_load_grid_at_generation(grid, *generation)
+                    .map_err(|error| {
+                        crate::hashlife::HashLifeSnapshotError::new(format!(
+                            "snapshot cell conversion failed: {error:?}"
+                        ))
+                    })?;
+                snapshot_session.write_snapshot(writer)
+            }
+        }
     }
 
     pub fn hashlife_generation(&self) -> u64 {
@@ -303,19 +411,45 @@ impl SimulationSession {
         self.hashlife_session.signature_checkpoint()
     }
 
+    pub(crate) const fn recurrence_lineage(&self) -> Lineage {
+        self.recurrence_lineage
+    }
+
+    pub(crate) fn recurrence_observation(&mut self) -> Result<Observation, RecurrenceUnavailable> {
+        match &self.authority {
+            SimulationAuthority::Unloaded => Err(RecurrenceUnavailable::WitnessLimit),
+            SimulationAuthority::Cell { grid, generation } => {
+                Observation::from_grid(self.recurrence_lineage, *generation, grid)
+            }
+            SimulationAuthority::HashLife => self
+                .hashlife_session
+                .try_recurrence_observation(self.recurrence_lineage),
+        }
+    }
+
+    pub(crate) fn apply_hashlife_recurrence(
+        &mut self,
+        certificate: PeriodicCertificate,
+        target_generation: u64,
+    ) -> Result<Option<crate::hashlife::SessionAdvanceStats>, RecurrenceUnavailable> {
+        if !certificate.matches_lineage(self.recurrence_lineage) || !self.hashlife_loaded() {
+            return Err(RecurrenceUnavailable::LineageMismatch);
+        }
+        let Some(skip) = certificate.checked_power(self.hashlife_generation(), target_generation)
+        else {
+            return Ok(None);
+        };
+        let advanced = self.hashlife_session.try_apply_recurrence_skip(skip)?;
+        self.state_revision = self.state_revision.wrapping_add(1);
+        Ok(Some(advanced))
+    }
+
     pub fn shift_hashlife_origin(
         &mut self,
         dx: Coord,
         dy: Coord,
     ) -> Result<(), crate::hashlife::HashLifeGeometryError> {
         self.hashlife_session.shift_origin(dx, dy)
-    }
-
-    pub(crate) fn skip_hashlife_generations(
-        &mut self,
-        generations: u64,
-    ) -> Result<crate::hashlife::SessionAdvanceStats, HashLifeAdvanceError> {
-        self.hashlife_session.skip_generations(generations)
     }
 
     pub fn sample_hashlife_state_grid(
@@ -334,6 +468,27 @@ impl SimulationSession {
     ) -> Option<BitGrid> {
         self.hashlife_session
             .sample_region(min_x, min_y, max_x, max_y)
+    }
+
+    pub(crate) fn inspect_viewport_region(
+        &self,
+        bounds: (i128, i128, i128, i128),
+        remaining: &mut usize,
+    ) -> Option<bool> {
+        self.hashlife_session
+            .viewport_region_occupied(bounds, remaining)
+    }
+
+    pub(crate) fn viewport_root_bounds(&self) -> Option<crate::bitgrid::Bounds> {
+        self.hashlife_session.viewport_root_bounds()
+    }
+
+    pub(crate) fn inspect_viewport_neighborhood(
+        &self,
+        tile: (Coord, Coord),
+        remaining: &mut usize,
+    ) -> Option<[u64; 9]> {
+        self.hashlife_session.viewport_neighborhood(tile, remaining)
     }
 
     pub(crate) fn record_hashlife_oracle_confirmation_materialization(&mut self) {
@@ -364,63 +519,30 @@ impl SimulationSession {
         }
 
         let mut current = grid.clone();
-        self.seen_states.clear();
-        let mut seen_bytes = 0_usize;
+        // This compatibility entrypoint accepts an arbitrary grid rather than
+        // the session's state, so every private batch starts a new lineage.
+        let lineage = Lineage::fresh();
+        let recurrence = self
+            .cell_recurrence
+            .get_or_insert_with(|| ExactRecurrenceTracker::new(lineage));
+        recurrence.reset(lineage);
         let mut generation = 0_u64;
         let mut repeat_skip_events = 0_u64;
         let mut repeat_skip_generations = 0_u64;
 
         while generation < generations {
-            let track_repeats = current.population() <= REPEAT_MAX_CELLS
-                && current.chunk_count() <= REPEAT_MAX_CHUNKS
-                && self.seen_states.len() < REPEAT_MAX_ENTRIES;
-            let normalized = track_repeats.then(|| normalize(&current));
-            if let Some((signature, origin)) = normalized.as_ref()
-                && let Some(&(first_seen, first_origin)) = self.seen_states.get(signature)
+            if let ObserveOutcome::Repeated(certificate) =
+                recurrence.observe_result(Observation::from_grid(lineage, generation, &current))
+                && let Some(skip) = certificate.checked_power(generation, generations)
+                && let Ok(candidate) = skip.try_translate_grid(&current)
             {
-                let period = generation - first_seen;
-                if let Some(skip_cycles) = (generations - generation).checked_div(period)
-                    && skip_cycles > 0
-                {
-                    let dx = origin.0 - first_origin.0;
-                    let dy = origin.1 - first_origin.1;
-                    if dx == 0 && dy == 0 {
-                        let skipped = skip_cycles * period;
-                        generation += skipped;
-                        repeat_skip_events += 1;
-                        repeat_skip_generations += skipped;
-                        continue;
-                    }
-                    let cycle_count = Coord::try_from(skip_cycles)
-                        .or_invariant("simd repeat skip exceeded Coord");
-                    current = current.translated(
-                        dx.checked_mul(cycle_count)
-                            .or_invariant("simd repeat x overflow"),
-                        dy.checked_mul(cycle_count)
-                            .or_invariant("simd repeat y overflow"),
-                    );
-                    let skipped = skip_cycles * period;
-                    generation += skipped;
-                    repeat_skip_events += 1;
-                    repeat_skip_generations += skipped;
-                    continue;
-                }
-            }
-            if let Some((signature, origin)) = normalized {
-                let entry_bytes = signature
-                    .cells
-                    .len()
-                    .saturating_mul(size_of::<(Coord, Coord)>())
-                    + size_of::<NormalizedGridSignature>()
-                    + size_of::<(u64, (Coord, Coord))>();
-                if seen_bytes.saturating_add(entry_bytes) <= REPEAT_MAX_BYTES
-                    && self
-                        .seen_states
-                        .insert(signature, (generation, origin))
-                        .is_none()
-                {
-                    seen_bytes += entry_bytes;
-                }
+                // Both the translated candidate and the checked power exist
+                // before publishing any progress, even within this private batch.
+                current = candidate;
+                generation += skip.committed_generations();
+                repeat_skip_events += 1;
+                repeat_skip_generations += skip.committed_generations();
+                continue;
             }
             current = step_grid_state_only_with_workspace(
                 &current,
@@ -439,6 +561,7 @@ impl SimulationSession {
             grid: current.clone(),
             generation: generations,
         };
+        self.recurrence_lineage = lineage;
         self.state_revision = self.state_revision.wrapping_add(1);
         self.preferred_backend = Some(SimulationBackend::SimdChunk);
         (

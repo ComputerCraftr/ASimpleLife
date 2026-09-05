@@ -42,6 +42,10 @@ static void bf_configure_binary_stdio(void) {
 #define BF_TEMPLATE_CELL_BITS 8
 #endif
 
+#if BF_TEMPLATE_CELL_BITS < 0 || BF_TEMPLATE_CELL_BITS > 63
+#error unsupported BF cell width: expected 0 through 63
+#endif
+
 #ifndef BF_TEMPLATE_SIGNED_CELLS
 #define BF_TEMPLATE_SIGNED_CELLS 1
 #endif
@@ -194,16 +198,20 @@ static uint64_t bf_transfer_kernel_lanes = 0;
 static uint64_t bf_transfer_kernel_batches = 0;
 static uint64_t bf_summary_kernel_lanes = 0;
 static uint64_t bf_summary_kernel_batches = 0;
+static uint64_t bf_polynomial_kernel_lanes = 0;
+static uint64_t bf_polynomial_kernel_batches = 0;
 static uint64_t bf_native_scan_kernel_lanes = 0;
 static uint64_t bf_native_add_kernel_lanes = 0;
 static uint64_t bf_native_clear_set_kernel_lanes = 0;
 static uint64_t bf_native_transfer_kernel_lanes = 0;
 static uint64_t bf_native_summary_kernel_lanes = 0;
+static uint64_t bf_native_polynomial_kernel_lanes = 0;
 static uint64_t bf_scalar_scan_kernel_lanes = 0;
 static uint64_t bf_scalar_add_kernel_lanes = 0;
 static uint64_t bf_scalar_clear_set_kernel_lanes = 0;
 static uint64_t bf_scalar_transfer_kernel_lanes = 0;
 static uint64_t bf_scalar_summary_kernel_lanes = 0;
+static uint64_t bf_scalar_polynomial_kernel_lanes = 0;
 
 #ifndef BF_TEST_WORK_LIMIT
 #define BF_TEST_WORK_LIMIT UINT64_C(0)
@@ -293,6 +301,10 @@ static void print_work_stats(void) {
            (unsigned long long)bf_summary_kernel_lanes);
     printf("bf summary kernel batches: %llu\n",
            (unsigned long long)bf_summary_kernel_batches);
+    printf("bf polynomial kernel lanes: %llu\n",
+           (unsigned long long)bf_polynomial_kernel_lanes);
+    printf("bf polynomial kernel batches: %llu\n",
+           (unsigned long long)bf_polynomial_kernel_batches);
     printf("bf native scan kernel lanes: %llu\n",
            (unsigned long long)bf_native_scan_kernel_lanes);
     printf("bf native add kernel lanes: %llu\n",
@@ -303,6 +315,8 @@ static void print_work_stats(void) {
            (unsigned long long)bf_native_transfer_kernel_lanes);
     printf("bf native summary kernel lanes: %llu\n",
            (unsigned long long)bf_native_summary_kernel_lanes);
+    printf("bf native polynomial kernel lanes: %llu\n",
+           (unsigned long long)bf_native_polynomial_kernel_lanes);
     printf("bf scalar scan kernel lanes: %llu\n",
            (unsigned long long)bf_scalar_scan_kernel_lanes);
     printf("bf scalar add kernel lanes: %llu\n",
@@ -313,6 +327,8 @@ static void print_work_stats(void) {
            (unsigned long long)bf_scalar_transfer_kernel_lanes);
     printf("bf scalar summary kernel lanes: %llu\n",
            (unsigned long long)bf_scalar_summary_kernel_lanes);
+    printf("bf scalar polynomial kernel lanes: %llu\n",
+           (unsigned long long)bf_scalar_polynomial_kernel_lanes);
 }
 
 /* @BF_WRAP_PTR_BEGIN */
@@ -342,11 +358,14 @@ typedef void (*BfSetKernel)(int64_t *, ptrdiff_t, const ptrdiff_t *,
 typedef void (*BfTransferKernel)(int64_t *, ptrdiff_t, int64_t,
                                  const ptrdiff_t *, const int64_t *, size_t,
                                  ptrdiff_t, unsigned, int);
+typedef void (*BfPolynomialKernel)(const int64_t *, const int64_t *, int64_t *,
+                                   size_t, unsigned, int);
 
 enum {
     BF_KERNEL_FAMILY_ADD = 0U,
     BF_KERNEL_FAMILY_TRANSFER = 1U,
-    BF_KERNEL_FAMILY_SUMMARY = 2U
+    BF_KERNEL_FAMILY_SUMMARY = 2U,
+    BF_KERNEL_FAMILY_POLYNOMIAL = 3U
 };
 
 typedef struct {
@@ -354,6 +373,7 @@ typedef struct {
     BfDeltaKernel apply_deltas;
     BfSetKernel set_cells;
     BfTransferKernel transfer;
+    BfPolynomialKernel polynomial_mul;
 } BfKernelSet;
 
 static void bf_count_family(unsigned family, uint64_t lanes, uint64_t batches) {
@@ -363,9 +383,12 @@ static void bf_count_family(unsigned family, uint64_t lanes, uint64_t batches) {
     } else if (family == BF_KERNEL_FAMILY_TRANSFER) {
         bf_transfer_kernel_lanes += lanes;
         bf_transfer_kernel_batches += batches;
-    } else {
+    } else if (family == BF_KERNEL_FAMILY_SUMMARY) {
         bf_summary_kernel_lanes += lanes;
         bf_summary_kernel_batches += batches;
+    } else {
+        bf_polynomial_kernel_lanes += lanes;
+        bf_polynomial_kernel_batches += batches;
     }
 }
 
@@ -375,8 +398,10 @@ static void bf_count_native_family(unsigned family, uint64_t lanes) {
         bf_native_add_kernel_lanes += lanes;
     else if (family == BF_KERNEL_FAMILY_TRANSFER)
         bf_native_transfer_kernel_lanes += lanes;
-    else
+    else if (family == BF_KERNEL_FAMILY_SUMMARY)
         bf_native_summary_kernel_lanes += lanes;
+    else
+        bf_native_polynomial_kernel_lanes += lanes;
 }
 #endif
 
@@ -385,8 +410,10 @@ static void bf_count_scalar_family(unsigned family, uint64_t lanes) {
         bf_scalar_add_kernel_lanes += lanes;
     else if (family == BF_KERNEL_FAMILY_TRANSFER)
         bf_scalar_transfer_kernel_lanes += lanes;
-    else
+    else if (family == BF_KERNEL_FAMILY_SUMMARY)
         bf_scalar_summary_kernel_lanes += lanes;
+    else
+        bf_scalar_polynomial_kernel_lanes += lanes;
 }
 
 static int64_t bf_kernel_wrap_add(int64_t lhs, int64_t rhs, unsigned bits,
@@ -468,6 +495,14 @@ static void bf_transfer_scalar(int64_t *tape, ptrdiff_t ptr, int64_t source,
     }
 }
 
+static int64_t bf_polynomial_wrap_mul(int64_t lhs, int64_t rhs, unsigned bits,
+                                      int signed_cells) {
+    return signed_cells ? bf_wrap_mul_i64_signed(lhs, rhs, bits)
+                        : bf_wrap_mul_i64_unsigned(lhs, rhs, bits);
+}
+
+/* @BF_POLYNOMIAL_RUNTIME */
+
 #if BF_HAS_AVX2_KERNEL && !defined(BF_FORCE_SCALAR_KERNEL)
 __attribute__((target("avx2")))
 static void bf_apply_deltas_avx2(int64_t *tape, ptrdiff_t ptr,
@@ -528,11 +563,6 @@ static void bf_transfer_avx2(int64_t *tape, ptrdiff_t ptr, int64_t source,
                              const int64_t *coefficients, size_t count,
                              ptrdiff_t len, unsigned bits,
                              int signed_cells) {
-    if (bits > 32U) {
-        bf_transfer_scalar(tape, ptr, source, offsets, coefficients, count, len,
-                           bits, signed_cells);
-        return;
-    }
     size_t i = 0;
     const __m256i source_lanes =
         _mm256_set1_epi64x((int64_t)bf_wrap_to_u64(source, bits));
@@ -546,7 +576,7 @@ static void bf_transfer_avx2(int64_t *tape, ptrdiff_t ptr, int64_t source,
             old[lane] = tape[bf_wrap_ptr(ptr, offsets[i + lane], len)];
             raw_coefficients[lane] = bf_wrap_to_u64(coefficients[i + lane], bits);
         }
-        __m256i product = _mm256_mul_epu32(
+        __m256i product = bf_mullo_u64_avx2(
             source_lanes,
             _mm256_loadu_si256((const __m256i *)raw_coefficients));
         __m256i raw = _mm256_and_si256(
@@ -566,6 +596,7 @@ static void bf_transfer_avx2(int64_t *tape, ptrdiff_t ptr, int64_t source,
         bf_transfer_scalar(tape, ptr, source, &offsets[i], &coefficients[i],
                            count - i, len, bits, signed_cells);
 }
+
 #endif
 
 #if BF_HAS_NEON_KERNEL && !defined(BF_FORCE_SCALAR_KERNEL)
@@ -623,26 +654,22 @@ static void bf_transfer_neon(int64_t *tape, ptrdiff_t ptr, int64_t source,
                              const int64_t *coefficients, size_t count,
                              ptrdiff_t len, unsigned bits,
                              int signed_cells) {
-    if (bits > 32U) {
-        bf_transfer_scalar(tape, ptr, source, offsets, coefficients, count, len,
-                           bits, signed_cells);
-        return;
-    }
     size_t i = 0;
-    const uint32x2_t source_lanes =
-        vdup_n_u32((uint32_t)bf_wrap_to_u64(source, bits));
+    const uint64x2_t source_lanes =
+        vdupq_n_u64(bf_wrap_to_u64(source, bits));
     const uint64x2_t mask = vdupq_n_u64(bf_bits_mask(bits));
     const uint64x2_t sign =
         vdupq_n_u64(bits == 0 ? 0 : UINT64_C(1) << (bits - 1U));
     for (; i + 2 <= count; i += 2) {
         int64_t old[2] = {tape[bf_wrap_ptr(ptr, offsets[i], len)],
                           tape[bf_wrap_ptr(ptr, offsets[i + 1], len)]};
-        uint32_t raw_coefficients[2] = {
-            (uint32_t)bf_wrap_to_u64(coefficients[i], bits),
-            (uint32_t)bf_wrap_to_u64(coefficients[i + 1], bits)};
+        uint64_t raw_coefficients[2] = {
+            bf_wrap_to_u64(coefficients[i], bits),
+            bf_wrap_to_u64(coefficients[i + 1], bits)};
         uint64x2_t raw = vandq_u64(
             vaddq_u64(vreinterpretq_u64_s64(vld1q_s64(old)),
-                      vmull_u32(source_lanes, vld1_u32(raw_coefficients))),
+                      bf_mullo_u64_neon(source_lanes,
+                                        vld1q_u64(raw_coefficients))),
             mask);
         if (signed_cells && bits != 0U)
             raw = vsubq_u64(veorq_u64(raw, sign), sign);
@@ -658,6 +685,7 @@ static void bf_transfer_neon(int64_t *tape, ptrdiff_t ptr, int64_t source,
         bf_transfer_scalar(tape, ptr, source, &offsets[i], &coefficients[i],
                            count - i, len, bits, signed_cells);
 }
+
 #endif
 
 static ptrdiff_t bf_scan_zero_scalar(const int64_t *tape, ptrdiff_t ptr,
@@ -747,8 +775,9 @@ static ptrdiff_t bf_scan_zero_neon(const int64_t *tape, ptrdiff_t ptr,
 }
 #endif
 
-static BfKernelSet bf_kernels = {bf_scan_zero_scalar, bf_apply_deltas_scalar,
-                                 bf_set_cells_scalar, bf_transfer_scalar};
+static BfKernelSet bf_kernels = {
+    bf_scan_zero_scalar, bf_apply_deltas_scalar, bf_set_cells_scalar,
+    bf_transfer_scalar, bf_polynomial_mul_scalar};
 
 static void bf_kernel_init(void) {
 #if defined(BF_FORCE_SCALAR_KERNEL)
@@ -761,6 +790,7 @@ static void bf_kernel_init(void) {
         bf_kernels.apply_deltas = bf_apply_deltas_avx2;
         bf_kernels.set_cells = bf_set_cells_avx2;
         bf_kernels.transfer = bf_transfer_avx2;
+        bf_kernels.polynomial_mul = bf_polynomial_mul_avx2;
         return;
     }
 #endif
@@ -769,6 +799,7 @@ static void bf_kernel_init(void) {
     bf_kernels.apply_deltas = bf_apply_deltas_neon;
     bf_kernels.set_cells = bf_set_cells_neon;
     bf_kernels.transfer = bf_transfer_neon;
+    bf_kernels.polynomial_mul = bf_polynomial_mul_neon;
 #endif
 #endif
 }
@@ -776,6 +807,16 @@ static void bf_kernel_init(void) {
 ptrdiff_t bf_scan_zero(const int64_t *tape, ptrdiff_t ptr,
                        ptrdiff_t stride, ptrdiff_t len, uint64_t *steps) {
     return bf_kernels.scan_zero(tape, ptr, stride, len, steps);
+}
+
+void bf_polynomial_mul_batch(const int64_t *lhs, const int64_t *rhs,
+                             int64_t *out, size_t count, unsigned bits,
+                             int signed_cells) {
+    if (count < 4U) {
+        bf_polynomial_mul_scalar(lhs, rhs, out, count, bits, signed_cells);
+        return;
+    }
+    bf_kernels.polynomial_mul(lhs, rhs, out, count, bits, signed_cells);
 }
 
 void bf_add_at_batch(int64_t *tape, ptrdiff_t ptr,

@@ -55,8 +55,7 @@ fn hashlife_root_checkpoint_reuses_exact_stable_identity_without_traversal() {
 fn hashlife_root_checkpoint_keeps_translation_in_origin_when_root_repeats() {
     let grid = pattern_by_name("glider").or_invariant("required value");
     let mut simulation = SimulationSession::new();
-    let outcome = OracleSession::new(grid, 0, Default::default(), &mut simulation)
-        .advance_runtime_target(1_000, None);
+    let outcome = OracleSession::new(grid, 0, &mut simulation).advance_runtime_target(1_000, None);
 
     assert_eq!(
         outcome.classification,
@@ -84,8 +83,7 @@ fn r_pentomino_runtime_target_projects_periodic_ash_and_retains_exact_state() {
     let target = 100_000_000;
     let mut simulation = SimulationSession::new();
 
-    let outcome = OracleSession::new(grid, 0, Default::default(), &mut simulation)
-        .advance_runtime_target(target, None);
+    let outcome = OracleSession::new(grid, 0, &mut simulation).advance_runtime_target(target, None);
 
     assert_eq!(outcome.final_generation, target, "outcome={outcome:?}");
     assert_eq!(outcome.failure, None, "outcome={outcome:?}");
@@ -105,7 +103,7 @@ fn hashlife_first_runtime_checkpoint_confirms_stable_cycle_and_syncs_generation(
     let target = 1_000_000_000_000;
     let mut simulation = SimulationSession::new();
 
-    let outcome = OracleSession::new(grid, 0, Default::default(), &mut simulation)
+    let outcome = OracleSession::new(grid, 0, &mut simulation)
         .advance_runtime_target_hashlife_first(target, None);
 
     assert_eq!(outcome.final_generation, target);
@@ -183,14 +181,15 @@ fn hashlife_root_identity_epoch_changes_after_engine_gc_remapping() {
         .signature_checkpoint()
         .or_invariant("checkpoint after GC")
         .identity;
-    assert!(
-        !after.same_epoch(before),
+    assert_ne!(
+        (after.session, after.epoch),
+        (before.session, before.epoch),
         "post-GC root ids must be isolated from pre-remap checkpoint history"
     );
 }
 
 #[test]
-fn large_stable_checkpoint_detects_repeat_without_cell_or_subtree_work() {
+fn large_stable_retained_root_checkpoint_avoids_subtree_and_cell_materialization() {
     let grid = large_stable_block_field();
     assert!(grid.population() > 4_096);
 
@@ -217,9 +216,14 @@ fn large_stable_checkpoint_detects_repeat_without_cell_or_subtree_work() {
             .checkpoint_cell_materializations,
         0
     );
+}
 
+#[test]
+fn large_stable_dag_recurrence_detects_repeat_without_cell_materialization() {
+    let grid = large_stable_block_field();
+    assert!(grid.population() > 4_096);
     let mut simulation = SimulationSession::new();
-    let outcome = OracleSession::new(grid, 0, Default::default(), &mut simulation)
+    let outcome = OracleSession::new(grid, 0, &mut simulation)
         .advance_runtime_target_hashlife_first(1_000_000, None);
     assert_eq!(
         outcome.classification,
@@ -227,7 +231,7 @@ fn large_stable_checkpoint_detects_repeat_without_cell_or_subtree_work() {
             period: 1,
             first_seen: 0
         },
-        "large stable state must be classified from O(1) retained-root checkpoints"
+        "large stable state must be classified using bounded DAG evidence, without expanding cells"
     );
     assert_eq!(simulation.hashlife_sample_materializations(), 0);
     assert_eq!(

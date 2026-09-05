@@ -5,7 +5,33 @@ use crate::bitgrid::{BitGrid, Coord};
 use crate::persistence::HASHLIFE_SNAPSHOT_MAGIC;
 use std::error::Error;
 use std::fmt;
-use std::fmt::Write as _;
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
+
+const MAX_SNAPSHOT_LINE_BYTES: usize = 4_096;
+// Buffered input, scratch line, and the bounded header/record strings coexist.
+const SNAPSHOT_PARSE_SCRATCH_BYTES: u128 = 32 * 1_024;
+
+#[cfg(test)]
+mod resource_tests;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedHashLifeSnapshot {
+    pub(super) bytes: Vec<u8>,
+}
+
+impl OwnedHashLifeSnapshot {
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HashLifeSnapshotError {
@@ -14,7 +40,7 @@ pub struct HashLifeSnapshotError {
 }
 
 impl HashLifeSnapshotError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             requested_bytes: None,
@@ -30,6 +56,16 @@ impl HashLifeSnapshotError {
 
     pub(super) const fn allocation_bytes(&self) -> Option<u128> {
         self.requested_bytes
+    }
+
+    fn io(error: std::io::Error) -> Self {
+        Self::new(format!("snapshot I/O failed: {error}"))
+    }
+}
+
+impl From<std::io::Error> for HashLifeSnapshotError {
+    fn from(error: std::io::Error) -> Self {
+        Self::io(error)
     }
 }
 
@@ -61,12 +97,25 @@ struct SnapshotNode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct HashLifeSnapshot {
+pub(super) struct ParsedHashLifeSnapshot {
     generation: u64,
     origin_x: Coord,
     origin_y: Coord,
     root: SnapshotChildRef,
     nodes: Vec<SnapshotNode>,
+}
+
+impl ParsedHashLifeSnapshot {
+    fn allocated_bytes(&self) -> u128 {
+        self.nodes.capacity() as u128 * std::mem::size_of::<SnapshotNode>() as u128
+    }
+
+    pub(super) fn estimated_import_bytes(&self) -> u128 {
+        u128::try_from(self.nodes.len())
+            .unwrap_or(u128::MAX)
+            .saturating_mul(256)
+            .saturating_add(1_024)
+    }
 }
 
 impl SnapshotNodeRef {
@@ -110,40 +159,91 @@ impl SnapshotChildRef {
     }
 }
 
-fn write_child_ref(out: &mut String, child: SnapshotChildRef) -> fmt::Result {
+fn write_child_ref(out: &mut impl Write, child: SnapshotChildRef) -> std::io::Result<()> {
     match child.node {
-        SnapshotNodeRef::DeadLeaf => out.push('D'),
-        SnapshotNodeRef::LiveLeaf => out.push('L'),
+        SnapshotNodeRef::DeadLeaf => out.write_all(b"D")?,
+        SnapshotNodeRef::LiveLeaf => out.write_all(b"L")?,
         SnapshotNodeRef::Node(index) => write!(out, "N{index}")?,
     }
     write!(out, "@{}", child.symmetry as u8)
 }
 
-fn serialize_snapshot(snapshot: &HashLifeSnapshot, mut out: String) -> Result<String, fmt::Error> {
-    out.push_str(HASHLIFE_SNAPSHOT_MAGIC);
-    out.push('\n');
+fn write_snapshot(
+    snapshot: &ParsedHashLifeSnapshot,
+    out: &mut impl Write,
+) -> Result<(), HashLifeSnapshotError> {
+    writeln!(out, "{HASHLIFE_SNAPSHOT_MAGIC}").map_err(HashLifeSnapshotError::io)?;
     writeln!(out, "generation {}", snapshot.generation)?;
     writeln!(out, "origin {} {}", snapshot.origin_x, snapshot.origin_y)?;
-    out.push_str("root ");
-    write_child_ref(&mut out, snapshot.root)?;
-    out.push('\n');
+    out.write_all(b"root ").map_err(HashLifeSnapshotError::io)?;
+    write_child_ref(out, snapshot.root)?;
+    out.write_all(b"\n").map_err(HashLifeSnapshotError::io)?;
     writeln!(out, "nodes {}", snapshot.nodes.len())?;
     for node in &snapshot.nodes {
         write!(out, "node {} ", node.level.get())?;
         for (index, child) in node.children.iter().copied().enumerate() {
             if index != 0 {
-                out.push(' ');
+                out.write_all(b" ").map_err(HashLifeSnapshotError::io)?;
             }
-            write_child_ref(&mut out, child)?;
+            write_child_ref(out, child)?;
         }
-        out.push('\n');
+        out.write_all(b"\n").map_err(HashLifeSnapshotError::io)?;
     }
-    Ok(out)
+    Ok(())
 }
 
-fn deserialize_snapshot(s: &str) -> Result<HashLifeSnapshot, HashLifeSnapshotError> {
-    let mut lines = s.lines();
-    match lines.next() {
+fn read_bounded_line(
+    input: &mut impl BufRead,
+    line: &mut Vec<u8>,
+) -> Result<Option<String>, HashLifeSnapshotError> {
+    line.clear();
+    loop {
+        let available = input.fill_buf().map_err(HashLifeSnapshotError::io)?;
+        if available.is_empty() {
+            break;
+        }
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(consumed) > MAX_SNAPSHOT_LINE_BYTES {
+            return Err(HashLifeSnapshotError::new(format!(
+                "snapshot line exceeds {MAX_SNAPSHOT_LINE_BYTES} bytes"
+            )));
+        }
+        line.extend_from_slice(&available[..consumed]);
+        input.consume(consumed);
+        if line.last() == Some(&b'\n') {
+            break;
+        }
+    }
+    if line.is_empty() {
+        return Ok(None);
+    }
+    if line.last() == Some(&b'\n') {
+        line.pop();
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    String::from_utf8(line.clone())
+        .map(Some)
+        .map_err(|_| HashLifeSnapshotError::new("snapshot is not valid UTF-8"))
+}
+
+pub(super) fn read_snapshot_with_limit(
+    reader: impl Read,
+    max_import_bytes: u128,
+) -> Result<ParsedHashLifeSnapshot, HashLifeSnapshotError> {
+    if max_import_bytes < SNAPSHOT_PARSE_SCRATCH_BYTES {
+        return Err(HashLifeSnapshotError::allocation(
+            SNAPSHOT_PARSE_SCRATCH_BYTES,
+        ));
+    }
+    let mut input = BufReader::new(reader);
+    let mut buffer = Vec::with_capacity(128);
+    let mut next_line = || read_bounded_line(&mut input, &mut buffer);
+    match next_line()? {
         Some(line) if line == HASHLIFE_SNAPSHOT_MAGIC => {}
         Some(other) => {
             return Err(HashLifeSnapshotError::new(format!(
@@ -153,18 +253,13 @@ fn deserialize_snapshot(s: &str) -> Result<HashLifeSnapshot, HashLifeSnapshotErr
         None => return Err(HashLifeSnapshotError::new("empty hashlife snapshot")),
     }
 
-    let generation_line = lines
-        .next()
-        .ok_or_else(|| HashLifeSnapshotError::new("missing generation line"))?;
-    let origin_line = lines
-        .next()
-        .ok_or_else(|| HashLifeSnapshotError::new("missing origin line"))?;
-    let root_line = lines
-        .next()
-        .ok_or_else(|| HashLifeSnapshotError::new("missing root line"))?;
-    let nodes_line = lines
-        .next()
-        .ok_or_else(|| HashLifeSnapshotError::new("missing nodes line"))?;
+    let generation_line =
+        next_line()?.ok_or_else(|| HashLifeSnapshotError::new("missing generation line"))?;
+    let origin_line =
+        next_line()?.ok_or_else(|| HashLifeSnapshotError::new("missing origin line"))?;
+    let root_line = next_line()?.ok_or_else(|| HashLifeSnapshotError::new("missing root line"))?;
+    let nodes_line =
+        next_line()?.ok_or_else(|| HashLifeSnapshotError::new("missing nodes line"))?;
 
     let generation = generation_line
         .strip_prefix("generation ")
@@ -202,15 +297,30 @@ fn deserialize_snapshot(s: &str) -> Result<HashLifeSnapshot, HashLifeSnapshotErr
         .parse::<usize>()
         .map_err(|_| HashLifeSnapshotError::new("invalid node count"))?;
 
+    let estimated_import_bytes = u128::try_from(node_count)
+        .unwrap_or(u128::MAX)
+        .saturating_mul(256)
+        .saturating_add(1_024);
+    let parse_bytes = estimated_import_bytes.saturating_add(SNAPSHOT_PARSE_SCRATCH_BYTES);
+    if parse_bytes > max_import_bytes {
+        return Err(HashLifeSnapshotError::allocation(parse_bytes));
+    }
+
     let requested_bytes =
         (node_count as u128).saturating_mul(std::mem::size_of::<SnapshotNode>() as u128);
     let mut nodes = Vec::new();
     nodes
         .try_reserve_exact(node_count)
         .map_err(|_| HashLifeSnapshotError::allocation(requested_bytes))?;
-    for (index, line) in lines.enumerate() {
+    let mut record_index = 0_usize;
+    while let Some(line) = next_line()? {
         if line.trim().is_empty() {
             continue;
+        }
+        if record_index == node_count {
+            return Err(HashLifeSnapshotError::new(format!(
+                "snapshot node count exceeds declared count {node_count}"
+            )));
         }
         let mut tokens = line.split_whitespace();
         let Some(kind) = tokens.next() else {
@@ -226,7 +336,7 @@ fn deserialize_snapshot(s: &str) -> Result<HashLifeSnapshot, HashLifeSnapshotErr
         if kind != "node" || parts.iter().any(Option::is_none) || tokens.next().is_some() {
             return Err(HashLifeSnapshotError::new(format!(
                 "invalid node record on line {}",
-                index + 5
+                record_index + 6
             )));
         }
         let [Some(level), Some(nw), Some(ne), Some(sw), Some(se)] = parts else {
@@ -251,6 +361,7 @@ fn deserialize_snapshot(s: &str) -> Result<HashLifeSnapshot, HashLifeSnapshotErr
             ],
         };
         nodes.push(node);
+        record_index += 1;
     }
 
     if nodes.len() != node_count {
@@ -269,6 +380,16 @@ fn deserialize_snapshot(s: &str) -> Result<HashLifeSnapshot, HashLifeSnapshotErr
                     "snapshot child reference N{child_index} is not topologically earlier than node N{index}"
                 )));
             }
+            let child_level = match child.node {
+                SnapshotNodeRef::DeadLeaf | SnapshotNodeRef::LiveLeaf => 0,
+                SnapshotNodeRef::Node(child_index) => nodes[child_index as usize].level.get(),
+            };
+            if child_level + 1 != node.level.get() {
+                return Err(HashLifeSnapshotError::new(format!(
+                    "snapshot node N{index} level {} requires children one level lower, found {child_level}",
+                    node.level.get()
+                )));
+            }
         }
     }
     if let SnapshotNodeRef::Node(root_index) = root.node
@@ -279,7 +400,7 @@ fn deserialize_snapshot(s: &str) -> Result<HashLifeSnapshot, HashLifeSnapshotErr
         )));
     }
 
-    Ok(HashLifeSnapshot {
+    Ok(ParsedHashLifeSnapshot {
         generation,
         origin_x,
         origin_y,
@@ -288,11 +409,23 @@ fn deserialize_snapshot(s: &str) -> Result<HashLifeSnapshot, HashLifeSnapshotErr
     })
 }
 
+#[cfg(test)]
+pub(super) fn read_snapshot(
+    reader: impl Read,
+) -> Result<ParsedHashLifeSnapshot, HashLifeSnapshotError> {
+    read_snapshot_with_limit(reader, super::session_types::DEFAULT_HARD_MEMORY_BYTES)
+}
+
+#[cfg(test)]
+fn deserialize_snapshot(s: &str) -> Result<ParsedHashLifeSnapshot, HashLifeSnapshotError> {
+    read_snapshot(Cursor::new(s.as_bytes()))
+}
+
 impl HashLifeEngine {
     fn snapshot_child_ref_for_node(
         &mut self,
         node: NodeId,
-        canonical_indices: &mut FlatTable<PackedNodeKey, u32>,
+        canonical_indices: &mut ProbeTable<PackedNodeKey, u32>,
         nodes: &mut Vec<SnapshotNode>,
     ) -> Result<SnapshotChildRef, HashLifeSnapshotError> {
         enum Work {
@@ -413,15 +546,16 @@ impl HashLifeEngine {
             .or_invariant("snapshot traversal produced no root"))
     }
 
-    pub(super) fn export_snapshot_string(
+    pub(super) fn write_snapshot(
         &mut self,
         root: NodeId,
         origin_x: Coord,
         origin_y: Coord,
         generation: u64,
-    ) -> Result<String, HashLifeSnapshotError> {
+        writer: &mut impl Write,
+    ) -> Result<(), HashLifeSnapshotError> {
         let capacity = self.node_count().max(2);
-        let Some(mut canonical_indices) = self.try_transient_flat_table(capacity) else {
+        let Some(mut canonical_indices) = self.try_transient_probe_table(capacity) else {
             return Err(HashLifeSnapshotError::allocation(capacity as u128));
         };
         let Some(mut nodes) = self.try_transient_vec(capacity) else {
@@ -429,21 +563,16 @@ impl HashLifeEngine {
         };
         let root_ref =
             self.snapshot_child_ref_for_node(root, &mut canonical_indices, &mut nodes)?;
-        let output_capacity = nodes.len().saturating_mul(80).saturating_add(256);
-        let Some(output) = self.try_transient_string(output_capacity) else {
-            return Err(HashLifeSnapshotError::allocation(output_capacity as u128));
-        };
-        serialize_snapshot(
-            &HashLifeSnapshot {
+        write_snapshot(
+            &ParsedHashLifeSnapshot {
                 generation,
                 origin_x,
                 origin_y,
                 root: root_ref,
                 nodes,
             },
-            output,
+            writer,
         )
-        .map_err(|_| HashLifeSnapshotError::allocation(output_capacity as u128))
     }
 
     fn import_snapshot_child_ref(
@@ -471,11 +600,21 @@ impl HashLifeEngine {
         }
     }
 
-    pub(super) fn import_snapshot_string(
+    pub(super) fn import_snapshot(
         &mut self,
-        s: &str,
+        snapshot: ParsedHashLifeSnapshot,
     ) -> Result<(NodeId, Coord, Coord, u64), HashLifeSnapshotError> {
-        let snapshot = deserialize_snapshot(s)?;
+        self.with_transient_allocation_scope(|engine| engine.import_snapshot_reserved(snapshot))
+    }
+
+    fn import_snapshot_reserved(
+        &mut self,
+        snapshot: ParsedHashLifeSnapshot,
+    ) -> Result<(NodeId, Coord, Coord, u64), HashLifeSnapshotError> {
+        let snapshot_bytes = snapshot.allocated_bytes();
+        if !self.reserve_transient_bytes(snapshot_bytes) {
+            return Err(HashLifeSnapshotError::allocation(snapshot_bytes));
+        }
         let root_level = match snapshot.root.node {
             SnapshotNodeRef::DeadLeaf | SnapshotNodeRef::LiveLeaf => 0,
             SnapshotNodeRef::Node(index) => {
@@ -494,10 +633,9 @@ impl HashLifeEngine {
         })?;
         let requested_bytes =
             (snapshot.nodes.len() as u128).saturating_mul(std::mem::size_of::<NodeId>() as u128);
-        let mut canonical_nodes = Vec::new();
-        canonical_nodes
-            .try_reserve_exact(snapshot.nodes.len())
-            .map_err(|_| HashLifeSnapshotError::allocation(requested_bytes))?;
+        let mut canonical_nodes = self
+            .try_transient_vec::<NodeId>(snapshot.nodes.len())
+            .ok_or_else(|| HashLifeSnapshotError::allocation(requested_bytes))?;
 
         for node in snapshot.nodes {
             let children = [
@@ -537,23 +675,49 @@ pub fn serialize_grid(grid: &BitGrid) -> Result<String, HashLifeSnapshotError> {
     })
 }
 
-pub fn deserialize_to_grid(s: &str) -> Result<BitGrid, HashLifeSnapshotError> {
+pub fn serialize_grid_to_writer(
+    grid: &BitGrid,
+    writer: &mut impl Write,
+) -> Result<(), HashLifeSnapshotError> {
+    let mut session = HashLifeSession::new();
+    session.try_load_grid(grid).map_err(|error| {
+        HashLifeSnapshotError::new(format!("snapshot grid conversion failed: {error:?}"))
+    })?;
+    if session.write_snapshot(writer)? {
+        Ok(())
+    } else {
+        Err(HashLifeSnapshotError::new("snapshot grid was not loaded"))
+    }
+}
+
+pub fn deserialize_from_reader(reader: impl Read) -> Result<BitGrid, HashLifeSnapshotError> {
     let mut session = HashLifeSession::new();
     session
-        .load_snapshot_string(s)
-        .map_err(|error| match error {
-            HashLifeConversionError::Snapshot(error) => error,
-            HashLifeConversionError::MemoryBudgetExceeded { .. }
-            | HashLifeConversionError::AllocationFailed { .. }
-            | HashLifeConversionError::NodeIdExhausted
-            | HashLifeConversionError::CanonicalReferenceExhausted
-            | HashLifeConversionError::CoordinateRangeExceeded { .. } => {
-                HashLifeSnapshotError::new(format!("snapshot resource failure: {error:?}"))
-            }
-        })?;
+        .load_snapshot_reader(reader)
+        .map_err(snapshot_conversion_error)?;
     session.sample_grid().map_err(|error| {
         HashLifeSnapshotError::new(format!("snapshot grid extraction failed: {error:?}"))
     })
+}
+
+pub fn deserialize_to_grid(s: &str) -> Result<BitGrid, HashLifeSnapshotError> {
+    deserialize_from_reader(Cursor::new(s.as_bytes()))
+}
+
+fn snapshot_conversion_error(error: HashLifeConversionError) -> HashLifeSnapshotError {
+    match error {
+        HashLifeConversionError::Cancelled => {
+            HashLifeSnapshotError::new("snapshot conversion cancelled")
+        }
+        HashLifeConversionError::Snapshot(error) => error,
+        HashLifeConversionError::MemoryBudgetExceeded { .. }
+        | HashLifeConversionError::AllocationFailed { .. }
+        | HashLifeConversionError::NodeIdExhausted
+        | HashLifeConversionError::CanonicalReferenceExhausted
+        | HashLifeConversionError::CoordinateRangeExceeded { .. } => {
+            HashLifeSnapshotError::new(format!("snapshot resource failure: {error:?}"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -621,6 +785,22 @@ mod tests {
     }
 
     #[test]
+    fn streaming_snapshot_reader_rejects_oversized_lines() {
+        let oversized = format!(
+            "{HASHLIFE_SNAPSHOT_MAGIC}\ngeneration 0\norigin 0 0\nroot D@0\nnodes 0\n{}\n",
+            "x".repeat(MAX_SNAPSHOT_LINE_BYTES + 1)
+        );
+
+        let error = read_snapshot(Cursor::new(oversized.as_bytes()))
+            .error_or_invariant("oversized snapshot line should fail");
+
+        assert!(
+            error.to_string().contains("snapshot line exceeds"),
+            "oversized line returned the wrong error: {error}"
+        );
+    }
+
+    #[test]
     fn snapshot_rejects_root_endpoint_overflow_before_engine_mutation() {
         let serialized = serialize_grid(&BitGrid::from_cells(&[(0, 0), (1, 1)]))
             .or_invariant("snapshot should serialize");
@@ -635,21 +815,37 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let mut engine = HashLifeEngine::default();
-        let nodes_before = engine.node_count();
+        let mut session = HashLifeSession::new();
+        session
+            .try_load_grid(&BitGrid::from_cells(&[
+                (10, 10),
+                (11, 10),
+                (10, 11),
+                (11, 11),
+            ]))
+            .or_invariant("authoritative fixture should load");
+        let snapshot_before = session
+            .export_snapshot_string()
+            .or_invariant("authoritative fixture should serialize");
 
-        let error = engine
-            .import_snapshot_string(&malformed)
+        let error = session
+            .load_snapshot_string(&malformed)
             .error_or_invariant("overflowing root interval should fail");
 
         assert!(
-            error.to_string().contains("root geometry is invalid"),
-            "unexpected snapshot geometry error: {error}"
+            matches!(
+                &error,
+                HashLifeConversionError::Snapshot(snapshot)
+                    if snapshot.to_string().contains("root geometry is invalid")
+            ),
+            "unexpected snapshot geometry error: {error:?}"
         );
         assert_eq!(
-            engine.node_count(),
-            nodes_before,
-            "invalid external geometry mutated the node arena before validation"
+            session
+                .export_snapshot_string()
+                .or_invariant("authoritative fixture should remain serializable"),
+            snapshot_before,
+            "invalid external geometry changed the authoritative session"
         );
     }
 

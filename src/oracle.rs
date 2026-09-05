@@ -1,18 +1,17 @@
-use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use crate::bitgrid::{BitGrid, Cell, Coord};
-use crate::classify::Classification;
+use crate::classify::{Classification, ClassificationCheckpoint};
 use crate::engine::{SimulationBackend, SimulationSession};
 use crate::generators::pattern_by_name;
 use crate::hashlife::{
     GridExtractionPolicy, HASHLIFE_FULL_GRID_MAX_CHUNKS, HASHLIFE_FULL_GRID_MAX_POPULATION,
-    HashLifeAdvanceError, HashLifeConversionError, HashLifeStateCheckpoint, HashLifeStateIdentity,
-    PopulationCount,
+    HashLifeAdvanceError, HashLifeConversionError, PopulationCount,
 };
 use crate::life::step_grid_with_changes_and_memo;
 use crate::memo::Memo;
 use crate::normalize::{NormalizedGridSignature, normalize};
+use crate::recurrence::{ExactRecurrenceTracker, Observation, ObserveOutcome, PeriodicCertificate};
 
 mod checkpoints;
 mod constellation;
@@ -30,13 +29,10 @@ use policy::{
     target_exact_suffix_window,
 };
 
-type SeenStates = HashMap<NormalizedGridSignature, (u64, Cell)>;
-type CheckpointStates = HashMap<HashLifeStateIdentity, (u64, Cell)>;
 type OracleStepCallback<'a> = &'a mut dyn FnMut(OracleStepPlan, OracleStateMetrics);
 
 const ORACLE_HASHLIFE_MIN_JUMP_BUDGET: u64 = 1_024;
 const ORACLE_HYBRID_SEGMENT_MAX_STEP: u64 = 64;
-const ORACLE_MAX_HASHLIFE_CHECKPOINTS: usize = 8;
 const ORACLE_HASHLIFE_CHECKPOINT_PROBE_COUNT: usize = 8;
 const ORACLE_HASHLIFE_CHECKPOINT_PROBE_STEP: u64 = 1;
 const ORACLE_SMALL_EXACT_POPULATION: usize = 64;
@@ -102,10 +98,7 @@ pub enum OracleRuntimeState {
 
 #[derive(Clone, Copy, Debug)]
 struct ConfirmedCycle {
-    period: u64,
-    first_seen: u64,
-    delta: (Coord, Coord),
-    detected_at: u64,
+    certificate: PeriodicCertificate,
 }
 
 #[derive(Clone, Debug)]
@@ -133,8 +126,7 @@ struct ConfirmedEmitterCycle {
 pub struct OracleSession<'a> {
     grid: Option<BitGrid>,
     generation: u64,
-    seen: SeenStates,
-    checkpoints: CheckpointStates,
+    recurrence: ExactRecurrenceTracker,
     confirmed_cycle: Option<ConfirmedCycle>,
     emitter_cycle_candidate: Option<EmitterCycleCandidate>,
     confirmed_emitter_cycle: Option<ConfirmedEmitterCycle>,
@@ -153,17 +145,12 @@ enum OraclePhase {
 }
 
 impl<'a> OracleSession<'a> {
-    pub fn new(
-        grid: BitGrid,
-        generation: u64,
-        seen: SeenStates,
-        simulation: &'a mut SimulationSession,
-    ) -> Self {
+    pub fn new(grid: BitGrid, generation: u64, simulation: &'a mut SimulationSession) -> Self {
+        let lineage = simulation.recurrence_lineage();
         Self {
             grid: Some(grid),
             generation,
-            seen,
-            checkpoints: HashMap::new(),
+            recurrence: ExactRecurrenceTracker::new(lineage),
             confirmed_cycle: None,
             emitter_cycle_candidate: None,
             confirmed_emitter_cycle: None,
@@ -188,8 +175,7 @@ impl<'a> OracleSession<'a> {
         Ok(Self {
             grid: None,
             generation,
-            seen: HashMap::new(),
-            checkpoints: HashMap::new(),
+            recurrence: ExactRecurrenceTracker::new(simulation.recurrence_lineage()),
             confirmed_cycle: None,
             emitter_cycle_candidate: None,
             confirmed_emitter_cycle: None,
@@ -199,6 +185,25 @@ impl<'a> OracleSession<'a> {
             last_step_span: 0,
             advance_failure: None,
         })
+    }
+
+    pub(crate) fn from_classification_checkpoint(
+        checkpoint: ClassificationCheckpoint,
+        simulation: &'a mut SimulationSession,
+    ) -> Self {
+        Self {
+            grid: Some(checkpoint.grid),
+            generation: checkpoint.generation,
+            recurrence: checkpoint.recurrence,
+            confirmed_cycle: None,
+            emitter_cycle_candidate: None,
+            confirmed_emitter_cycle: None,
+            simulation,
+            exact_memo: Memo::default(),
+            phase: OraclePhase::ExactGrid,
+            last_step_span: 0,
+            advance_failure: None,
+        }
     }
 
     pub fn generation(&self) -> u64 {
@@ -319,10 +324,9 @@ impl<'a> OracleSession<'a> {
     }
 
     fn classify_exact_state(&mut self) -> Option<Classification> {
-        let (signature, origin, is_empty) = {
+        let is_empty = {
             let grid = self.ensure_sampled_grid();
-            let (signature, origin) = normalize(grid);
-            (signature, origin, grid.is_empty())
+            grid.is_empty()
         };
         if is_empty {
             return Some(Classification::DiesOut {
@@ -330,29 +334,50 @@ impl<'a> OracleSession<'a> {
             });
         }
 
-        if let Some(&(first_seen, first_origin)) = self.seen.get(&signature) {
-            let period = self.generation - first_seen;
-            let dx = origin.0 - first_origin.0;
-            let dy = origin.1 - first_origin.1;
-            self.confirmed_cycle = Some(ConfirmedCycle {
-                period,
-                first_seen,
-                delta: (dx, dy),
-                detected_at: self.generation,
-            });
-            return Some(if dx == 0 && dy == 0 {
-                Classification::Repeats { period, first_seen }
-            } else {
-                Classification::Spaceship {
-                    period,
-                    first_seen,
-                    delta: (dx, dy),
-                    detected_at: self.generation,
-                }
-            });
-        }
+        let outcome = self.observe_recurrence();
+        self.classification_for_recurrence(outcome)
+    }
 
-        self.seen.insert(signature, (self.generation, origin));
-        None
+    fn observe_recurrence(&mut self) -> ObserveOutcome {
+        let simulation_lineage = self.simulation.recurrence_lineage();
+        if self.is_hashlife_phase() && self.recurrence.lineage() != simulation_lineage {
+            self.recurrence.reset(simulation_lineage);
+        }
+        let lineage = if self.is_hashlife_phase() {
+            simulation_lineage
+        } else {
+            self.recurrence.lineage()
+        };
+        let observation = if self.is_hashlife_phase() {
+            self.simulation.recurrence_observation()
+        } else {
+            Observation::from_grid(lineage, self.generation, self.ensure_sampled_grid())
+        };
+        self.recurrence.observe_result(observation)
+    }
+
+    fn classification_for_recurrence(&mut self, outcome: ObserveOutcome) -> Option<Classification> {
+        let ObserveOutcome::Repeated(certificate) = outcome else {
+            return None;
+        };
+        let delta = certificate.delta();
+        let delta = (
+            Coord::try_from(delta.0).ok()?,
+            Coord::try_from(delta.1).ok()?,
+        );
+        self.confirmed_cycle = Some(ConfirmedCycle { certificate });
+        Some(if delta == (0, 0) {
+            Classification::Repeats {
+                period: certificate.period(),
+                first_seen: certificate.first_seen(),
+            }
+        } else {
+            Classification::Spaceship {
+                period: certificate.period(),
+                first_seen: certificate.first_seen(),
+                delta,
+                detected_at: certificate.detected_at(),
+            }
+        })
     }
 }

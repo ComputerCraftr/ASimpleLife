@@ -2,6 +2,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use syn::visit::{self, Visit};
 
+pub(crate) mod c;
+mod cfg;
+pub(crate) mod compiled_c;
+mod discovery;
+pub(crate) use cfg::attributes_are_test_only;
+pub(crate) use discovery::source_files;
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CfgPredicate {
     Flag(String),
@@ -21,52 +28,52 @@ impl RustSource {
         syn::parse_file(&normalized).map(|syntax| Self { syntax })
     }
 
-    pub(crate) fn function_has_cfg_flag(&self, function: &str, flag: &str) -> Option<bool> {
-        let function = self.function(function)?;
-        Some(function.attrs.iter().any(|attribute| {
-            if !attribute.path().is_ident("cfg") {
-                return false;
-            }
-            let mut contains_flag = false;
-            attribute
-                .parse_nested_meta(|meta| {
-                    contains_flag |= meta.path.is_ident(flag);
-                    Ok(())
-                })
-                .is_ok()
-                && contains_flag
-        }))
+    pub(crate) fn function_is_test_only(&self, function: &str) -> Option<bool> {
+        let (test_only, _) = self.callable(function)?;
+        Some(test_only)
     }
 
     pub(crate) fn function_path_references(&self, function: &str) -> Option<Vec<String>> {
-        let function = self.function(function)?;
+        let (_, block) = self.callable(function)?;
         let mut visitor = PathReferenceVisitor::default();
-        visitor.visit_item_fn(function);
+        visitor.visit_block(block);
         Some(visitor.references)
     }
 
     pub(crate) fn struct_field_names(&self, name: &str) -> Option<Vec<String>> {
-        self.syntax.items.iter().find_map(|item| {
-            let syn::Item::Struct(item_struct) = item else {
-                return None;
-            };
-            if item_struct.ident != name {
-                return None;
-            }
-            Some(
-                item_struct
-                    .fields
-                    .iter()
-                    .filter_map(|field| field.ident.as_ref().map(ToString::to_string))
-                    .collect(),
-            )
-        })
+        let matches = self.structs(name);
+        if matches.len() != 1 {
+            return None;
+        }
+        Some(
+            matches[0]
+                .fields
+                .iter()
+                .filter_map(|field| field.ident.as_ref().map(ToString::to_string))
+                .collect(),
+        )
+    }
+
+    fn structs(&self, name: &str) -> Vec<&syn::ItemStruct> {
+        let mut visitor = StructVisitor {
+            name,
+            found: Vec::new(),
+        };
+        visitor.visit_file(&self.syntax);
+        visitor.found
     }
 
     pub(crate) fn method_call_count(&self, method: &str) -> usize {
         let mut visitor = MethodCallVisitor { method, count: 0 };
         visitor.visit_file(&self.syntax);
         visitor.count
+    }
+
+    pub(crate) fn callable_method_count(&self, callable: &str, method: &str) -> Option<usize> {
+        let (_, block) = self.callable(callable)?;
+        let mut visitor = MethodCallVisitor { method, count: 0 };
+        visitor.visit_block(block);
+        Some(visitor.count)
     }
 
     pub(crate) fn macro_cfg_predicate(&self, macro_name: &str) -> Option<CfgPredicate> {
@@ -97,13 +104,7 @@ impl RustSource {
     }
 
     fn contains_callable(&self, name: &str) -> bool {
-        self.syntax.items.iter().any(|item| match item {
-            syn::Item::Fn(function) => function.sig.ident == name,
-            syn::Item::Impl(item_impl) => item_impl.items.iter().any(
-                |item| matches!(item, syn::ImplItem::Fn(function) if function.sig.ident == name),
-            ),
-            _ => false,
-        })
+        !self.callables(name).is_empty()
     }
 
     fn contains_macro(&self, name: &str) -> bool {
@@ -112,13 +113,75 @@ impl RustSource {
         )
     }
 
-    fn function(&self, name: &str) -> Option<&syn::ItemFn> {
-        self.syntax.items.iter().find_map(|item| {
-            let syn::Item::Fn(function) = item else {
-                return None;
-            };
-            (function.sig.ident == name).then_some(function)
-        })
+    fn callable(&self, name: &str) -> Option<(bool, &syn::Block)> {
+        let matches = self.callables(name);
+        (matches.len() == 1).then(|| matches[0])
+    }
+
+    fn callables(&self, name: &str) -> Vec<(bool, &syn::Block)> {
+        let mut visitor = CallableVisitor {
+            name,
+            found: Vec::new(),
+            test_only: false,
+        };
+        visitor.visit_file(&self.syntax);
+        visitor.found
+    }
+}
+
+struct StructVisitor<'name, 'ast> {
+    name: &'name str,
+    found: Vec<&'ast syn::ItemStruct>,
+}
+
+impl<'ast> Visit<'ast> for StructVisitor<'_, 'ast> {
+    fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+        if item.ident == self.name {
+            self.found.push(item);
+        }
+        visit::visit_item_struct(self, item);
+    }
+}
+
+struct CallableVisitor<'name, 'ast> {
+    name: &'name str,
+    found: Vec<(bool, &'ast syn::Block)>,
+    test_only: bool,
+}
+
+impl<'ast> Visit<'ast> for CallableVisitor<'_, 'ast> {
+    fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
+        let inherited = self.test_only;
+        self.test_only |= attributes_are_test_only(&function.attrs);
+        if function.sig.ident == self.name {
+            self.found.push((self.test_only, &function.block));
+        }
+        visit::visit_item_fn(self, function);
+        self.test_only = inherited;
+    }
+
+    fn visit_impl_item_fn(&mut self, function: &'ast syn::ImplItemFn) {
+        let inherited = self.test_only;
+        self.test_only |= attributes_are_test_only(&function.attrs);
+        if function.sig.ident == self.name {
+            self.found.push((self.test_only, &function.block));
+        }
+        visit::visit_impl_item_fn(self, function);
+        self.test_only = inherited;
+    }
+
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        let inherited = self.test_only;
+        self.test_only |= attributes_are_test_only(&item.attrs);
+        visit::visit_item_mod(self, item);
+        self.test_only = inherited;
+    }
+
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        let inherited = self.test_only;
+        self.test_only |= attributes_are_test_only(&item.attrs);
+        visit::visit_item_impl(self, item);
+        self.test_only = inherited;
     }
 }
 
@@ -128,27 +191,7 @@ pub(crate) struct RustRepository {
 
 impl RustRepository {
     pub(crate) fn discover(root: &Path) -> Result<Self, String> {
-        let mut paths = Vec::new();
-        let mut directories = vec![root.join("src")];
-        while let Some(directory) = directories.pop() {
-            let entries = fs::read_dir(&directory)
-                .map_err(|error| format!("failed to read {}: {error}", directory.display()))?;
-            for entry in entries {
-                let entry = entry.map_err(|error| {
-                    format!(
-                        "failed to read an entry in {}: {error}",
-                        directory.display()
-                    )
-                })?;
-                let path = entry.path();
-                if path.is_dir() {
-                    directories.push(path);
-                } else if path.extension().is_some_and(|extension| extension == "rs") {
-                    paths.push(path);
-                }
-            }
-        }
-        paths.sort();
+        let paths = source_files(root, &["rs"])?;
 
         let mut sources = Vec::with_capacity(paths.len());
         for path in paths {
@@ -167,6 +210,30 @@ impl RustRepository {
                 .iter()
                 .filter(|(_, source)| source.contains_callable(name)),
         )
+    }
+
+    pub(crate) fn source_containing_struct(&self, name: &str) -> Option<&RustSource> {
+        unique_source(
+            self.sources
+                .iter()
+                .filter(|(_, source)| !source.structs(name).is_empty()),
+        )
+    }
+
+    pub(crate) fn source_containing_function_reference(
+        &self,
+        function: &str,
+        referenced_path: &str,
+    ) -> Option<&RustSource> {
+        unique_source(self.sources.iter().filter(|(_, source)| {
+            source
+                .function_path_references(function)
+                .is_some_and(|references| {
+                    references
+                        .iter()
+                        .any(|reference| reference == referenced_path)
+                })
+        }))
     }
 
     pub(crate) fn source_containing_macro(&self, name: &str) -> Option<&RustSource> {
@@ -261,6 +328,50 @@ mod tests {
     use crate::RequiredExt;
 
     #[test]
+    fn rust_queries_follow_nested_modules_but_keep_callable_scope_and_ambiguity() {
+        let source = RustSource::parse(
+            r#"
+            mod moved {
+                struct Artifact { cells: Grid }
+                impl Engine { fn embed(&self) { grid.occupied_chunks(); } }
+                fn unrelated() { grid.live_cells(); }
+            }
+        "#,
+        )
+        .or_invariant("nested AST fixture");
+        assert_eq!(source.callable_method_count("embed", "live_cells"), Some(0));
+        assert_eq!(
+            source.callable_method_count("embed", "occupied_chunks"),
+            Some(1)
+        );
+        assert_eq!(
+            source.struct_field_names("Artifact"),
+            Some(vec!["cells".to_string()])
+        );
+        let duplicate = RustSource::parse("mod a { fn f() {} } mod b { fn f() {} }")
+            .or_invariant("ambiguous fixture");
+        assert!(
+            duplicate.function_path_references("f").is_none(),
+            "ambiguous names must not silently select the first declaration"
+        );
+    }
+
+    #[test]
+    fn rust_callable_cfg_inherits_module_and_impl_conditions_without_leaking_to_siblings() {
+        let source = RustSource::parse(
+            r#"
+            #[cfg(test)] mod fixtures { fn hidden() {} }
+            #[cfg(test)] impl Engine { fn probe(&self) {} }
+            #[cfg_attr(test, inline)] fn production() {}
+        "#,
+        )
+        .or_invariant("inherited cfg fixture");
+        assert_eq!(source.function_is_test_only("hidden"), Some(true));
+        assert_eq!(source.function_is_test_only("probe"), Some(true));
+        assert_eq!(source.function_is_test_only("production"), Some(false));
+    }
+
+    #[test]
     fn rust_source_queries_use_syntax_instead_of_comments_or_string_literals() {
         let source = RustSource::parse(
             r#"
@@ -286,7 +397,7 @@ mod tests {
         assert_eq!(source.method_call_count("live_cells"), 0);
         assert_eq!(source.method_call_count("occupied_chunks"), 1);
         assert_eq!(
-            source.function_has_cfg_flag("compile_life_scaffold", "test"),
+            source.function_is_test_only("compile_life_scaffold"),
             Some(true)
         );
         assert_eq!(
@@ -308,7 +419,7 @@ mod tests {
         let source = "#[cfg(test)]\r\nfn scaffold() { value.real_call(); }\r\n";
         let source = RustSource::parse(source).or_invariant("CRLF source should parse");
 
-        assert_eq!(source.function_has_cfg_flag("scaffold", "test"), Some(true));
+        assert_eq!(source.function_is_test_only("scaffold"), Some(true));
         assert_eq!(source.method_call_count("real_call"), 1);
     }
 

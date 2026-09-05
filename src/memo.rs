@@ -1,13 +1,9 @@
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use crate::RequiredExt;
 use crate::cache_policy::{SIMD_RETAINED_CACHE_CAPACITY, should_collect_simd_transition_caches};
-use crate::classify::Classification;
-use crate::flat_table::FlatKey;
 use crate::hashing::hash_chunk_neighborhood_words;
-use crate::normalize::NormalizedGridSignature;
-use crate::probe_table::{ProbeMode, ProbeTable};
+use crate::probe_table::{ProbeKey, ProbeMode, ProbeTable};
 use crate::simd_layout::{AlignedLaneIndexBatch, SIMD_BATCH_LANES};
 use crate::symmetry::D4Symmetry as Symmetry;
 
@@ -28,7 +24,7 @@ impl Hash for ChunkNeighborhood {
     }
 }
 
-impl FlatKey for ChunkNeighborhood {
+impl ProbeKey for ChunkNeighborhood {
     fn fingerprint(&self) -> u64 {
         self.fingerprint()
     }
@@ -94,7 +90,6 @@ pub(crate) struct MemoRuntimeStats {
 
 #[derive(Clone, Debug)]
 pub struct Memo {
-    classification_cache: HashMap<NormalizedGridSignature, Classification>,
     chunk_transition_cache: ProbeTable<ChunkNeighborhood, u64>,
     chunk_canonicalization_cache: ProbeTable<ChunkNeighborhood, CanonicalChunkNeighborhoodEntry>,
     stats: MemoStats,
@@ -103,34 +98,9 @@ pub struct Memo {
 impl Default for Memo {
     fn default() -> Self {
         Self {
-            classification_cache: HashMap::new(),
             chunk_transition_cache: ProbeTable::new(ProbeMode::Mutable),
             chunk_canonicalization_cache: ProbeTable::new(ProbeMode::Mutable),
             stats: MemoStats::default(),
-        }
-    }
-}
-
-impl Memo {
-    pub fn get_classification(
-        &self,
-        signature: &NormalizedGridSignature,
-    ) -> Option<Classification> {
-        self.classification_cache.get(signature).cloned()
-    }
-
-    pub fn insert_classification(
-        &mut self,
-        signature: NormalizedGridSignature,
-        classification: Classification,
-    ) {
-        if matches!(
-            classification,
-            Classification::DiesOut { .. }
-                | Classification::Repeats { .. }
-                | Classification::Spaceship { .. }
-        ) {
-            self.classification_cache.insert(signature, classification);
         }
     }
 }

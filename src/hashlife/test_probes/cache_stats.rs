@@ -217,7 +217,7 @@ impl HashLifeEngine {
         (0..self.node_count()).all(|i| {
             let id = NodeId::try_from(i).or_invariant("test node id exceeds u32");
             self.node_columns.fingerprint(id)
-                == super::FlatKey::fingerprint(&self.node_columns.packed_key(id))
+                == super::ProbeKey::fingerprint(&self.node_columns.packed_key(id))
         })
     }
 

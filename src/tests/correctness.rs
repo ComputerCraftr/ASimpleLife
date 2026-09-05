@@ -434,11 +434,19 @@ fn distant_equal_viewport_candidate_does_not_replace_current_focus() {
 }
 
 #[test]
-fn materially_better_viewport_candidate_replaces_current_focus() {
+fn distant_population_lead_does_not_replace_an_occupied_focus() {
     assert_eq!(
         stable_viewport_origin(Some((0, 0)), (1_000, 0), 60, 100, 80, 24),
-        (1_000, 0),
-        "the viewport should switch when its current cluster has become materially weaker"
+        (0, 0),
+        "a population lead can be an oscillator phase, not loss of the current focus"
+    );
+}
+
+#[test]
+fn empty_viewport_reacquires_a_visible_candidate() {
+    assert_eq!(
+        stable_viewport_origin(Some((0, 0)), (1_000, 0), 0, 5, 80, 24),
+        (1_000, 0)
     );
 }
 

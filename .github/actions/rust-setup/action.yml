@@ -13,6 +13,9 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Keep executable test artifacts within this CI job
+      shell: bash
+      run: echo "ASIMPLELIFE_C_TEST_CACHE_DIR=$RUNNER_TEMP/asimplelife-c-tests-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB" >> "$GITHUB_ENV"
     - name: Install stable Rust
       if: ${{ inputs.toolchain == 'stable' }}
       uses: dtolnay/rust-toolchain@stable

@@ -1,24 +1,24 @@
 use super::*;
 use crate::RequiredExt;
 use crate::bf::c_support::{
-    mask_literal, normalized_c_offset, push_c_line, signed_cells_flag, unified_input_stmt,
-    unified_output_stmt, wrap_ptr_expr,
+    expand_runtime_fragments, mask_literal, normalized_c_offset, push_c_line, signed_cells_flag,
+    unified_input_stmt, unified_output_stmt, wrap_ptr_expr,
 };
 use crate::bf::ir::ShiftDir;
 use crate::bf::optimizer::CodegenOpts;
+use crate::bf::polynomial_emit::PolynomialEmissionBudget;
 use crate::bf::summary::{
     DEFAULT_DYNAMIC_LOOP_HOT_THRESHOLD, RUNTIME_SUMMARY_EFFECT_MAX, RUNTIME_SUMMARY_WINDOW_MAX,
     stable_summary_hash,
 };
 use std::collections::HashMap;
-
 mod batches;
 use batches::{emit_seq_add_batch, emit_seq_clear_batch};
+mod polynomial;
+use polynomial::{emit_powered_loop_apply, emit_symbolic_transfer_apply, render_symbolic_transfer};
 mod reachable;
 use reachable::executable_nodes;
-
 type DynamicLoopOps = Vec<(u8, i32, i32, i32, u8)>;
-
 fn lower_dynamic_loop_ops(engine: &EmitterEngine, body: NodeId) -> Option<DynamicLoopOps> {
     let mut ops = Vec::new();
     let mut stack = vec![body];
@@ -102,11 +102,9 @@ fn lower_dynamic_loop_ops(engine: &EmitterEngine, body: NodeId) -> Option<Dynami
     (pointer == 0 && span_minus_one < window_max).then_some(())?;
     matches!(guard_delta, -1 | 1).then_some(ops)
 }
-
 fn stable_node_hash(engine: &EmitterEngine, body: NodeId) -> u64 {
     stable_summary_hash(&format!("{:?}", engine.interner.get(body)))
 }
-
 fn emit_dynamic_loop_spec(
     out: &mut String,
     engine: &EmitterEngine,
@@ -140,7 +138,6 @@ fn emit_dynamic_loop_spec(
     );
     out.push('\n');
 }
-
 fn emit_dynamic_loop_fast_path(out: &mut String, id: NodeId, body: NodeId, level: usize) {
     push_c_line(
         out,
@@ -195,224 +192,21 @@ fn emit_dynamic_loop_fast_path(out: &mut String, id: NodeId, body: NodeId, level
     push_c_line(out, level + 1, "dynamic_memo_after_rejection++;");
     push_c_line(out, level, "}");
 }
-
 fn wrap_add_expr(delta: i32) -> String {
     format!("bf_wrap_add(tape[ptr], INT64_C({delta}), BF_CELL_BITS, BF_SIGNED_CELLS)")
 }
-
 fn wrap_sub_expr(delta: i64) -> String {
     format!("bf_wrap_sub(tape[ptr], INT64_C({delta}), BF_CELL_BITS, BF_SIGNED_CELLS)")
 }
-
 fn cell_expr(offset: crate::bf::BfOffset) -> String {
     format!("tape[{}]", wrap_ptr_expr(offset))
 }
-
 fn wrap_shift_left_expr(src_expr: &str, amount: u32) -> String {
     format!("bf_wrap_shift_left({src_expr}, {amount}, BF_CELL_BITS, BF_SIGNED_CELLS)")
 }
-
 fn wrap_shift_right_expr(src_expr: &str, amount: u32) -> String {
     format!("bf_wrap_shift_right({src_expr}, {amount}, BF_CELL_BITS, BF_SIGNED_CELLS)")
 }
-
-fn cell_var_name(offset: crate::bf::BfOffset) -> String {
-    if offset < 0 {
-        format!("cell_neg_{}", -offset)
-    } else {
-        format!("cell_{offset}")
-    }
-}
-
-fn emit_symbolic_transfer_apply(out: &mut String, transfer: &SymbolicTransfer, level: usize) {
-    push_c_line(out, level, "bf_work_op();");
-    for &offset in &transfer.reads {
-        push_c_line(
-            out,
-            level,
-            &format!(
-                "int64_t {} = tape[{}];",
-                cell_var_name(offset),
-                wrap_ptr_expr(offset)
-            ),
-        );
-    }
-    let effects = transfer.effects.iter().collect::<Vec<_>>();
-    let mut index = 0;
-    while index < effects.len() {
-        let (&offset, polynomial) = effects[index];
-        if polynomial.is_zero() {
-            let start = offset;
-            let mut end = offset;
-            while index + 1 < effects.len()
-                && effects[index + 1].0 == &(end + 1)
-                && effects[index + 1].1.is_zero()
-            {
-                index += 1;
-                end += 1;
-            }
-            push_c_line(
-                out,
-                level,
-                &format!("bf_zero_region(tape, ptr, {start}, {}U);", end - start + 1),
-            );
-            index += 1;
-            continue;
-        }
-        let target = wrap_ptr_expr(offset);
-        let line = format!("tape[{target}] = {};", symbolic_polynomial_expr(polynomial));
-        push_c_line(out, level, &line);
-        index += 1;
-    }
-}
-
-fn symbolic_polynomial_expr(polynomial: &SymbolicPolynomial) -> String {
-    let mut expression = c_i64_literal(polynomial.constant);
-    for (&term, &coeff) in &polynomial.terms {
-        let base = match term {
-            SymbolicMonomial::Linear(offset) => cell_var_name(offset),
-            SymbolicMonomial::Product(lhs, rhs) => format!(
-                "bf_wrap_mul({}, {}, BF_CELL_BITS, BF_SIGNED_CELLS)",
-                cell_var_name(lhs),
-                cell_var_name(rhs)
-            ),
-        };
-        let value = if coeff == 1 {
-            base
-        } else {
-            format!(
-                "bf_wrap_mul({base}, {}, BF_CELL_BITS, BF_SIGNED_CELLS)",
-                c_i64_literal(coeff)
-            )
-        };
-        expression = format!("bf_wrap_add({expression}, {value}, BF_CELL_BITS, BF_SIGNED_CELLS)");
-    }
-    expression
-}
-
-fn c_i64_literal(value: i64) -> String {
-    if value == i64::MIN {
-        "(-INT64_C(9223372036854775807) - INT64_C(1))".to_string()
-    } else {
-        format!("INT64_C({value})")
-    }
-}
-
-fn emit_powered_loop_apply(
-    out: &mut String,
-    analysis: &PoweredLoopAnalysis,
-    max_power: u8,
-    level: usize,
-) {
-    push_c_line(
-        out,
-        level,
-        &format!(
-            "int64_t guard = tape[{}];",
-            wrap_ptr_expr(analysis.guard_offset)
-        ),
-    );
-    push_c_line(out, level, "uint64_t remaining_iters = 0;");
-    push_c_line(out, level, "int powered_ok = 0;");
-    push_c_line(out, level, "if (guard == 0) {");
-    push_c_line(out, level + 1, "powered_ok = 1;");
-    push_c_line(out, level, "} else if (BF_SIGNED_CELLS) {");
-    if analysis.guard_delta < 0 {
-        push_c_line(
-            out,
-            level + 1,
-            &format!(
-                "if (guard > 0 && ((uint64_t)guard % UINT64_C({})) == 0) {{",
-                -analysis.guard_delta
-            ),
-        );
-        push_c_line(
-            out,
-            level + 2,
-            &format!(
-                "remaining_iters = (uint64_t)guard / UINT64_C({});",
-                -analysis.guard_delta
-            ),
-        );
-    } else {
-        push_c_line(
-            out,
-            level + 1,
-            "uint64_t guard_magnitude = (uint64_t)(-(guard + INT64_C(1))) + UINT64_C(1);",
-        );
-        push_c_line(
-            out,
-            level + 1,
-            &format!(
-                "if (guard < 0 && (guard_magnitude % UINT64_C({})) == 0) {{",
-                analysis.guard_delta
-            ),
-        );
-        push_c_line(
-            out,
-            level + 2,
-            &format!(
-                "remaining_iters = guard_magnitude / UINT64_C({});",
-                analysis.guard_delta
-            ),
-        );
-    }
-    push_c_line(out, level + 2, "powered_ok = 1;");
-    push_c_line(out, level + 1, "}");
-    push_c_line(out, level, "} else {");
-    if analysis.guard_delta < 0 {
-        push_c_line(
-            out,
-            level + 1,
-            &format!(
-                "if (guard > 0 && ((uint64_t)guard % UINT64_C({})) == 0) {{",
-                -analysis.guard_delta
-            ),
-        );
-        push_c_line(
-            out,
-            level + 2,
-            &format!(
-                "remaining_iters = (uint64_t)guard / UINT64_C({});",
-                -analysis.guard_delta
-            ),
-        );
-        push_c_line(out, level + 2, "powered_ok = 1;");
-        push_c_line(out, level + 1, "}");
-    }
-    push_c_line(out, level, "}");
-    push_c_line(out, level, "if (powered_ok) {");
-    push_c_line(out, level + 1, "symbolic_power_builds++;");
-    for power in (0..=max_power).rev() {
-        let iterations = 1_u64 << power;
-        let condition = if power == max_power { "while" } else { "if" };
-        push_c_line(
-            out,
-            level + 1,
-            &format!("{condition} (remaining_iters >= UINT64_C({iterations})) {{"),
-        );
-        push_c_line(out, level + 2, "symbolic_power_hits++;");
-        emit_symbolic_transfer_apply(out, &analysis.powers[usize::from(power)], level + 2);
-        push_c_line(
-            out,
-            level + 2,
-            &format!("remaining_iters -= UINT64_C({iterations});"),
-        );
-        push_c_line(out, level + 1, "}");
-    }
-    push_c_line(out, level, "} else {");
-    push_c_line(out, level + 1, "recursion_fallbacks++;");
-    push_c_line(out, level + 1, "while (tape[ptr] != 0) {");
-    push_c_line(out, level + 2, "bf_work_loop_iter();");
-    push_c_line(
-        out,
-        level + 2,
-        &format!("exec_node_{}(tape, &ptr);", analysis.body.0),
-    );
-    push_c_line(out, level + 1, "}");
-    push_c_line(out, level, "}");
-}
-
 fn emit_exact_memo_prologue(
     out: &mut String,
     id: NodeId,
@@ -473,7 +267,6 @@ fn emit_exact_memo_prologue(
     push_c_line(out, level + 1, "}");
     let _ = body_level;
 }
-
 fn emit_exact_memo_epilogue(out: &mut String, exact: ExactMemoSpec, level: usize) {
     push_c_line(out, level + 1, "value.node_id = key.node_id;");
     push_c_line(out, level + 1, "value.window_start = key.window_start;");
@@ -497,13 +290,24 @@ fn emit_exact_memo_epilogue(out: &mut String, exact: ExactMemoSpec, level: usize
     push_c_line(out, level + 1, "bf_memo_store(&key, &value);");
     push_c_line(out, level, "}");
 }
-
+fn is_polynomial_rich_tree(engine: &EmitterEngine, root: NodeId) -> bool {
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        match engine.interner.get(id) {
+            NodeKind::Affine { .. } | NodeKind::Square { .. } | NodeKind::MulAdd { .. } => {}
+            NodeKind::Seq(children) => stack.extend(children.iter().copied()),
+            _ => return false,
+        }
+    }
+    true
+}
 fn emit_raw_node(
     out: &mut String,
     engine: &mut EmitterEngine,
     id: NodeId,
     opts: CodegenOpts,
     level: usize,
+    emission_budget: &mut PolynomialEmissionBudget,
 ) {
     match engine.interner.get(id) {
         NodeKind::Add(delta) if *delta > 0 => {
@@ -790,13 +594,34 @@ fn emit_raw_node(
             push_c_line(out, level, "bf_diverge_forever();");
         }
         NodeKind::Seq(children) => {
+            let children = children.clone();
+            if is_polynomial_rich_tree(engine, id) {
+                let transfer = engine.transfer(id).clone();
+                if engine.compile_work.admit_evaluation(&transfer)
+                    && let Some(lines) =
+                        render_symbolic_transfer(&transfer, emission_budget, level + 1)
+                {
+                    push_c_line(out, level, "if (!bf_semantic_fuel_enabled()) {");
+                    emit_symbolic_transfer_apply(out, &lines, level + 1);
+                    push_c_line(out, level, "} else {");
+                    for child in &children {
+                        push_c_line(
+                            out,
+                            level + 1,
+                            &format!("exec_node_{}(tape, &ptr);", child.0),
+                        );
+                    }
+                    push_c_line(out, level, "}");
+                    return;
+                }
+            }
             let mut index = 0;
             while index < children.len() {
-                if let Some(next) = emit_seq_add_batch(out, engine, children, index, level) {
+                if let Some(next) = emit_seq_add_batch(out, engine, &children, index, level) {
                     index = next;
                     continue;
                 }
-                if let Some(next) = emit_seq_clear_batch(out, engine, children, index, level) {
+                if let Some(next) = emit_seq_clear_batch(out, engine, &children, index, level) {
                     index = next;
                     continue;
                 }
@@ -828,6 +653,7 @@ fn emit_exec_function(
     dynamic_loops: &HashMap<NodeId, (NodeId, DynamicLoopOps, ExactMemoSpec)>,
     id: NodeId,
     opts: CodegenOpts,
+    emission_budget: &mut PolynomialEmissionBudget,
 ) {
     let plan = engine.plan_node(id);
     let dynamic_body = dynamic_loops.get(&id).map(|(body, _, _)| *body);
@@ -849,7 +675,18 @@ fn emit_exec_function(
     match plan {
         ExecPlan::ExactMemo(exact) => {
             emit_exact_memo_prologue(out, id, exact, 1, 2);
-            emit_raw_node(out, engine, id, opts, 2);
+            let transfer = engine.transfer(id).clone();
+            if engine.compile_work.admit_evaluation(&transfer)
+                && let Some(lines) = render_symbolic_transfer(&transfer, emission_budget, 3)
+            {
+                push_c_line(out, 2, "if (bf_semantic_fuel_enabled()) {");
+                emit_raw_node(out, engine, id, opts, 3, emission_budget);
+                push_c_line(out, 2, "} else {");
+                emit_symbolic_transfer_apply(out, &lines, 3);
+                push_c_line(out, 2, "}");
+            } else {
+                emit_raw_node(out, engine, id, opts, 2, emission_budget);
+            }
             emit_exact_memo_epilogue(out, exact, 1);
         }
         ExecPlan::ExactLoopMemo { body, exact } => {
@@ -893,27 +730,28 @@ fn emit_exec_function(
             push_c_line(out, 4, &format!("exec_node_{}(tape, &ptr);", body.0));
             push_c_line(out, 3, "}");
             push_c_line(out, 2, "} else {");
-            emit_powered_loop_apply(out, powered, max_power, 3);
+            emit_powered_loop_apply(out, powered, max_power, 3, emission_budget);
             push_c_line(out, 2, "}");
             emit_exact_memo_epilogue(out, exact, 1);
         }
-        _ => emit_raw_node(out, engine, id, opts, 1),
+        _ => emit_raw_node(out, engine, id, opts, 1, emission_budget),
     }
     push_c_line(out, 1, "recursion_depth--;");
     push_c_line(out, 1, "*ptr_ref = ptr;");
     push_c_line(out, 0, "}");
     out.push('\n');
 }
-
 pub fn emit_c_super(program: &[BfIr], opts: CodegenOpts) -> String {
-    let mut engine = EmitterEngine::new();
+    if let Err(error) = opts.validate() {
+        return format!("#error {error}\n");
+    }
+    let mut engine = EmitterEngine::with_opts(opts);
     let root = engine.build_program(program);
     for index in 0..engine.interner.len() {
         let node_id = NodeId(u32::try_from(index).or_invariant("super-C node count exceeded u32"));
         let _ = engine.plan_node(node_id);
     }
     let executable = executable_nodes(&mut engine, root);
-
     let mut dynamic_loops = HashMap::new();
     for (index, is_executable) in executable.iter().copied().enumerate() {
         if !is_executable {
@@ -926,8 +764,8 @@ pub fn emit_c_super(program: &[BfIr], opts: CodegenOpts) -> String {
             dynamic_loops.insert(node_id, (body, ops, exact));
         }
     }
-
     let mut functions = String::new();
+    let mut emission_budget = PolynomialEmissionBudget::default();
     for (index, is_executable) in executable.iter().copied().enumerate() {
         if !is_executable {
             continue;
@@ -952,12 +790,19 @@ pub fn emit_c_super(program: &[BfIr], opts: CodegenOpts) -> String {
                 index, node_debug, decision.plan, decision.estimated_cost
             ),
         );
-        emit_exec_function(&mut functions, &mut engine, &dynamic_loops, node_id, opts);
+        emit_exec_function(
+            &mut functions,
+            &mut engine,
+            &dynamic_loops,
+            node_id,
+            opts,
+            &mut emission_budget,
+        );
     }
     let config = format!(
         "#define BF_TEMPLATE_TAPE_LEN {}\n#define BF_TEMPLATE_CELL_BITS {}\n#define BF_TEMPLATE_SIGNED_CELLS {}\n#define BF_TEMPLATE_MEMO_CAPACITY {}\n#define BF_TEMPLATE_MEMO_WINDOW_MAX {}\n#define BF_TEMPLATE_MAX_NODES {}\n#define BF_TEMPLATE_INPUT_MASK {}\n#define BF_TEMPLATE_OUTPUT_MASK {}\n#define BF_TEMPLATE_ROOT_NODE {}\n#define BF_TEMPLATE_DYNAMIC_HOT_THRESHOLD {}\n#define BF_TEMPLATE_RUNTIME_SUMMARY_EFFECT_MAX {}\n",
         SUPER_C_TAPE_LEN,
-        opts.cell_bits.min(63),
+        opts.cell_bits,
         signed_cells_flag(opts.cell_sign),
         SUPER_MEMO_CAPACITY,
         SUPER_MEMO_WINDOW_MAX,
@@ -969,7 +814,7 @@ pub fn emit_c_super(program: &[BfIr], opts: CodegenOpts) -> String {
         RUNTIME_SUMMARY_EFFECT_MAX,
     );
     let functions = format!("#define BF_TEMPLATE_HAS_FUNCTIONS 1\n{functions}");
-    include_str!("../bf_super.c.in")
+    expand_runtime_fragments(crate::bf::c_support::SUPER_RUNTIME_TEMPLATE)
         .replace("/* @BF_CONFIG */", config.trim_end())
         .replace("/* @BF_FUNCTIONS */", functions.trim_end())
 }

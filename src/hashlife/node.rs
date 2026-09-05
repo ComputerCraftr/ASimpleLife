@@ -4,6 +4,7 @@ use super::{
 };
 use crate::RequiredExt;
 use crate::bitgrid::{BitGrid, CHUNK_SIZE, Cell, Coord};
+use crate::probe_table::ProbeKey;
 
 #[derive(Clone, Copy)]
 struct BoundsFrame {
@@ -77,7 +78,7 @@ impl HashLifeEngine {
             |engine| &engine.result_caches.shells,
             |engine| &mut engine.result_caches.shells,
             key,
-            crate::flat_table::FlatKey::fingerprint(&key),
+            ProbeKey::fingerprint(&key),
             shell,
         );
         shell
@@ -275,7 +276,7 @@ impl HashLifeEngine {
                     |engine| &engine.result_caches.bounds,
                     |engine| &mut engine.result_caches.bounds,
                     current,
-                    crate::flat_table::FlatKey::fingerprint(&current),
+                    ProbeKey::fingerprint(&current),
                     bounds,
                 );
                 stack_len -= 1;
@@ -320,7 +321,7 @@ impl HashLifeEngine {
     ) -> Result<(), GridExtractionError> {
         const MAX_EXTRACTION_STACK: usize = 256;
         let (clip_min_x, clip_min_y, clip_max_x, clip_max_y) = clip_bounds;
-        let mut stack = [(0, 0, 0, 0); MAX_EXTRACTION_STACK];
+        let mut stack = [(NodeId::ZERO, 0, 0, 0); MAX_EXTRACTION_STACK];
         stack[0] = (node, origin.0, origin.1, size);
         let mut stack_len = 1;
         while stack_len != 0 {
@@ -394,7 +395,7 @@ impl HashLifeEngine {
         out: &mut BitGrid,
     ) {
         const MAX_EXTRACTION_STACK: usize = 256;
-        let mut stack = [(0, 0, 0, 0); MAX_EXTRACTION_STACK];
+        let mut stack = [(NodeId::ZERO, 0, 0, 0); MAX_EXTRACTION_STACK];
         stack[0] = (node, origin_x, origin_y, size);
         let mut stack_len = 1;
         while stack_len != 0 {
@@ -440,6 +441,9 @@ impl HashLifeEngine {
         while self.empty_by_level.len() <= level as usize {
             let child = *self.empty_by_level.last().or_invariant("required value");
             let node = self.join(child, child, child, child);
+            if self.allocation_failed() {
+                return self.dead_leaf;
+            }
             self.empty_by_level.push(node);
         }
         self.empty_by_level[level as usize]
@@ -581,6 +585,49 @@ fn extraction_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hashlife::{EngineAllocationFailure, EngineIdCapacity};
+
+    #[test]
+    fn failed_empty_chain_never_caches_a_leaf_sentinel_as_a_higher_level_node() {
+        let mut engine = HashLifeEngine::default();
+        engine.id_capacity.node_count = engine.node_count() + 2;
+        engine.begin_allocation_transaction(u128::MAX);
+        engine.empty(4);
+        assert_eq!(
+            engine.take_allocation_failure(),
+            Some(EngineAllocationFailure::NodeIdExhausted)
+        );
+        assert_eq!(
+            engine.empty_by_level.len(),
+            3,
+            "failed levels must not be published"
+        );
+        for (level, node) in engine.empty_by_level.iter().enumerate() {
+            assert_eq!(
+                engine.node_columns.level(*node) as usize,
+                level,
+                "failure cached a node at the wrong level"
+            );
+        }
+
+        engine.id_capacity = EngineIdCapacity::FULL;
+        engine.begin_allocation_transaction(u128::MAX);
+        let root = engine.empty(4);
+        assert_eq!(engine.take_allocation_failure(), None);
+        assert_eq!(
+            engine.node_columns.level(root),
+            4,
+            "retry reused a failure sentinel"
+        );
+        assert_eq!(engine.node_columns.population(root), 0);
+        let nodes = engine.node_count();
+        assert_eq!(engine.empty(4), root);
+        assert_eq!(
+            engine.node_count(),
+            nodes,
+            "valid retry must still intern empty levels uniquely"
+        );
+    }
 
     #[test]
     fn pressured_shell_and_bounds_publication_preserve_exact_results() {

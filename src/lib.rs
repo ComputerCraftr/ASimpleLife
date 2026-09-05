@@ -14,7 +14,6 @@ pub(crate) mod cache_policy;
 pub mod classify;
 pub mod cli;
 pub mod engine;
-pub(crate) mod flat_table;
 pub mod generators;
 pub(crate) mod hashing;
 pub mod hashlife;
@@ -26,12 +25,14 @@ pub mod oracle;
 pub mod persistence;
 #[allow(unsafe_code)]
 pub(crate) mod probe_table;
+pub mod recurrence;
 pub mod render;
 pub(crate) mod simd_layout;
 pub(crate) mod symmetry;
 pub mod term;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod tui;
 pub(crate) mod wide_math;
 
 pub use invariant::{RequiredErrorExt, RequiredExt, invariant_failure};

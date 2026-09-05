@@ -6,6 +6,8 @@ use crate::simd_layout::AlignedLaneIndexBatch;
 use crate::simd_layout::AlignedU64LaneWords9;
 
 mod builders;
+#[cfg(test)]
+mod hot_path_tests;
 
 impl HashLifeEngine {
     pub(super) fn probe_table_many<K: crate::probe_table::ProbeKey, V: Copy, const N: usize>(
@@ -15,6 +17,7 @@ impl HashLifeEngine {
         active_lanes: usize,
     ) -> ([Option<V>; N], crate::hashlife::kernels::KernelAccounting) {
         let mut total = crate::hashlife::kernels::KernelAccounting::default();
+        let kernels = crate::hashlife::kernels::KernelSet::selected();
         let values = table.get_many_with_fingerprints_using(
             keys,
             fingerprints,
@@ -25,8 +28,8 @@ impl HashLifeEngine {
                     let chunk_lanes = (lanes - start).min(SIMD_BATCH_LANES);
                     let mut kernel_tags = [0_u8; SIMD_BATCH_LANES];
                     kernel_tags[..chunk_lanes].copy_from_slice(&tags[start..start + chunk_lanes]);
-                    let (matches, accounting) = crate::hashlife::kernels::KernelSet::selected()
-                        .control_matches(controls, &kernel_tags, chunk_lanes);
+                    let (matches, accounting) =
+                        kernels.control_matches(controls, &kernel_tags, chunk_lanes);
                     total.accumulate(accounting);
                     expanded[start..start + chunk_lanes].copy_from_slice(&matches[..chunk_lanes]);
                 }
@@ -60,6 +63,9 @@ impl HashLifeEngine {
             }
             Some(KernelOperation::ControlMatch) => {
                 stats.control_match_kernel_lanes += accounting.candidate_lanes;
+                stats.swar_control_groups += accounting.swar_control_groups;
+                stats.native_avx2_control_groups += accounting.native_avx2_control_groups;
+                stats.native_neon_control_groups += accounting.native_neon_control_groups;
             }
             Some(KernelOperation::D4Candidate) => {
                 stats.d4_candidate_lanes += accounting.candidate_lanes;
@@ -132,8 +138,8 @@ impl HashLifeEngine {
             unique: usize,
         }
 
-        let mut canonical_overlap_lanes = [[0; 9]; N];
-        let mut structural_keys = [CanonicalStructKey::new(0, [0; 4]); N];
+        let mut canonical_overlap_lanes = [[NodeId::ZERO; 9]; N];
+        let mut structural_keys = [CanonicalStructKey::leaf(false); N];
         for lane in 0..active_lanes {
             structural_keys[lane] = identities[lane].structural;
         }
@@ -147,20 +153,18 @@ impl HashLifeEngine {
         let mut miss_records = [OverlapMissRecord {
             representative_lane: 0,
             identity: CanonicalNodeIdentity {
-                packed: PackedNodeKey::new(0, [0; 4]),
-                structural: CanonicalStructKey::new(0, [0; 4]),
+                packed: PackedNodeKey::new(0, [NodeId::ZERO; 4]),
+                structural: CanonicalStructKey::leaf(false),
                 symmetry: Symmetry::Identity,
             },
             fingerprint: 0,
             join_level: 0,
-            join_children: [[0; 4]; 5],
-            overlaps: [0; 9],
+            join_children: [[NodeId::ZERO; 4]; 5],
+            overlaps: [NodeId::ZERO; 9],
         }; N];
         let mut duplicate_miss_lanes = [DuplicateMissLane { lane: 0, unique: 0 }; N];
         let mut duplicate_miss_count = 0usize;
         let mut miss_unique_count = 0;
-        let mut unique_lookup =
-            self.try_transient_flat_table::<CanonicalStructKey, usize>(active_lanes.max(4))?;
 
         for lane in 0..active_lanes {
             if let Some(lane_overlaps) = cached[lane] {
@@ -172,9 +176,10 @@ impl HashLifeEngine {
             let canonical_identity = identities[lane];
             let canonical_key = canonical_identity.packed;
             let structural_key = canonical_identity.structural;
-            if let Some(unique) =
-                unique_lookup.get_with_fingerprint(&structural_key, fingerprints[lane])
-            {
+            if let Some(unique) = miss_records[..miss_unique_count].iter().position(|record| {
+                record.fingerprint == fingerprints[lane]
+                    && record.identity.structural == structural_key
+            }) {
                 self.stats.simd.overlap_local_reuse_lanes += 1;
                 duplicate_miss_lanes[duplicate_miss_count] = DuplicateMissLane { lane, unique };
                 duplicate_miss_count += 1;
@@ -199,15 +204,8 @@ impl HashLifeEngine {
                     [ne_sw, ne_se, se_nw, se_ne],
                     [sw_ne, se_nw, sw_se, se_sw],
                 ],
-                overlaps: [0; 9],
+                overlaps: [NodeId::ZERO; 9],
             };
-            if !self.try_insert_transient_table(
-                &mut unique_lookup,
-                structural_key,
-                miss_unique_count,
-            ) {
-                return None;
-            }
             miss_unique_count += 1;
         }
 
@@ -272,22 +270,22 @@ impl HashLifeEngine {
 #[cfg(test)]
 impl HashLifeEngine {
     pub(super) fn overlapping_subnodes(&mut self, node: NodeId) -> [NodeId; 9] {
-        let (packed, structural, symmetry, fingerprint, used_cached_fingerprint) =
+        let (packed, structural, symmetry, used_cached_fingerprint) =
             if self.record_symmetry_gate_decision(node) {
                 let canonical = self.canonicalize_packed_node(node);
                 (
                     canonical.node.packed,
                     canonical.node.structural,
                     canonical.node.symmetry,
-                    canonical.fingerprint,
                     canonical.used_cached_fingerprint,
                 )
             } else {
-                let (packed, fingerprint) = self.node_columns.packed_key_and_fingerprint(node);
+                let (packed, _) = self.node_columns.packed_key_and_fingerprint(node);
                 let structural = self.symmetry_entry(node, Symmetry::Identity).structural;
-                (packed, structural, Symmetry::Identity, fingerprint, true)
+                (packed, structural, Symmetry::Identity, true)
             };
         self.record_fingerprint_probe(used_cached_fingerprint, 1);
+        let fingerprint = structural.fingerprint();
         if let Some(overlaps) = self
             .result_caches
             .overlap
@@ -333,30 +331,38 @@ impl HashLifeEngine {
     ) -> [[NodeId; 9]; N] {
         let mut inverse_symmetries = [Symmetry::Identity; N];
         let mut identities = [CanonicalNodeIdentity {
-            packed: PackedNodeKey::new(0, [0; 4]),
-            structural: CanonicalStructKey::new(0, [0; 4]),
+            packed: PackedNodeKey::new(0, [NodeId::ZERO; 4]),
+            structural: CanonicalStructKey::leaf(false),
             symmetry: Symmetry::Identity,
         }; N];
         let mut fingerprints = [0_u64; N];
         let canonicalized = self.canonicalize_packed_nodes_batch(nodes, active_lanes);
         for lane in 0..active_lanes {
-            let (packed, structural, symmetry, fingerprint, used_cached_fingerprint) =
+            if let Some(source_lane) = nodes[..lane]
+                .iter()
+                .position(|&candidate| candidate == nodes[lane])
+            {
+                identities[lane] = identities[source_lane];
+                inverse_symmetries[lane] = inverse_symmetries[source_lane];
+                fingerprints[lane] = fingerprints[source_lane];
+                self.record_fingerprint_probe(true, 1);
+                continue;
+            }
+            let (packed, structural, symmetry, used_cached_fingerprint) =
                 if self.record_symmetry_gate_decision(nodes[lane]) {
                     let canonical = canonicalized[lane];
                     (
                         canonical.node.packed,
                         canonical.node.structural,
                         canonical.node.symmetry,
-                        canonical.fingerprint,
                         canonical.used_cached_fingerprint,
                     )
                 } else {
-                    let (packed, fingerprint) =
-                        self.node_columns.packed_key_and_fingerprint(nodes[lane]);
+                    let (packed, _) = self.node_columns.packed_key_and_fingerprint(nodes[lane]);
                     let structural = self
                         .symmetry_entry(nodes[lane], Symmetry::Identity)
                         .structural;
-                    (packed, structural, Symmetry::Identity, fingerprint, true)
+                    (packed, structural, Symmetry::Identity, true)
                 };
             self.record_fingerprint_probe(used_cached_fingerprint, 1);
             identities[lane] = CanonicalNodeIdentity {
@@ -365,7 +371,7 @@ impl HashLifeEngine {
                 symmetry,
             };
             inverse_symmetries[lane] = identities[lane].symmetry.inverse();
-            fingerprints[lane] = fingerprint;
+            fingerprints[lane] = structural.fingerprint();
         }
 
         self.stats.scheduler.cache_probe_batches += 1;
@@ -376,7 +382,7 @@ impl HashLifeEngine {
             &fingerprints,
             active_lanes,
         ) else {
-            return [[0; 9]; N];
+            return [[NodeId::ZERO; 9]; N];
         };
         self.transform_overlap_words_grouped(
             &canonical_overlap_lanes,
@@ -411,7 +417,7 @@ impl HashLifeEngine {
         active_lanes: usize,
     ) -> [NodeId; N] {
         debug_assert!(active_lanes <= SIMD_BATCH_LANES);
-        let mut centered = [0; N];
+        let mut centered = [NodeId::ZERO; N];
         let mut intents = [None; N];
         for lane in 0..active_lanes {
             let node = nodes[lane];
@@ -450,11 +456,11 @@ impl HashLifeEngine {
         inverse_symmetries: &[Symmetry; N],
         active_lanes: usize,
     ) -> [[NodeId; 9]; N] {
-        let mut overlap_lanes = [[0; 9]; N];
+        let mut overlap_lanes = [[NodeId::ZERO; 9]; N];
         for symmetry in Symmetry::ALL {
             let perm = symmetry.grid3_perm();
             let mut grouped_indices = AlignedLaneIndexBatch::default();
-            let mut source_lanes = [[0; 9]; N];
+            let mut source_lanes = [[NodeId::ZERO; 9]; N];
             let mut grouped_count = 0;
             for lane in 0..active_lanes {
                 if inverse_symmetries[lane] == symmetry {
@@ -466,9 +472,9 @@ impl HashLifeEngine {
             if grouped_count == 0 {
                 continue;
             }
-            let mut transformed_lanes = [[0_u32; 9]; N];
+            let mut transformed_lanes = [[NodeId::ZERO; 9]; N];
             for word_index in 0..9 {
-                let mut word = [0_u32; N];
+                let mut word = [NodeId::ZERO; N];
                 for lane in 0..grouped_count {
                     word[lane] = source_lanes[lane][word_index];
                 }
@@ -504,7 +510,7 @@ impl HashLifeEngine {
         intents: [Option<JoinIntent>; N],
     ) -> [Option<NodeId>; N] {
         let mut resolved = [None; N];
-        let mut packed_keys = [PackedNodeKey::new(0, [0; 4]); N];
+        let mut packed_keys = [PackedNodeKey::new(0, [NodeId::ZERO; 4]); N];
         let mut lane_map = [usize::MAX; N];
         let mut active = 0;
 
@@ -591,26 +597,55 @@ impl HashLifeEngine {
             crate::hashlife::kernels::KernelSet::selected().aggregate_population(&population_batch);
         self.record_kernel_accounting(population_accounting);
 
+        let mut unique_slots = [usize::MAX; N];
+        let mut unique_count = 0;
         for &slot in &unresolved_slots[..unresolved_count] {
-            let key = packed_keys[slot];
-            let duplicate = duplicate_sources[slot];
-            if duplicate != u8::MAX {
-                let source_lane = lane_map[usize::from(duplicate)];
-                if let Some(node_id) = resolved[source_lane] {
-                    resolved[lane_map[slot]] = Some(node_id);
-                    continue;
-                }
+            if duplicate_sources[slot] == u8::MAX {
+                unique_slots[unique_count] = slot;
+                unique_count += 1;
             }
+        }
+        for index in 1..unique_count {
+            let slot = unique_slots[index];
+            let slot_key = packed_keys[slot];
+            let slot_structural = self.canonical_parent_key(
+                slot_key.level,
+                slot_key
+                    .children
+                    .map(|child| self.node_columns.identity_ref(child)),
+            );
+            let mut insertion = index;
+            while insertion != 0 {
+                let previous_slot = unique_slots[insertion - 1];
+                let previous_key = packed_keys[previous_slot];
+                let previous_structural = self.canonical_parent_key(
+                    previous_key.level,
+                    previous_key
+                        .children
+                        .map(|child| self.node_columns.identity_ref(child)),
+                );
+                if self.compare_canonical_keys(previous_structural, slot_structural)
+                    != std::cmp::Ordering::Greater
+                {
+                    break;
+                }
+                unique_slots[insertion] = previous_slot;
+                insertion -= 1;
+            }
+            unique_slots[insertion] = slot;
+        }
+        if !self.prepare_mandatory_node_batch_growth(unique_count) {
+            return resolved;
+        }
 
+        for &slot in &unique_slots[..unique_count] {
+            let key = packed_keys[slot];
             let [nw, ne, sw, se] = key.children;
             let population = PopulationStat::from_limbs(
                 populations.lo[slot],
                 populations.hi[slot],
                 populations.saturated[slot],
             );
-            if !self.prepare_mandatory_node_growth() {
-                return resolved;
-            }
             let node_id = self.push_node(key.level, population, nw, ne, sw, se);
             if self.allocation_failed() {
                 return resolved;
@@ -621,6 +656,14 @@ impl HashLifeEngine {
             }
             let lane = lane_map[slot];
             resolved[lane] = Some(node_id);
+        }
+        for &slot in &unresolved_slots[..unresolved_count] {
+            let duplicate = duplicate_sources[slot];
+            if duplicate == u8::MAX {
+                continue;
+            }
+            let source_lane = lane_map[usize::from(duplicate)];
+            resolved[lane_map[slot]] = resolved[source_lane];
         }
 
         resolved
@@ -753,13 +796,23 @@ mod tests {
     #[test]
     fn overlap_batch_allocation_failure_returns_to_the_transaction_boundary() {
         let mut engine = HashLifeEngine::default();
-        let node = engine.empty(3);
-        let (packed, fingerprint) = engine.node_columns.packed_key_and_fingerprint(node);
+        let empty = engine.empty(1);
+        let single = engine.join(
+            engine.live_leaf,
+            engine.dead_leaf,
+            engine.dead_leaf,
+            engine.dead_leaf,
+        );
+        let left = engine.join(single, empty, empty, empty);
+        let right = engine.join(empty, single, empty, empty);
+        let node = engine.join(left, right, right, left);
+        let packed = engine.node_columns.packed_key(node);
         let identity = CanonicalNodeIdentity {
             packed,
             structural: engine.symmetry_entry(node, Symmetry::Identity).structural,
             symmetry: Symmetry::Identity,
         };
+        let fingerprint = identity.structural.fingerprint();
         let retained = crate::hashlife::memory::wide_allocated_bytes(engine.allocated_bytes());
         engine.begin_allocation_transaction(retained);
 
@@ -776,6 +829,89 @@ mod tests {
                 Some(EngineAllocationFailure::Allocation { .. })
             ),
             "the transaction boundary must receive the typed overlap allocation failure"
+        );
+    }
+
+    #[test]
+    fn mandatory_join_batch_preflights_all_unique_nodes_before_publication() {
+        let mut engine = HashLifeEngine::default();
+        let empty = engine.empty(1);
+        let sparse = engine.join(
+            engine.live_leaf,
+            engine.dead_leaf,
+            engine.dead_leaf,
+            engine.dead_leaf,
+        );
+        let intents = [
+            Some(JoinIntent {
+                level: 2,
+                children: [empty, sparse, empty, sparse],
+            }),
+            Some(JoinIntent {
+                level: 2,
+                children: [sparse, empty, sparse, empty],
+            }),
+        ];
+        let nodes_before = engine.node_count();
+        engine.id_capacity.node_count = nodes_before + 1;
+        engine.begin_allocation_transaction(u128::MAX);
+
+        let resolved = engine.resolve_join_intents_staged(intents);
+
+        assert_eq!(resolved, [None, None]);
+        assert_eq!(
+            engine.node_count(),
+            nodes_before,
+            "a rejected mandatory batch must publish no prefix of its unique nodes"
+        );
+        assert_eq!(
+            engine.take_allocation_failure(),
+            Some(EngineAllocationFailure::NodeIdExhausted)
+        );
+    }
+
+    #[test]
+    fn mandatory_join_batch_commits_unique_nodes_in_structural_order() {
+        fn fixture(engine: &mut HashLifeEngine) -> [Option<JoinIntent>; 2] {
+            let empty = engine.empty(1);
+            let sparse = engine.join(
+                engine.live_leaf,
+                engine.dead_leaf,
+                engine.dead_leaf,
+                engine.dead_leaf,
+            );
+            [
+                Some(JoinIntent {
+                    level: 2,
+                    children: [empty, sparse, empty, sparse],
+                }),
+                Some(JoinIntent {
+                    level: 2,
+                    children: [sparse, empty, sparse, empty],
+                }),
+            ]
+        }
+
+        let mut forward = HashLifeEngine::default();
+        let forward_intents = fixture(&mut forward);
+        forward.begin_allocation_transaction(u128::MAX);
+        let forward_nodes = forward.resolve_join_intents_staged(forward_intents);
+
+        let mut reversed = HashLifeEngine::default();
+        let mut reversed_intents = fixture(&mut reversed);
+        reversed_intents.reverse();
+        reversed.begin_allocation_transaction(u128::MAX);
+        let reversed_nodes = reversed.resolve_join_intents_staged(reversed_intents);
+
+        assert_eq!(forward.take_allocation_failure(), None);
+        assert_eq!(reversed.take_allocation_failure(), None);
+        assert_eq!(
+            forward_nodes[0], reversed_nodes[1],
+            "first structural node changed identity when input lanes were reversed"
+        );
+        assert_eq!(
+            forward_nodes[1], reversed_nodes[0],
+            "second structural node changed identity when input lanes were reversed"
         );
     }
 }

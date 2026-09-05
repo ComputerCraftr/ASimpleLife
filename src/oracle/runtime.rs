@@ -1,5 +1,5 @@
 use super::*;
-use crate::RequiredExt;
+use crate::recurrence::PeriodicCertificate;
 
 impl<'a> OracleSession<'a> {
     pub fn advance_runtime_target(
@@ -111,6 +111,9 @@ impl<'a> OracleSession<'a> {
 
     pub(super) fn advance_by(&mut self, step_span: u64) -> bool {
         self.last_step_span = 0;
+        if step_span == 0 {
+            return true;
+        }
         if step_span <= 1 && self.is_hashlife_phase() {
             let result = self.simulation.advance_hashlife_root(1);
             self.grid = None;
@@ -128,11 +131,6 @@ impl<'a> OracleSession<'a> {
                 }
             }
         } else if step_span <= 1 {
-            let current_grid = self.take_or_sample_grid();
-            self.grid =
-                Some(step_grid_with_changes_and_memo(&current_grid, &mut self.exact_memo).0);
-            self.exact_memo.maybe_collect_transition_caches();
-            self.phase = OraclePhase::ExactConfirmation;
             let Some(reached_generation) = self.generation.checked_add(step_span) else {
                 self.advance_failure = Some(HashLifeAdvanceError::GenerationOverflow {
                     starting_generation: self.generation,
@@ -142,6 +140,11 @@ impl<'a> OracleSession<'a> {
                 });
                 return false;
             };
+            let current_grid = self.take_or_sample_grid();
+            self.grid =
+                Some(step_grid_with_changes_and_memo(&current_grid, &mut self.exact_memo).0);
+            self.exact_memo.maybe_collect_transition_caches();
+            self.phase = OraclePhase::ExactConfirmation;
             self.generation = reached_generation;
             self.last_step_span = step_span;
         } else {
@@ -223,42 +226,49 @@ impl<'a> OracleSession<'a> {
         }
     }
 
-    fn apply_cycle_skip(&mut self, generation_skip: u64, dx: Coord, dy: Coord) -> bool {
-        if generation_skip == 0 {
+    fn apply_cycle_skip(
+        &mut self,
+        certificate: PeriodicCertificate,
+        target_generation: u64,
+    ) -> bool {
+        if self.is_hashlife_phase() {
+            match self
+                .simulation
+                .apply_hashlife_recurrence(certificate, target_generation)
+            {
+                Ok(Some(stats)) => {
+                    self.generation = stats.reached_generation;
+                    self.last_step_span = stats.completed_generations;
+                    self.grid = None;
+                    self.phase = OraclePhase::HashLifeApprox;
+                    self.assert_hashlife_generation_aligned();
+                }
+                Ok(None) => {}
+                Err(_) => return false,
+            }
             return true;
         }
-        if self.is_hashlife_phase() {
-            match self.simulation.skip_hashlife_generations(generation_skip) {
-                Ok(stats) => self.generation = stats.reached_generation,
-                Err(error) => {
-                    self.generation = error.reached_generation();
-                    self.advance_failure = Some(error);
-                    return false;
-                }
-            }
-            if (dx != 0 || dy != 0) && self.simulation.shift_hashlife_origin(dx, dy).is_err() {
-                return false;
-            }
-            self.grid = None;
-        } else {
-            let Some(reached_generation) = self.generation.checked_add(generation_skip) else {
-                self.advance_failure = Some(HashLifeAdvanceError::GenerationOverflow {
-                    starting_generation: self.generation,
-                    requested_delta: generation_skip,
-                    completed_generations: 0,
-                    reached_generation: self.generation,
-                });
-                return false;
-            };
-            self.generation = reached_generation;
-            if dx != 0 || dy != 0 {
-                let current_grid = self
-                    .grid
-                    .take()
-                    .or_invariant("translated cycle skip requires a materialized grid");
-                self.grid = Some(current_grid.translated(dx, dy));
-            }
+
+        if !certificate.matches_lineage(self.recurrence.lineage()) {
+            return false;
         }
+        let Some(skip) = certificate.checked_power(self.generation, target_generation) else {
+            return true;
+        };
+        let Some(current_grid) = self.grid.as_ref() else {
+            return false;
+        };
+        let Ok(candidate) = skip.try_translate_grid(current_grid) else {
+            return false;
+        };
+        let Some(reached_generation) = self.generation.checked_add(skip.committed_generations())
+        else {
+            return false;
+        };
+        self.grid = Some(candidate);
+        self.generation = reached_generation;
+        self.last_step_span = skip.committed_generations();
+        self.phase = OraclePhase::ExactConfirmation;
         true
     }
 
@@ -278,6 +288,21 @@ impl<'a> OracleSession<'a> {
             },
             failure: self.advance_failure,
         }
+    }
+
+    fn advance_ordinarily_to_target(&mut self, target_generation: u64) -> bool {
+        while self.generation < target_generation {
+            let remaining = target_generation - self.generation;
+            let plan = if self.is_hashlife_phase() {
+                self.plan_runtime_hashlife_step(remaining, 0)
+            } else {
+                self.plan_target_step(remaining)
+            };
+            if !self.advance_by(plan.step_span.min(remaining)) {
+                return false;
+            }
+        }
+        true
     }
 
     fn retain_projected_constellation(
@@ -330,53 +355,58 @@ impl<'a> OracleSession<'a> {
         target_generation: u64,
         cycle: ConfirmedCycle,
     ) -> OracleAdvanceOutcome {
-        if cycle.period > 0 && self.generation < target_generation {
-            let remaining = target_generation - self.generation;
-            let skip_cycles = remaining / cycle.period;
-            if skip_cycles > 0 {
-                let cycle_count =
-                    Coord::try_from(skip_cycles).or_invariant("cycle skip exceeded Coord");
-                if !self.apply_cycle_skip(
-                    skip_cycles * cycle.period,
-                    cycle
-                        .delta
-                        .0
-                        .checked_mul(cycle_count)
-                        .or_invariant("cycle x overflow"),
-                    cycle
-                        .delta
-                        .1
-                        .checked_mul(cycle_count)
-                        .or_invariant("cycle y overflow"),
-                ) {
-                    return OracleAdvanceOutcome {
-                        classification: Classification::Unknown {
-                            simulated: self.generation,
-                        },
-                        final_generation: self.generation,
-                        grid: self.take_or_sample_grid(),
-                    };
-                }
-            }
+        if self.generation < target_generation
+            && !self.apply_cycle_skip(cycle.certificate, target_generation)
+        {
+            self.confirmed_cycle = None;
+            let advanced = self.advance_ordinarily_to_target(target_generation);
+            return OracleAdvanceOutcome {
+                classification: Classification::Unknown {
+                    simulated: if advanced {
+                        target_generation
+                    } else {
+                        self.generation
+                    },
+                },
+                final_generation: self.generation,
+                grid: self.take_or_sample_grid(),
+            };
         }
 
-        while self.generation < target_generation {
-            if !self.advance_by(1) {
-                break;
-            }
+        if !self.advance_ordinarily_to_target(target_generation) {
+            return OracleAdvanceOutcome {
+                classification: Classification::Unknown {
+                    simulated: self.generation,
+                },
+                final_generation: self.generation,
+                grid: self.take_or_sample_grid(),
+            };
         }
 
-        let classification = if cycle.delta == (0, 0) {
+        let delta = cycle.certificate.delta();
+        let Some(delta) = Coord::try_from(delta.0)
+            .ok()
+            .zip(Coord::try_from(delta.1).ok())
+        else {
+            return OracleAdvanceOutcome {
+                classification: Classification::Unknown {
+                    simulated: self.generation,
+                },
+                final_generation: self.generation,
+                grid: self.take_or_sample_grid(),
+            };
+        };
+        let classification = if delta == (0, 0) {
             Classification::Repeats {
-                period: cycle.period,
-                first_seen: cycle.first_seen,
+                period: cycle.certificate.period(),
+                first_seen: cycle.certificate.first_seen(),
             }
         } else {
             Classification::Spaceship {
-                period: cycle.period,
-                first_seen: cycle.first_seen,
-                delta: cycle.delta,
-                detected_at: cycle.detected_at,
+                period: cycle.certificate.period(),
+                first_seen: cycle.certificate.first_seen(),
+                delta,
+                detected_at: cycle.certificate.detected_at(),
             }
         };
 
@@ -392,47 +422,55 @@ impl<'a> OracleSession<'a> {
         target_generation: u64,
         cycle: ConfirmedCycle,
     ) -> OracleRuntimeOutcome {
-        if cycle.period > 0 && self.generation < target_generation {
-            let remaining = target_generation - self.generation;
-            let skip_cycles = remaining / cycle.period;
-            if skip_cycles > 0 {
-                let cycle_count =
-                    Coord::try_from(skip_cycles).or_invariant("cycle skip exceeded Coord");
-                if !self.apply_cycle_skip(
-                    skip_cycles * cycle.period,
-                    cycle
-                        .delta
-                        .0
-                        .checked_mul(cycle_count)
-                        .or_invariant("cycle x overflow"),
-                    cycle
-                        .delta
-                        .1
-                        .checked_mul(cycle_count)
-                        .or_invariant("cycle y overflow"),
-                ) {
-                    return self.runtime_failure_outcome();
-                }
-            }
-        }
-
-        while self.generation < target_generation {
-            if !self.advance_by(1) {
+        if self.generation < target_generation
+            && !self.apply_cycle_skip(cycle.certificate, target_generation)
+        {
+            self.confirmed_cycle = None;
+            if !self.advance_ordinarily_to_target(target_generation) {
                 return self.runtime_failure_outcome();
             }
+            if !self.ensure_runtime_session_state() {
+                return self.runtime_failure_outcome();
+            }
+            let metrics = self.current_state_shape();
+            return OracleRuntimeOutcome {
+                classification: Classification::Unknown {
+                    simulated: target_generation,
+                },
+                final_generation: self.generation,
+                population: metrics.population,
+                bounds_span: metrics.bounds_span,
+                state: if self.is_hashlife_phase() {
+                    OracleRuntimeState::RetainedHashLife
+                } else {
+                    OracleRuntimeState::Modeled
+                },
+                failure: None,
+            };
         }
 
-        let classification = if cycle.delta == (0, 0) {
+        if !self.advance_ordinarily_to_target(target_generation) {
+            return self.runtime_failure_outcome();
+        }
+
+        let delta = cycle.certificate.delta();
+        let Some(delta) = Coord::try_from(delta.0)
+            .ok()
+            .zip(Coord::try_from(delta.1).ok())
+        else {
+            return self.runtime_failure_outcome();
+        };
+        let classification = if delta == (0, 0) {
             Classification::Repeats {
-                period: cycle.period,
-                first_seen: cycle.first_seen,
+                period: cycle.certificate.period(),
+                first_seen: cycle.certificate.first_seen(),
             }
         } else {
             Classification::Spaceship {
-                period: cycle.period,
-                first_seen: cycle.first_seen,
-                delta: cycle.delta,
-                detected_at: cycle.detected_at,
+                period: cycle.certificate.period(),
+                first_seen: cycle.certificate.first_seen(),
+                delta,
+                detected_at: cycle.certificate.detected_at(),
             }
         };
         if !self.ensure_runtime_session_state() {
@@ -537,8 +575,7 @@ impl<'a> OracleSession<'a> {
                                     OracleStateMetrics::default(),
                                 );
                             }
-                            let Ok(stats) = self.simulation.skip_hashlife_generations(remaining)
-                            else {
+                            let Ok(stats) = self.simulation.advance_hashlife_root(remaining) else {
                                 return self.runtime_failure_outcome();
                             };
                             self.generation = stats.reached_generation;
@@ -560,53 +597,44 @@ impl<'a> OracleSession<'a> {
                         };
                     }
 
-                    if let Some(checkpoint) = self.simulation.hashlife_checkpoint().cloned() {
-                        hashlife_checkpoint_probes = hashlife_checkpoint_probes.saturating_add(1);
-                        if self.prepare_hashlife_checkpoint(&checkpoint) {
-                            // Root-level changes invalidate retained identities. Restart the
-                            // adjacent probes so late stabilizations and oscillators are observed
-                            // before another coarse jump changes the checkpoint epoch again.
-                            hashlife_checkpoint_probes = 1;
-                        }
-                        if self.checkpoints.contains_key(&checkpoint.identity) {
-                            if let Some(cycle) =
-                                self.observe_repeated_hashlife_checkpoint(&checkpoint)
-                            {
-                                self.confirmed_cycle = Some(cycle);
-                                return self
-                                    .runtime_outcome_for_confirmed_cycle(target_generation, cycle);
-                            }
-                        } else {
-                            let remaining = target_generation.saturating_sub(self.generation);
-                            let projected = (self.generation >= 64
-                                && checkpoint.population
-                                    <= u128::from(ORACLE_CONSTELLATION_MAX_POPULATION))
-                            .then(|| {
-                                self.simulation.sample_hashlife_state_grid(
-                                    GridExtractionPolicy::FullGridIfUnder {
-                                        max_population: u128::from(
-                                            ORACLE_CONSTELLATION_MAX_POPULATION,
-                                        ),
-                                        max_chunks: ORACLE_CONSTELLATION_MAX_CHUNKS,
-                                        max_bounds_span: ORACLE_CONSTELLATION_MAX_SPAN,
-                                    },
-                                )
-                            })
-                            .transpose()
-                            .ok()
-                            .flatten()
-                            .and_then(|sample| {
-                                constellation::project_periodic_constellation(&sample, remaining)
-                            });
-                            if let Some(projected) = projected {
-                                return self.retain_projected_constellation(
-                                    target_generation,
-                                    projected,
-                                    on_step,
-                                );
-                            }
-                            self.record_hashlife_checkpoint(checkpoint);
-                        }
+                    hashlife_checkpoint_probes = hashlife_checkpoint_probes.saturating_add(1);
+                    let recurrence = self.observe_recurrence();
+                    if self.classification_for_recurrence(recurrence).is_some() {
+                        let Some(cycle) = self.confirmed_cycle else {
+                            return self.runtime_failure_outcome();
+                        };
+                        return self.runtime_outcome_for_confirmed_cycle(target_generation, cycle);
+                    }
+
+                    let population = self.simulation.hashlife_population_count();
+                    let remaining = target_generation.saturating_sub(self.generation);
+                    let projected = (self.generation >= 64
+                        && population.is_some_and(|value| {
+                            value.is_exact()
+                                && value.lower_bound()
+                                    <= u128::from(ORACLE_CONSTELLATION_MAX_POPULATION)
+                        }))
+                    .then(|| {
+                        self.simulation.sample_hashlife_state_grid(
+                            GridExtractionPolicy::FullGridIfUnder {
+                                max_population: u128::from(ORACLE_CONSTELLATION_MAX_POPULATION),
+                                max_chunks: ORACLE_CONSTELLATION_MAX_CHUNKS,
+                                max_bounds_span: ORACLE_CONSTELLATION_MAX_SPAN,
+                            },
+                        )
+                    })
+                    .transpose()
+                    .ok()
+                    .flatten()
+                    .and_then(|sample| {
+                        constellation::project_periodic_constellation(&sample, remaining)
+                    });
+                    if let Some(projected) = projected {
+                        return self.retain_projected_constellation(
+                            target_generation,
+                            projected,
+                            on_step,
+                        );
                     }
 
                     if self.generation >= cycle_probe_limit
@@ -734,6 +762,12 @@ impl<'a> OracleSession<'a> {
 
 fn conversion_failure_at(error: HashLifeConversionError, generation: u64) -> HashLifeAdvanceError {
     match error {
+        HashLifeConversionError::Cancelled => HashLifeAdvanceError::Cancelled {
+            starting_generation: generation,
+            requested_delta: 0,
+            completed_generations: 0,
+            reached_generation: generation,
+        },
         HashLifeConversionError::MemoryBudgetExceeded {
             retained_bytes,
             limit_bytes,
@@ -778,5 +812,137 @@ fn conversion_failure_at(error: HashLifeConversionError, generation: u64) -> Has
             reached_generation: generation,
             required_level: crate::hashlife::MAX_COORD_ROOT_LEVEL + 1,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::recurrence::{ExactRecurrenceTracker, Lineage, Observation, ObserveOutcome};
+
+    #[test]
+    fn failed_optional_translation_makes_no_partial_progress() -> Result<(), String> {
+        let mut simulation = SimulationSession::new();
+        let lineage = simulation.recurrence_lineage();
+        let origin = BitGrid::from_cells(&[(0, 0)]);
+        let extreme = BitGrid::from_cells(&[(i64::MAX, 0)]);
+        let mut tracker = ExactRecurrenceTracker::new(lineage);
+        assert_eq!(
+            tracker.observe_result(Observation::from_grid(lineage, 0, &origin)),
+            ObserveOutcome::Recorded
+        );
+        let certificate = tracker
+            .observe_result(Observation::from_grid(lineage, 1, &extreme))
+            .certificate()
+            .ok_or_else(|| "translated witness should produce an exact certificate".to_owned())?;
+
+        let mut oracle = OracleSession::new(extreme.clone(), 1, &mut simulation);
+        assert!(!oracle.apply_cycle_skip(certificate, 2));
+        assert_eq!(oracle.generation, 1);
+        assert_eq!(oracle.grid.as_ref(), Some(&extreme));
+        Ok(())
+    }
+
+    #[test]
+    fn cell_skip_rejects_a_certificate_from_another_lineage() -> Result<(), String> {
+        let certificate_lineage = Lineage::fresh();
+        let origin = BitGrid::from_cells(&[(0, 0)]);
+        let shifted = BitGrid::from_cells(&[(1, 0)]);
+        let mut tracker = ExactRecurrenceTracker::new(certificate_lineage);
+        assert_eq!(
+            tracker.observe_result(Observation::from_grid(certificate_lineage, 0, &origin,)),
+            ObserveOutcome::Recorded
+        );
+        let certificate = tracker
+            .observe_result(Observation::from_grid(certificate_lineage, 1, &shifted))
+            .certificate()
+            .ok_or_else(|| "translated witness should produce an exact certificate".to_owned())?;
+
+        let mut simulation = SimulationSession::new();
+        let mut oracle = OracleSession::new(shifted.clone(), 1, &mut simulation);
+        assert!(!oracle.apply_cycle_skip(certificate, 2));
+        assert_eq!(oracle.generation, 1);
+        assert_eq!(oracle.grid.as_ref(), Some(&shifted));
+        Ok(())
+    }
+
+    #[test]
+    fn exact_generation_overflow_preserves_the_unadvanced_grid() {
+        let grid = BitGrid::from_cells(&[(0, 0), (2, 0), (0, 1)]);
+        let mut simulation = SimulationSession::new();
+        let mut oracle = OracleSession::new(grid.clone(), u64::MAX, &mut simulation);
+
+        assert!(!oracle.advance_by(1));
+        assert_eq!(oracle.generation, u64::MAX);
+        assert_eq!(oracle.grid.as_ref(), Some(&grid));
+        assert!(matches!(
+            oracle.advance_failure,
+            Some(HashLifeAdvanceError::GenerationOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn stale_hashlife_certificate_falls_back_to_ordinary_runtime_advance() -> Result<(), String> {
+        let glider =
+            pattern_by_name("glider").ok_or_else(|| "glider fixture should exist".to_owned())?;
+        let mut first = glider.clone();
+        let mut memo = Memo::default();
+        for _ in 0..4 {
+            first = step_grid_with_changes_and_memo(&first, &mut memo).0;
+        }
+        let mut repeated = first.clone();
+        for _ in 0..4 {
+            repeated = step_grid_with_changes_and_memo(&repeated, &mut memo).0;
+        }
+
+        let stale_lineage = Lineage::fresh();
+        let mut tracker = ExactRecurrenceTracker::new(stale_lineage);
+        assert_eq!(
+            tracker.observe_result(Observation::from_grid(stale_lineage, 4, &first)),
+            ObserveOutcome::Recorded
+        );
+        let certificate = tracker
+            .observe_result(Observation::from_grid(stale_lineage, 8, &repeated))
+            .certificate()
+            .ok_or_else(|| "glider recurrence certificate should be available".to_owned())?;
+        let mut expected = repeated;
+        for _ in 0..4 {
+            expected = step_grid_with_changes_and_memo(&expected, &mut memo).0;
+        }
+
+        let mut simulation = SimulationSession::new();
+        simulation
+            .try_load_hashlife_state(&glider)
+            .map_err(|error| format!("glider HashLife load failed: {error:?}"))?;
+        simulation
+            .advance_hashlife_root(8)
+            .map_err(|error| format!("glider prefix advance failed: {error:?}"))?;
+        let mut oracle = OracleSession::from_hashlife_state(8, &mut simulation)
+            .map_err(|error| error.to_owned())?;
+        let cycle = ConfirmedCycle { certificate };
+        oracle.confirmed_cycle = Some(cycle);
+        let outcome = oracle.runtime_outcome_for_confirmed_cycle(12, cycle);
+
+        assert_eq!(oracle.generation, 12);
+        assert!(oracle.confirmed_cycle.is_none());
+        assert_eq!(outcome.final_generation, 12);
+        assert_eq!(
+            outcome.classification,
+            Classification::Unknown { simulated: 12 }
+        );
+        assert_eq!(outcome.failure, None);
+        drop(oracle);
+        let actual = simulation
+            .sample_hashlife_state_grid(GridExtractionPolicy::FullGridIfUnder {
+                max_population: u128::MAX,
+                max_chunks: usize::MAX,
+                max_bounds_span: i64::MAX,
+            })
+            .map_err(|error| format!("actual state sampling failed: {error:?}"))?;
+        assert_eq!(
+            actual, expected,
+            "rejected stale certificate must preserve ordinary world-space evolution"
+        );
+        Ok(())
     }
 }

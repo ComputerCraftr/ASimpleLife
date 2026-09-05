@@ -1,5 +1,5 @@
 use crate::RequiredExt;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,7 +8,8 @@ use serde::Serialize;
 
 use crate::bitgrid::{BitGrid, Cell, Coord};
 use crate::classify::{
-    Classification, ClassificationCheckpoint, ClassificationLimits, predict_seed_with_checkpoint,
+    Classification, ClassificationCheckpoint, ClassificationLimits, effective_generation_limit,
+    predict_seed_with_checkpoint,
 };
 use crate::engine::{SimulationBackend, select_backend};
 use crate::generators::{pattern_by_name, random_soup};
@@ -23,7 +24,6 @@ mod suite;
 #[cfg(test)]
 pub(crate) use report::classifications_are_compatible_for_tests;
 use runtime::{run_exhaustive_5x5, run_oracle_representative_case, run_oracle_runtime_case};
-pub(crate) use suite::effective_generation_limit;
 use suite::{
     benchmark_family_filter, benchmark_run_mode_and_seed, exhaustive_small_box_cases,
     seeded_benchmark_suite,
@@ -406,16 +406,11 @@ pub(crate) fn reference_classify_from_checkpoint(
         };
     }
 
-    OracleSession::new(
-        checkpoint.grid,
-        checkpoint.generation,
-        checkpoint.seen,
-        oracle_simulation,
-    )
-    .classify_continuation(
-        oracle_limit.max(prediction_limits.max_generations),
-        prediction_limits.max_generations,
-    )
+    OracleSession::from_classification_checkpoint(checkpoint, oracle_simulation)
+        .classify_continuation(
+            oracle_limit.max(prediction_limits.max_generations),
+            prediction_limits.max_generations,
+        )
 }
 
 #[cfg(test)]

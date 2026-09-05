@@ -1,5 +1,17 @@
 use super::optimizer::{CellSign, CodegenOpts, IoMode};
 
+const POLYNOMIAL_RUNTIME_MARKER: &str = "/* @BF_POLYNOMIAL_RUNTIME */";
+pub(super) const PLAIN_RUNTIME_TEMPLATE: &str = include_str!("bf.c.in");
+pub(super) const SUPER_RUNTIME_TEMPLATE: &str = include_str!("bf_super.c.in");
+const POLYNOMIAL_RUNTIME_FRAGMENT: &str = include_str!("bf_polynomial_runtime.c.in");
+
+pub(super) fn expand_runtime_fragments(template: &str) -> String {
+    template.replace(
+        POLYNOMIAL_RUNTIME_MARKER,
+        POLYNOMIAL_RUNTIME_FRAGMENT.trim_end(),
+    )
+}
+
 pub(super) fn indent4(level: usize) -> String {
     " ".repeat(level * 4)
 }

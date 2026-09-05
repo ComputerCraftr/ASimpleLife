@@ -1,8 +1,7 @@
-use super::c_backend::{
-    BfEvalError, emit_c, format_ir, interpret_for_tests, interpret_unsigned_for_tests,
-};
+use super::c_backend::{BfEvalError, emit_c, interpret_for_tests, interpret_unsigned_for_tests};
 use super::c_super_backend::emit_c_super;
 use super::cli::{parse_opts, read_input};
+use super::format_ir;
 use super::ir::{BfIr, Parser, ShiftDir, validate_canonical_ir};
 use super::ir_report::{
     IrOutputFormat, IrRenderOpts, IrSectionSelection, build_ir_report, render_ir_json,
@@ -12,14 +11,11 @@ use super::optimizer::{CellSign, CodegenOpts, IoMode, optimize_with_opts};
 use super::summary::{
     LoopId, LoopSummary, OffsetOp, SummaryEffect, SummaryProvenance, normalize_offset_body,
 };
+use crate::test_support::c::CSource;
 use crate::{RequiredErrorExt, RequiredExt};
-use std::fs;
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod c_shape;
 mod c_super_backend;
 mod c_super_runtime;
 mod ir_report;
@@ -27,17 +23,43 @@ mod life;
 mod life_rich;
 mod optimizer;
 mod payload;
+mod planner_shape;
+mod polynomial_backend;
 
-static BF_TEST_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const BF_PLAIN_STATS_SENTINEL: &str = "=== BF PLAIN RUNTIME STATS ===";
 const BF_SUPER_STATS_SENTINEL: &str = "=== BF SUPER RUNTIME STATS ===";
-const BF_TEST_PROGRAM_TIMEOUT: Duration = Duration::from_secs(60);
-const BF_TEST_DEFAULT_WORK_LIMIT: &str = "-DBF_TEST_WORK_LIMIT=100000000";
 
 #[derive(Clone, Copy, Debug)]
 enum TestCBackend {
     Plain,
     Super,
+}
+
+impl TestCBackend {
+    fn runtime_template(self) -> &'static str {
+        match self {
+            Self::Plain => crate::bf::c_support::PLAIN_RUNTIME_TEMPLATE,
+            Self::Super => crate::bf::c_support::SUPER_RUNTIME_TEMPLATE,
+        }
+    }
+
+    fn stats_function(self) -> &'static str {
+        match self {
+            Self::Plain => "print_work_stats",
+            Self::Super => "print_memo_stats",
+        }
+    }
+
+    fn stats_call(self) -> String {
+        format!("{}();", self.stats_function())
+    }
+
+    fn stats_sentinel(self) -> &'static str {
+        match self {
+            Self::Plain => BF_PLAIN_STATS_SENTINEL,
+            Self::Super => BF_SUPER_STATS_SENTINEL,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -477,8 +499,8 @@ fn compile_and_run_c_source(c: &str) -> String {
     compile_and_run_c_source_with_args(c, &[])
 }
 
-fn compile_and_run_c_template(path: &str) -> String {
-    compile_and_run_c_source(&fs::read_to_string(path).or_invariant("required value"))
+fn compile_and_run_c_template(backend: TestCBackend) -> String {
+    compile_and_run_c_source(backend.runtime_template())
 }
 
 fn compile_and_run_c_source_sanitized(c: &str) -> String {
@@ -496,7 +518,9 @@ fn compile_and_run_c_source_with_args(c: &str, extra_cc_args: &[&str]) -> String
     let output = compile_and_run_c_source_capture(c, extra_cc_args);
     assert!(
         output.status.success(),
-        "program failed: stdout={}\nstderr={}",
+        "program failed: status={} code={:?} flags={extra_cc_args:?}\nstdout={}\nstderr={}",
+        output.status,
+        output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -504,86 +528,9 @@ fn compile_and_run_c_source_with_args(c: &str, extra_cc_args: &[&str]) -> String
 }
 
 fn compile_and_run_c_source_capture(c: &str, extra_cc_args: &[&str]) -> std::process::Output {
-    static C_EXECUTION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let lock = C_EXECUTION_LOCK.get_or_init(|| Mutex::new(()));
-    let _execution_guard = match lock.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .or_invariant("required value")
-        .as_nanos();
-    let counter = BF_TEST_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let base = std::env::temp_dir().join(format!(
-        "a_simple_life_bf_{}_{}_{}",
-        std::process::id(),
-        timestamp,
-        counter
-    ));
-    fs::create_dir_all(&base).or_invariant("required value");
-    let source = base.join("program.c");
-    let binary = base.join("program.bin");
-    fs::write(&source, c).or_invariant("required value");
-
-    let mut compile_cmd = Command::new("cc");
-    compile_cmd
-        .arg("-std=c2x")
-        .arg("-O0")
-        .arg("-Wall")
-        .arg("-Wextra")
-        .arg("-Wpedantic")
-        .arg("-Werror");
-    if !extra_cc_args
-        .iter()
-        .any(|arg| arg.starts_with("-DBF_TEST_WORK_LIMIT="))
-    {
-        compile_cmd.arg(BF_TEST_DEFAULT_WORK_LIMIT);
-    }
-    compile_cmd.args(extra_cc_args);
-    compile_cmd.arg(&source).arg("-o").arg(&binary);
-    let compile = compile_cmd.output().or_invariant("required value");
-    assert!(
-        compile.status.success(),
-        "cc failed: stdout={}\nstderr={}",
-        String::from_utf8_lossy(&compile.stdout),
-        String::from_utf8_lossy(&compile.stderr)
-    );
-
-    let mut child = Command::new(&binary)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env(
-            "ASAN_OPTIONS",
-            "detect_leaks=0:halt_on_error=1:abort_on_error=1",
-        )
-        .env("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
-        .spawn()
-        .or_invariant("required value");
-    let deadline = Instant::now() + BF_TEST_PROGRAM_TIMEOUT;
-    loop {
-        if let Some(status) = child.try_wait().or_invariant("required value") {
-            break child.wait_with_output().unwrap_or_else(|err| {
-                crate::invariant_failure!(
-                    "failed to collect program output after exit ({status}): {err}"
-                )
-            });
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let output = child.wait_with_output().unwrap_or_else(|err| {
-                crate::invariant_failure!("failed to collect timed-out program output: {err}")
-            });
-            crate::invariant_failure!(
-                "program timed out after {:?}: stdout={}\nstderr={}",
-                BF_TEST_PROGRAM_TIMEOUT,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    let c = super::c_support::expand_runtime_fragments(c);
+    crate::test_support::compiled_c::compile_and_run(&c, extra_cc_args)
+        .unwrap_or_else(|error| crate::invariant_failure!("generated-C harness failed: {error}"))
 }
 
 #[test]
@@ -709,221 +656,6 @@ fn unmatched_left_bracket_errors() {
             .error_or_invariant("expected error")
             .contains("unmatched '['")
     );
-}
-
-#[test]
-fn plain_c_template_compiles_standalone_under_strict_c23_compatibility_mode() {
-    let output = compile_and_run_c_template("src/bf/bf.c.in");
-    assert!(
-        split_plain_c_payload(&output).is_empty(),
-        "unexpected standalone template output: {output}"
-    );
-    assert!(output.contains(BF_PLAIN_STATS_SENTINEL));
-    assert!(output.contains("work dispatches:"));
-    assert!(output.contains("work loop iterations:"));
-    assert!(output.contains("work ops:"));
-}
-
-#[test]
-fn super_c_template_compiles_standalone_under_strict_c23_compatibility_mode() {
-    let output = compile_and_run_c_template("src/bf/bf_super.c.in");
-    assert!(
-        output.contains("memo hits:"),
-        "unexpected standalone super template output: {output}"
-    );
-}
-
-#[test]
-fn emit_c_signed_runtime_outputs_negative_value() {
-    let stdout = compile_and_run_emitted_backend(
-        "-.",
-        CodegenOpts {
-            io_mode: IoMode::Number,
-            cell_bits: 8,
-            input_bits: None,
-            output_bits: None,
-            cell_sign: CellSign::Signed,
-        },
-        TestCBackend::Plain,
-        false,
-    );
-    assert_eq!(split_plain_c_payload(&stdout), "-1\n");
-}
-
-#[test]
-fn emit_c_char_only_program_omits_numeric_format_constants() {
-    let c = emit_c(&parse_and_opt("+++."), default_c_opts());
-    assert!(!c.contains("BF_SCANF_FMT"));
-    assert!(!c.contains("BF_PRINTF_FMT"));
-}
-
-#[test]
-fn emit_c_wraps_tape_pointer_moves() {
-    let c = emit_c(&parse_and_opt(">>"), default_c_opts());
-    assert!(c.contains("ptrdiff_t bf_wrap_ptr(ptrdiff_t ptr, ptrdiff_t delta, ptrdiff_t len) {"));
-    assert!(c.contains("#define BF_TEMPLATE_TAPE_LEN 30000"));
-    assert!(c.contains("ptr = bf_wrap_ptr(ptr, 2, BF_TAPE_LEN);"));
-}
-
-#[test]
-fn emit_c_unsigned_runtime_executes_distribute_loop_correctly() {
-    let stdout = compile_and_run_emitted_backend(
-        "+++[->++<]>.",
-        CodegenOpts {
-            io_mode: IoMode::Number,
-            cell_bits: 8,
-            input_bits: None,
-            output_bits: None,
-            cell_sign: CellSign::Unsigned,
-        },
-        TestCBackend::Plain,
-        false,
-    );
-    assert_eq!(split_plain_c_payload(&stdout), "6\n");
-}
-
-#[test]
-fn emit_c_unsigned_runtime_wraps_underflow_correctly() {
-    let stdout = compile_and_run_emitted_backend(
-        "-.",
-        CodegenOpts {
-            io_mode: IoMode::Number,
-            cell_bits: 8,
-            input_bits: None,
-            output_bits: None,
-            cell_sign: CellSign::Unsigned,
-        },
-        TestCBackend::Plain,
-        false,
-    );
-    assert_eq!(split_plain_c_payload(&stdout), "255\n");
-}
-
-#[test]
-fn emit_c_uses_unsigned_wrapping_when_requested() {
-    let c = emit_c(
-        &parse_and_opt("++[->+<]"),
-        CodegenOpts {
-            cell_sign: CellSign::Unsigned,
-            ..default_c_opts()
-        },
-    );
-    assert!(c.contains("#define BF_TEMPLATE_SIGNED_CELLS 0"));
-    assert!(c.contains("bf_wrap_add_i64_unsigned"));
-    assert!(c.contains("bf_wrap_sub_i64_unsigned"));
-    assert!(c.contains("bf_wrap_mul_i64_unsigned"));
-    assert!(c.contains("bf_wrap_from_u64_unsigned"));
-}
-
-#[test]
-fn emit_c_uses_requested_cell_width() {
-    let c = emit_c(
-        &parse_and_opt("+"),
-        CodegenOpts {
-            cell_bits: 63,
-            ..default_c_opts()
-        },
-    );
-    assert!(c.contains("int64_t tape[BF_TAPE_LEN] = {0};"));
-    assert!(c.contains("#define BF_TEMPLATE_CELL_BITS 63"));
-    assert!(!c.contains("BF_CELL_MASK = "));
-    assert!(c.contains("ptrdiff_t ptr = 0;"));
-}
-
-#[test]
-fn emit_c_applies_custom_char_masks() {
-    let c = emit_c(
-        &parse_and_opt(",."),
-        CodegenOpts {
-            cell_bits: 16,
-            input_bits: Some(5),
-            output_bits: Some(6),
-            ..default_c_opts()
-        },
-    );
-    assert!(c.contains("#define BF_TEMPLATE_INPUT_MASK UINT64_C(31)"));
-    assert!(c.contains("#define BF_TEMPLATE_OUTPUT_MASK UINT64_C(63)"));
-    assert!(c.contains("BF_SIGNED_CELLS ? bf_wrap_from_u64_signed(((uint64_t)(uint8_t)ch) & BF_INPUT_MASK, BF_CELL_BITS) : bf_wrap_from_u64_unsigned(((uint64_t)(uint8_t)ch) & BF_INPUT_MASK, BF_CELL_BITS)"));
-    assert!(c.contains("putchar((unsigned char)(((uint64_t)tape[ptr]) & BF_OUTPUT_MASK));"));
-}
-
-#[test]
-fn emit_c_applies_custom_number_masks() {
-    let c = emit_c(
-        &parse_and_opt(",."),
-        CodegenOpts {
-            io_mode: IoMode::Number,
-            cell_bits: 32,
-            input_bits: Some(3),
-            output_bits: Some(4),
-            cell_sign: CellSign::Signed,
-        },
-    );
-    assert!(c.contains("#define BF_TEMPLATE_INPUT_MASK UINT64_C(7)"));
-    assert!(c.contains("#define BF_TEMPLATE_OUTPUT_MASK UINT64_C(15)"));
-    assert!(c.contains("{ int64_t tmp = 0; if (scanf(\"%\" SCNd64, &tmp) != 1) tmp = 0; tape[ptr] = bf_wrap_from_u64_signed(((uint64_t)tmp) & BF_INPUT_MASK, BF_CELL_BITS); }"));
-    assert!(c.contains("bf_wrap_from_u64_signed(((uint64_t)tmp) & BF_INPUT_MASK, BF_CELL_BITS)"));
-    assert!(c.contains("printf(\"%\" PRId64 \"\\n\", bf_wrap_from_u64_signed(((uint64_t)tape[ptr]) & BF_OUTPUT_MASK, BF_CELL_BITS));"));
-}
-
-#[test]
-fn emit_c_runtime_wraps_pointer_moves_correctly() {
-    let stdout = compile_and_run_emitted_backend(
-        "<+.",
-        CodegenOpts {
-            io_mode: IoMode::Number,
-            cell_bits: 8,
-            input_bits: None,
-            output_bits: None,
-            cell_sign: CellSign::Unsigned,
-        },
-        TestCBackend::Plain,
-        false,
-    );
-    assert_eq!(split_plain_c_payload(&stdout), "1\n");
-}
-
-#[test]
-#[cfg(not(target_os = "windows"))]
-fn emit_c_runtime_is_clean_under_asan_ubsan() {
-    let stdout = compile_and_run_emitted_backend(
-        "+++[->++<]>.<.",
-        CodegenOpts {
-            io_mode: IoMode::Number,
-            cell_bits: 8,
-            input_bits: None,
-            output_bits: None,
-            cell_sign: CellSign::Unsigned,
-        },
-        TestCBackend::Plain,
-        true,
-    );
-    assert_eq!(split_plain_c_payload(&stdout), "6\n0\n");
-}
-
-#[test]
-#[cfg(not(target_os = "windows"))]
-fn emit_c_signed_63bit_runtime_is_clean_under_asan_ubsan() {
-    let stdout = compile_and_run_emitted_backend(
-        "-.",
-        CodegenOpts {
-            io_mode: IoMode::Number,
-            cell_bits: 63,
-            input_bits: None,
-            output_bits: None,
-            cell_sign: CellSign::Signed,
-        },
-        TestCBackend::Plain,
-        true,
-    );
-    assert_eq!(split_plain_c_payload(&stdout), "-1\n");
-}
-
-#[test]
-fn emit_c_for_empty_loop_stays_guarded() {
-    let c = emit_c(&parse_and_opt("[]"), default_c_opts());
-    assert!(c.contains("while (tape[ptr] != 0) {"));
-    assert!(c.contains("bf_diverge_forever();"));
 }
 
 #[test]

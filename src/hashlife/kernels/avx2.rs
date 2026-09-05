@@ -46,18 +46,18 @@ pub(super) fn control_matches(
 ) -> ([u16; SIMD_BATCH_LANES], KernelAccounting) {
     // SAFETY: the caller reaches this module only after AVX2 runtime detection.
     let result = unsafe { control_match_kernel(control, tags, active_lanes) };
-    (
-        result,
-        KernelAccounting::avx2(KernelOperation::ControlMatch, active_lanes),
-    )
+    let mut accounting = KernelAccounting::avx2(KernelOperation::ControlMatch, active_lanes);
+    accounting.native_avx2_control_groups = 1;
+    (result, accounting)
 }
 
 #[cfg(target_arch = "x86_64")]
 pub(super) fn d4_prefix(batch: &D4PrefixBatch) -> (D4PrefixDecision, KernelAccounting) {
     // SAFETY: the caller reaches this module only after AVX2 runtime detection.
     let result = unsafe { d4_prefix_kernel(batch) };
-    let mut accounting = KernelAccounting::avx2(KernelOperation::D4SemanticPrefix, 8);
-    accounting.native_d4_prefix_compare_lanes = 8;
+    let mut accounting =
+        KernelAccounting::avx2(KernelOperation::D4SemanticPrefix, batch.active_lanes);
+    accounting.native_d4_prefix_compare_lanes = batch.active_lanes;
     accounting.native_d4_exact_winner_lanes = usize::from(result.exact);
     (result, accounting)
 }
@@ -68,8 +68,8 @@ pub(super) fn d4_candidates(
 ) -> (D4CandidateBatchResult, KernelAccounting) {
     // SAFETY: the caller reaches this module only after AVX2 runtime detection.
     let result = unsafe { d4_candidate_kernel(batch) };
-    let mut accounting = KernelAccounting::avx2(KernelOperation::D4Candidate, 8);
-    accounting.native_d4_candidate_lanes = 8;
+    let mut accounting = KernelAccounting::avx2(KernelOperation::D4Candidate, batch.active_lanes);
+    accounting.native_d4_candidate_lanes = batch.active_lanes;
     (result, accounting)
 }
 
@@ -172,6 +172,7 @@ unsafe fn control_match_kernel(
 #[target_feature(enable = "avx2")]
 unsafe fn d4_prefix_kernel(batch: &D4PrefixBatch) -> D4PrefixDecision {
     let sign = _mm256_set1_epi64x(i64::MIN);
+    let active_mask = contracts::active_lane_mask(batch.active_lanes);
     let mut winner = 0_usize;
     loop {
         let mut less_mask = 0_u8;
@@ -198,10 +199,11 @@ unsafe fn d4_prefix_kernel(batch: &D4PrefixBatch) -> D4PrefixDecision {
                 u8::try_from(_mm256_movemask_pd(_mm256_castsi256_pd(less))).unwrap_or_default();
             less_mask |= bits << offset;
         }
+        less_mask &= active_mask;
         if less_mask == 0 {
             break;
         }
-        winner = usize::try_from(less_mask.trailing_zeros()).unwrap_or_default();
+        winner = contracts::lowest_original_lane(less_mask, &batch.transforms);
     }
 
     let mut unresolved_mask = 0_u8;
@@ -221,7 +223,11 @@ unsafe fn d4_prefix_kernel(batch: &D4PrefixBatch) -> D4PrefixDecision {
         let bits = u8::try_from(_mm256_movemask_pd(_mm256_castsi256_pd(equal))).unwrap_or_default();
         unresolved_mask |= bits << offset;
     }
-    let transform = contracts::symmetry_from_index(winner);
+    let packed_unresolved_mask = unresolved_mask & active_mask;
+    winner = contracts::lowest_original_lane(packed_unresolved_mask, &batch.transforms);
+    let unresolved_mask =
+        contracts::original_transform_mask(packed_unresolved_mask, &batch.transforms);
+    let transform = batch.transforms[winner];
     D4PrefixDecision {
         transform,
         inverse: transform.inverse(),
@@ -233,24 +239,20 @@ unsafe fn d4_prefix_kernel(batch: &D4PrefixBatch) -> D4PrefixDecision {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn d4_candidate_kernel(batch: &D4CandidateBatch) -> D4CandidateBatchResult {
-    const PERMUTATIONS: [[i32; 8]; 4] = [
-        [0, 1, 2, 3, 1, 3, 0, 2],
-        [3, 2, 1, 0, 2, 0, 3, 1],
-        [1, 0, 3, 2, 3, 1, 2, 0],
-        [2, 3, 0, 1, 0, 2, 1, 3],
-    ];
     let mut output = D4CandidateBatchResult::default();
-    for (pair, indices) in PERMUTATIONS.iter().enumerate() {
-        // SAFETY: every permutation is one complete eight-lane `i32` vector.
-        let permutation = unsafe { _mm256_loadu_si256(indices.as_ptr().cast()) };
-        // SAFETY: every index is in 0..4 and addresses the fixed child array.
-        let candidates = unsafe {
-            _mm256_i32gather_epi32::<4>(batch.children.as_ptr().cast::<i32>(), permutation)
+    for candidate in 0..batch.active_lanes {
+        let permutation = batch.permutations[candidate].map(i32::from);
+        // SAFETY: the fixed permutation has four valid indexes into this candidate's row.
+        let indices = unsafe { _mm_loadu_si128(permutation.as_ptr().cast()) };
+        // SAFETY: every index is validated by the scalar D4 action-table constructor.
+        let children = unsafe {
+            _mm_i32gather_epi32::<4>(
+                batch.oriented_children[candidate].as_ptr().cast::<i32>(),
+                indices,
+            )
         };
-        // SAFETY: each pair owns eight writable `u32` values across two candidate rows.
-        unsafe {
-            _mm256_storeu_si256(output.children[pair * 2..].as_mut_ptr().cast(), candidates);
-        }
+        // SAFETY: each destination row contains exactly four writable `u32` values.
+        unsafe { _mm_storeu_si128(output.children[candidate].as_mut_ptr().cast(), children) };
     }
     output
 }

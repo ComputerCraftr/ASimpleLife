@@ -2,17 +2,14 @@
 use std::arch::aarch64::*;
 
 #[cfg(target_arch = "aarch64")]
-use crate::simd_layout::SIMD_BATCH_LANES;
-#[cfg(target_arch = "aarch64")]
-use crate::symmetry::D4Symmetry;
-
-#[cfg(target_arch = "aarch64")]
 use super::KernelAccounting;
 #[cfg(target_arch = "aarch64")]
 use super::contracts::{
     self, D4CandidateBatch, D4CandidateBatchResult, D4PrefixBatch, D4PrefixDecision, DedupBatch,
     FingerprintBatch, KernelOperation, PopulationBatch, PopulationBatchResult,
 };
+#[cfg(target_arch = "aarch64")]
+use crate::simd_layout::SIMD_BATCH_LANES;
 
 #[cfg(target_arch = "aarch64")]
 pub(super) fn evaluate(
@@ -48,18 +45,18 @@ pub(super) fn control_matches(
 ) -> ([u16; SIMD_BATCH_LANES], KernelAccounting) {
     // SAFETY: Advanced SIMD is mandatory for supported AArch64 targets.
     let result = unsafe { control_match_kernel(control, tags, active_lanes) };
-    (
-        result,
-        KernelAccounting::neon(KernelOperation::ControlMatch, active_lanes),
-    )
+    let mut accounting = KernelAccounting::neon(KernelOperation::ControlMatch, active_lanes);
+    accounting.native_neon_control_groups = 1;
+    (result, accounting)
 }
 
 #[cfg(target_arch = "aarch64")]
 pub(super) fn d4_prefix(batch: &D4PrefixBatch) -> (D4PrefixDecision, KernelAccounting) {
     // SAFETY: Advanced SIMD is mandatory for supported AArch64 targets.
     let result = unsafe { d4_prefix_kernel(batch) };
-    let mut accounting = KernelAccounting::neon(KernelOperation::D4SemanticPrefix, 8);
-    accounting.native_d4_prefix_compare_lanes = 8;
+    let mut accounting =
+        KernelAccounting::neon(KernelOperation::D4SemanticPrefix, batch.active_lanes);
+    accounting.native_d4_prefix_compare_lanes = batch.active_lanes;
     accounting.native_d4_exact_winner_lanes = usize::from(result.exact);
     (result, accounting)
 }
@@ -70,8 +67,8 @@ pub(super) fn d4_candidates(
 ) -> (D4CandidateBatchResult, KernelAccounting) {
     // SAFETY: Advanced SIMD is mandatory for supported AArch64 targets.
     let result = unsafe { d4_candidate_kernel(batch) };
-    let mut accounting = KernelAccounting::neon(KernelOperation::D4Candidate, 8);
-    accounting.native_d4_candidate_lanes = 8;
+    let mut accounting = KernelAccounting::neon(KernelOperation::D4Candidate, batch.active_lanes);
+    accounting.native_d4_candidate_lanes = batch.active_lanes;
     (result, accounting)
 }
 
@@ -180,6 +177,7 @@ unsafe fn control_match_kernel(
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn d4_prefix_kernel(batch: &D4PrefixBatch) -> D4PrefixDecision {
+    let active_mask = contracts::active_lane_mask(batch.active_lanes);
     let mut winner = 0_usize;
     loop {
         let mut less_mask = 0_u8;
@@ -198,10 +196,11 @@ unsafe fn d4_prefix_kernel(batch: &D4PrefixBatch) -> D4PrefixDecision {
             less_mask |= u8::from(lanes[0] != 0) << offset;
             less_mask |= u8::from(lanes[1] != 0) << (offset + 1);
         }
+        less_mask &= active_mask;
         if less_mask == 0 {
             break;
         }
-        winner = usize::try_from(less_mask.trailing_zeros()).unwrap_or_default();
+        winner = contracts::lowest_original_lane(less_mask, &batch.transforms);
     }
 
     let mut unresolved_mask = 0_u8;
@@ -220,7 +219,11 @@ unsafe fn d4_prefix_kernel(batch: &D4PrefixBatch) -> D4PrefixDecision {
         unresolved_mask |= u8::from(lanes[0] != 0) << offset;
         unresolved_mask |= u8::from(lanes[1] != 0) << (offset + 1);
     }
-    let transform = contracts::symmetry_from_index(winner);
+    let packed_unresolved_mask = unresolved_mask & active_mask;
+    winner = contracts::lowest_original_lane(packed_unresolved_mask, &batch.transforms);
+    let unresolved_mask =
+        contracts::original_transform_mask(packed_unresolved_mask, &batch.transforms);
+    let transform = batch.transforms[winner];
     D4PrefixDecision {
         transform,
         inverse: transform.inverse(),
@@ -232,21 +235,12 @@ unsafe fn d4_prefix_kernel(batch: &D4PrefixBatch) -> D4PrefixDecision {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn d4_candidate_kernel(batch: &D4CandidateBatch) -> D4CandidateBatchResult {
-    const BYTE_PERMUTATIONS: [[u8; 16]; 8] = [
-        d4_byte_permutation(D4Symmetry::Identity),
-        d4_byte_permutation(D4Symmetry::Rotate90),
-        d4_byte_permutation(D4Symmetry::Rotate180),
-        d4_byte_permutation(D4Symmetry::Rotate270),
-        d4_byte_permutation(D4Symmetry::MirrorX),
-        d4_byte_permutation(D4Symmetry::MirrorXRotate90),
-        d4_byte_permutation(D4Symmetry::MirrorXRotate180),
-        d4_byte_permutation(D4Symmetry::MirrorXRotate270),
-    ];
-    // SAFETY: four `u32` children occupy exactly one 16-byte vector.
-    let source = unsafe { vld1q_u8(batch.children.as_ptr().cast()) };
     let mut output = D4CandidateBatchResult::default();
-    for (candidate, permutation) in BYTE_PERMUTATIONS.iter().enumerate() {
-        // SAFETY: every permutation is a complete 16-byte table index vector.
+    for candidate in 0..batch.active_lanes {
+        let permutation = d4_byte_permutation(batch.permutations[candidate]);
+        // SAFETY: four `u32` children occupy exactly one complete 16-byte vector.
+        let source = unsafe { vld1q_u8(batch.oriented_children[candidate].as_ptr().cast()) };
+        // SAFETY: every permutation is a complete 16-byte table-index vector.
         let indices = unsafe { vld1q_u8(permutation.as_ptr()) };
         let oriented = vqtbl1q_u8(source, indices);
         // SAFETY: each candidate row contains exactly four writable `u32` children.
@@ -256,13 +250,12 @@ unsafe fn d4_candidate_kernel(batch: &D4CandidateBatch) -> D4CandidateBatchResul
 }
 
 #[cfg(target_arch = "aarch64")]
-const fn d4_byte_permutation(symmetry: D4Symmetry) -> [u8; 16] {
+fn d4_byte_permutation(slots: [u8; 4]) -> [u8; 16] {
     const BYTE_INDEX: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-    let slots = symmetry.quadrant_perm();
     let mut output = [0_u8; 16];
     let mut output_slot = 0;
     while output_slot < 4 {
-        let input = slots[output_slot] * 4;
+        let input = usize::from(slots[output_slot]) * 4;
         let mut byte = 0;
         while byte < 4 {
             output[output_slot * 4 + byte] = BYTE_INDEX[input + byte];

@@ -1,6 +1,44 @@
 use super::*;
 
 #[test]
+fn overflowing_scale_coefficients_fold_using_shared_modular_arithmetic() {
+    for cell_sign in [CellSign::Unsigned, CellSign::Signed] {
+        let opts = CodegenOpts {
+            cell_sign,
+            ..life_opts()
+        };
+        let scale = BfIr::Affine {
+            src: 0,
+            dst: 0,
+            coeff: 2_000_000_003,
+            preserve_src: true,
+            set_dst: true,
+        };
+        let original = vec![BfIr::Add(7), scale.clone(), scale];
+        let optimized = optimize_with_opts(original.clone(), opts);
+        assert_eq!(
+            optimized,
+            vec![
+                BfIr::Add(7),
+                BfIr::Affine {
+                    src: 0,
+                    dst: 0,
+                    coeff: 9,
+                    preserve_src: true,
+                    set_dst: true
+                }
+            ],
+            "cell_sign={cell_sign:?}: wrapped coefficient product must not be rejected at the i32 boundary"
+        );
+        assert_eq!(
+            interpret_for_tests(&optimized, opts).or_invariant("optimized scaling terminates"),
+            interpret_for_tests(&original, opts).or_invariant("original scaling terminates"),
+            "cell_sign={cell_sign:?}: modular folding must preserve every cell and pointer"
+        );
+    }
+}
+
+#[test]
 fn optimize_canonicalizes_muladd_with_aliased_sources_and_destination_to_square() {
     assert_eq!(
         optimize_with_opts(

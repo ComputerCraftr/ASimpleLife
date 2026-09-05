@@ -467,8 +467,8 @@ fn hashlife_direct_parent_cache_survives_skip_gc() {
         oracle.direct_parent_cache_survives_skip_gc(&grid);
 
     assert!(
-        populate_delta.1 > 0,
-        "first direct-parent canonicalization should reconstruct the canonical root once"
+        populate_delta.1 <= 1,
+        "cold canonicalization should reconstruct at most once; an already canonical input needs none: {populate_delta:?}"
     );
     assert!(
         populate_delta.2 > 0,
@@ -747,7 +747,7 @@ fn hashlife_d4_semantic_winner_ignores_opposing_intern_order() {
 }
 
 #[test]
-fn hashlife_d4_prefix_cost_gate_avoids_warm_cache_rewalks() {
+fn hashlife_d4_prefix_metadata_avoids_recursive_leaf_rewalks() {
     let grid = random_soup(
         LARGE_SOUP_DIM,
         LARGE_SOUP_DIM,
@@ -755,10 +755,10 @@ fn hashlife_d4_prefix_cost_gate_avoids_warm_cache_rewalks() {
         SEED_CANONICAL_SYMMETRY_PARITY,
     );
     let mut engine = HashLifeEngine::default();
-    let (level, cold_attempts, cold_visits, cold_cost_bypasses, warm_cache_bypasses, warm_visits) =
+    let (level, cold_attempts, cold_visits, cold_cost_bypasses, warm_attempts, warm_visits) =
         engine.d4_semantic_prefix_cost_probe(&grid);
     eprintln!(
-        "d4_prefix_probe level={level} attempts={cold_attempts} leaf_visits={cold_visits} cost_bypasses={cold_cost_bypasses} warm_cache_bypasses={warm_cache_bypasses} warm_leaf_visits={warm_visits}"
+        "d4_prefix_probe level={level} attempts={cold_attempts} leaf_visits={cold_visits} cost_bypasses={cold_cost_bypasses} warm_attempts={warm_attempts} warm_leaf_visits={warm_visits}"
     );
     assert_eq!(
         cold_attempts + cold_cost_bypasses,
@@ -766,26 +766,17 @@ fn hashlife_d4_prefix_cost_gate_avoids_warm_cache_rewalks() {
         "cold D4 scan must choose exactly one prefix or exact-recursive path: level={level} stats={:?}",
         engine.runtime_stats()
     );
-    if cold_attempts == 1 {
-        let leaves_per_candidate = if level >= 4 {
-            128
-        } else {
-            1_usize << (2 * level)
-        };
-        assert_eq!(
-            cold_visits,
-            8 * leaves_per_candidate,
-            "native prefix construction must stay within its exact bounded leaf budget"
-        );
-    } else {
-        assert_eq!(
-            cold_visits, 0,
-            "scalar or cost-gated D4 scans must not construct semantic prefixes"
-        );
-    }
     assert_eq!(
-        warm_cache_bypasses, 1,
-        "fully cached D4 transforms must bypass semantic-prefix construction"
+        cold_attempts, 1,
+        "every D4 winner uses exact prefix ordering"
+    );
+    assert_eq!(
+        cold_visits, 0,
+        "canonical prefixes must be composed at intern time, not by a D4 leaf walk"
+    );
+    assert_eq!(
+        warm_attempts, 1,
+        "warm D4 scans must retain the same exact prefix-ordering contract"
     );
     assert_eq!(
         warm_visits, 0,

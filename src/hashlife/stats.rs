@@ -60,6 +60,9 @@ pub(crate) struct KernelWorkStats {
     pub(crate) native_d4_candidate_lanes: usize,
     pub(crate) native_d4_prefix_compare_lanes: usize,
     pub(crate) native_d4_exact_winner_lanes: usize,
+    pub(crate) swar_control_groups: usize,
+    pub(crate) native_avx2_control_groups: usize,
+    pub(crate) native_neon_control_groups: usize,
     pub(crate) population_kernel_lanes: usize,
     pub(crate) base_transition_kernel_lanes: usize,
     pub(crate) dedup_kernel_lanes: usize,
@@ -147,6 +150,21 @@ pub(crate) struct GcStats {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TransformStats {
+    // Each admitted request is classified exactly once, including requests in
+    // failed attempts: eliminated + cached + uncached. Uncached is not a claim
+    // that the requested proof completed or allocated a new shape.
+    pub(crate) orientation_requests: usize,
+    pub(crate) orientation_quotient_eliminations: usize,
+    pub(crate) orientation_uncached_requests: usize,
+    pub(crate) orientation_resolved_signatures: usize,
+    pub(crate) orientation_signature_reuses: usize,
+    pub(crate) orientation_cache_hits: usize,
+    pub(crate) orientation_scratch_bypasses: usize,
+    pub(crate) orientation_work_bypasses: usize,
+    pub(crate) d4_candidate_requests: usize,
+    pub(crate) d4_duplicate_candidates: usize,
+    pub(crate) d4_unique_candidates: usize,
+    pub(crate) d4_exact_comparator_calls: usize,
     pub(crate) packed_d4_canonicalization_misses: usize,
     pub(crate) d4_semantic_prefix_attempts: usize,
     pub(crate) d4_semantic_prefix_leaf_visits: usize,
@@ -171,6 +189,31 @@ pub(crate) struct MaterializationStats {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FutureStats {
+    pub(crate) class_lookups: usize,
+    pub(crate) class_hits: usize,
+    pub(crate) class_misses: usize,
+    pub(crate) classes_interned: usize,
+    pub(crate) proof_visits: usize,
+    pub(crate) proof_bypasses: usize,
+    pub(crate) proof_budget_bypasses: usize,
+    pub(crate) result_lookups: usize,
+    pub(crate) result_hits: usize,
+    pub(crate) result_misses: usize,
+    pub(crate) result_publications: usize,
+    pub(crate) result_bypasses: usize,
+    pub(crate) ineligible_lookups: usize,
+    pub(crate) publication_bypasses: usize,
+    pub(crate) ineligible_publications: usize,
+    pub(crate) analysis_sampling_bypasses: usize,
+    pub(crate) sampling_publication_bypasses: usize,
+    pub(crate) analysis_cooldowns: usize,
+    pub(crate) saved_jump_lookups: usize,
+    pub(crate) registry_resets: usize,
+    pub(crate) weak_results_dropped: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct HashLifeStats {
     pub(super) result_cache: ResultCacheStats,
     pub(super) scheduler: SchedulerTraversalStats,
@@ -180,6 +223,7 @@ pub(super) struct HashLifeStats {
     pub(super) gc: GcStats,
     pub(super) transform: TransformStats,
     pub(super) materialization: MaterializationStats,
+    pub(super) future: FutureStats,
 }
 
 #[derive(Clone, Copy)]

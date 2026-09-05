@@ -1,12 +1,14 @@
 use crate::RequiredExt;
+use crate::test_support::attributes_are_test_only;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use crate::test_support::c::CSource;
 use syn::parse::Parser as _;
 use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{Attribute, Expr, ExprCall, ExprMethodCall, ImplItemFn, ItemFn, Lit, Local, Token};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 #[derive(Debug)]
 pub(super) struct SourceFunction {
@@ -278,22 +280,6 @@ fn item_attrs(item: &syn::Item) -> &[Attribute] {
         syn::Item::Use(item) => &item.attrs,
         syn::Item::Verbatim(_) | _ => &[],
     }
-}
-
-fn attributes_are_test_only(attributes: &[Attribute]) -> bool {
-    attributes.iter().any(|attribute| {
-        if attribute.path().is_ident("cfg") {
-            return attribute
-                .meta
-                .require_list()
-                .is_ok_and(|list| list.tokens.to_string() == "test");
-        }
-        attribute.path().is_ident("cfg_attr")
-            && attribute
-                .meta
-                .require_list()
-                .is_ok_and(|list| list.tokens.to_string().starts_with("test ,"))
-    })
 }
 
 struct RustFunctionCollector<'a> {
@@ -649,40 +635,22 @@ impl<'ast> Visit<'ast> for RustSelfCallVisitor<'_> {
 }
 
 pub(super) fn c_source_functions(path: &Path, source: &str) -> Vec<SourceFunction> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_c::LANGUAGE.into())
-        .or_invariant("tree-sitter-c language should load");
-    let tree = parser.parse(source, None).unwrap_or_else(|| {
-        crate::invariant_failure!("failed to parse C source {}", path.display())
+    let syntax = CSource::try_parse(source).unwrap_or_else(|error| {
+        crate::invariant_failure!("failed to parse C source {}: {error}", path.display())
     });
-    assert!(
-        !tree.root_node().has_error(),
-        "failed to parse C source {}",
-        path.display()
-    );
 
     let mut functions = Vec::new();
-    collect_c_functions(tree.root_node(), source.as_bytes(), path, &mut functions);
+    collect_c_functions(syntax.root(), source.as_bytes(), path, &mut functions);
     functions
 }
 
 pub(super) fn c_source_structs(path: &Path, source: &str) -> Vec<SourceStruct> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_c::LANGUAGE.into())
-        .or_invariant("tree-sitter-c language should load");
-    let tree = parser.parse(source, None).unwrap_or_else(|| {
-        crate::invariant_failure!("failed to parse C source {}", path.display())
+    let syntax = CSource::try_parse(source).unwrap_or_else(|error| {
+        crate::invariant_failure!("failed to parse C source {}: {error}", path.display())
     });
-    assert!(
-        !tree.root_node().has_error(),
-        "failed to parse C source {}",
-        path.display()
-    );
 
     let mut structs = Vec::new();
-    let mut pending = vec![tree.root_node()];
+    let mut pending = vec![syntax.root()];
     while let Some(node) = pending.pop() {
         if node.kind() == "struct_specifier"
             && let Some(body) = node.child_by_field_name("body")
@@ -717,11 +685,7 @@ pub(super) fn c_source_structs(path: &Path, source: &str) -> Vec<SourceStruct> {
 
 fn c_field_declarator_count(declaration: Node<'_>) -> usize {
     let declarators = (0..declaration.child_count())
-        .filter(|&index| {
-            declaration.field_name_for_child(
-                u32::try_from(index).or_invariant("tree-sitter child index should fit u32"),
-            ) == Some("declarator")
-        })
+        .filter(|&index| declaration.field_name_for_child(index) == Some("declarator"))
         .count();
     declarators.max(1)
 }

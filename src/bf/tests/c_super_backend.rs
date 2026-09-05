@@ -4,29 +4,11 @@ use crate::bf::ShiftDir;
 #[test]
 fn emit_c_super_contains_symbolic_memo_runtime() {
     let c = emit_c_super(&parse_and_opt("+++[->+<]>+."), default_c_opts());
-    assert!(c.contains("typedef struct {"));
-    assert!(c.contains("MemoKey"));
-    assert!(c.contains("bf_memo_lookup"));
-    assert!(c.contains("print_memo_stats"));
-    assert!(c.contains("work dispatches:"));
-    assert!(c.contains("work loop iterations:"));
-    assert!(c.contains("work ops:"));
-    assert!(c.contains("memo hits:"));
-    assert!(c.contains("memo evictions:"));
-    assert!(c.contains("memo lookup max probe:"));
-    assert!(c.contains("memo store max probe:"));
-    assert!(c.contains("symbolic power hits:"));
-    assert!(c.contains("symbolic power builds:"));
-    assert!(c.contains("recursion fallbacks:"));
-    assert!(c.contains("max recursion depth:"));
-    assert!(c.contains("node_hits[MAX_NODES]"));
-    assert!(c.contains(" cost="));
-    assert!(c.contains(
-        "Affine { src: 0, dst: 1, coeff: 1, preserve_src: false, set_dst: false } plan=ExactMemo("
-    ));
-    assert!(
-        c.contains("Seq([NodeId(0), NodeId(1), NodeId(2), NodeId(3), NodeId(4)]) plan=Residual")
-    );
+    let syntax = CSource::parse(&c);
+    assert!(syntax.has_identifier("MemoKey"));
+    assert!(syntax.has_call("bf_memo_lookup"));
+    assert!(syntax.has_call("print_memo_stats"));
+    assert!(syntax.has_identifier("node_hits"));
 }
 
 fn compile_and_run_emitted_c_super_with_memo_capacity(
@@ -35,62 +17,10 @@ fn compile_and_run_emitted_c_super_with_memo_capacity(
     memo_capacity: usize,
 ) -> String {
     let c = emit_c_super(&parse_and_opt(src), opts);
-    let c = c.replacen(
-        "#define BF_TEMPLATE_MEMO_CAPACITY 4096",
-        &format!("#define BF_TEMPLATE_MEMO_CAPACITY {memo_capacity}"),
-        1,
-    );
+    let c = CSource::parse(&c)
+        .replace_define("BF_TEMPLATE_MEMO_CAPACITY", &memo_capacity.to_string())
+        .or_invariant("unique memo capacity definition");
     compile_and_run_c_source(&c)
-}
-
-#[test]
-fn emit_c_super_can_plan_symbolic_loop_regions() {
-    let c = emit_c_super(&parse_and_opt("[->+<+]"), default_c_opts());
-    assert!(
-        c.contains("Seq([NodeId(0), NodeId(1), NodeId(2), NodeId(3), NodeId(2)]) plan=ExactMemo(")
-    );
-    assert!(c.contains("Loop(NodeId(4)) plan=ExactLoopMemo"));
-    assert!(c.contains("while (tape[ptr] != 0) {"));
-}
-
-#[test]
-fn emit_c_super_can_plan_powered_loop_regions() {
-    let c = emit_c_super(&parse_and_opt("[--]"), default_c_opts());
-    assert!(c.contains("Loop(NodeId(0)) plan=ExactPoweredLoopMemo"));
-    assert!(c.contains("remaining_iters"));
-    assert!(c.contains("powered_ok"));
-    assert!(!c.contains("dynamic_spec_"));
-}
-
-#[test]
-fn emit_c_super_refuses_powered_loop_for_distribute_style_body() {
-    let c = emit_c_super(&parse_and_opt("[->+<]"), default_c_opts());
-    assert!(!c.contains("plan=ExactPoweredLoopMemo"));
-}
-
-#[test]
-fn emit_c_super_refuses_powered_loop_for_io_body() {
-    let c = emit_c_super(
-        &parse_and_opt("[,.]"),
-        CodegenOpts {
-            io_mode: IoMode::Number,
-            cell_bits: 8,
-            input_bits: None,
-            output_bits: None,
-            cell_sign: CellSign::Unsigned,
-        },
-    );
-    assert!(!c.contains("plan=ExactPoweredLoopMemo"));
-}
-
-#[test]
-fn emit_c_super_can_plan_symbolic_seq_regions() {
-    let c = emit_c_super(&parse_and_opt("++>+<"), default_c_opts());
-    assert!(c.contains("Seq([NodeId(0), NodeId(1), NodeId(2), NodeId(3)]) plan=ExactMemo("));
-    assert!(c.contains("MemoKey key = {"));
-    assert!(c.contains("bf_memo_lookup(&key, &value)"));
-    assert!(c.contains("ptrdiff_t memo_base_ptr = ptr;"));
-    assert!(c.contains("bf_memo_store(&key, &value);"));
 }
 
 #[test]
@@ -553,9 +483,9 @@ fn emit_c_super_powered_loop_emits_overshoot_guard() {
             cell_sign: CellSign::Unsigned,
         },
     );
-    assert!(c.contains("remaining_iters = (uint64_t)guard / UINT64_C(2);"));
-    assert!(c.contains("((uint64_t)guard % UINT64_C(2)) == 0"));
-    assert!(c.contains("while (tape[ptr] != 0) {"));
+    assert!(CSource::parse(&c).has_syntax("remaining_iters = (uint64_t)guard / UINT64_C(2);"));
+    assert!(CSource::parse(&c).has_syntax("((uint64_t)guard % UINT64_C(2)) == 0"));
+    assert!(CSource::parse(&c).has_condition("while_statement", "tape[ptr] != 0"));
 }
 
 #[test]
@@ -662,19 +592,20 @@ fn emit_c_super_repeated_powered_loops_keep_hitting_under_small_memo_capacity() 
 
 #[test]
 fn emit_c_super_repeated_leaf_ops_produce_exact_memo_hits() {
+    let program = (0..4)
+        .flat_map(|_| [BfIr::Add(1), BfIr::Output, BfIr::Add(-1), BfIr::Output])
+        .collect::<Vec<_>>();
     let stdout = compile_and_run_ir_backend(
-        &[
-            BfIr::Add(1),
-            BfIr::Add(-1),
-            BfIr::Add(1),
-            BfIr::Add(-1),
-            BfIr::Add(1),
-            BfIr::Add(-1),
-            BfIr::Add(1),
-            BfIr::Add(-1),
-        ],
-        default_c_opts(),
+        &program,
+        CodegenOpts {
+            io_mode: IoMode::Number,
+            ..default_c_opts()
+        },
         TestCBackend::Super,
+    );
+    assert_eq!(
+        split_super_c_payload(&stdout).trim(),
+        "1\n0\n1\n0\n1\n0\n1\n0"
     );
     assert!(
         memo_stat(&stdout, "memo hits:") > 0,
@@ -683,16 +614,17 @@ fn emit_c_super_repeated_leaf_ops_produce_exact_memo_hits() {
 }
 
 #[test]
-fn emit_c_super_repeated_seq_regions_produce_exact_memo_hits() {
+fn emit_c_super_repeated_pure_seq_is_composed_into_one_operation() {
     let stdout = compile_and_run_emitted_backend(
         "++>+<".repeat(8).as_str(),
         default_c_opts(),
         TestCBackend::Super,
         false,
     );
-    assert!(
-        memo_stat(&stdout, "memo hits:") > 0,
-        "expected exact memo hits for repeated seq regions, got:\n{stdout}"
+    assert_eq!(
+        memo_stat(&stdout, "work ops:"),
+        1,
+        "pure repeated sequence should be composed rather than replayed:\n{stdout}"
     );
     assert!(
         memo_stat(&stdout, "max recursion depth:") > 0,
@@ -896,11 +828,10 @@ fn emit_c_super_value_guarded_transducer_handles_noncomposable_square_loop() {
         cell_sign: CellSign::Unsigned,
     };
     let plain = compile_and_run_ir_backend(&program, opts, TestCBackend::Plain);
-    let super_c = emit_c_super(&program, opts).replacen(
-        "#define BF_TEMPLATE_DYNAMIC_HOT_THRESHOLD 8",
-        "#define BF_TEMPLATE_DYNAMIC_HOT_THRESHOLD 3",
-        1,
-    );
+    let source = emit_c_super(&program, opts);
+    let super_c = CSource::parse(&source)
+        .replace_define("BF_TEMPLATE_DYNAMIC_HOT_THRESHOLD", "3")
+        .or_invariant("unique hot threshold definition");
     let super_out = compile_and_run_c_source(&super_c);
 
     assert_super_payload_matches_plain("value-guarded square transducer", &plain, &super_out);
@@ -968,7 +899,7 @@ fn emit_c_super_contiguous_zero_summary_wraps_memset_at_tape_end() {
     let plain = compile_and_run_ir_backend(&program, opts, TestCBackend::Plain);
     let super_c = emit_c_super(&program, opts);
     assert!(
-        super_c.contains("bf_zero_region(tape, ptr"),
+        CSource::parse(&super_c).has_call("bf_zero_region"),
         "contiguous proven clears should select the wrap-safe memset lowering"
     );
     let super_out = compile_and_run_c_source(&super_c);

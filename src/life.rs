@@ -408,7 +408,7 @@ fn apply_chunk_step(
 }
 
 // Evolution kernels
-fn evolve_center_chunk_bitwise(neighborhood: &ChunkNeighborhood) -> u64 {
+pub(crate) fn evolve_center_chunk_bitwise(neighborhood: &ChunkNeighborhood) -> u64 {
     let [nw, n, ne, w, center, e, sw, s, se] = neighborhood.0;
     let north = align_vertical_neighbor(center, n, 7, 1);
     let south = align_vertical_neighbor(center, s, 0, -1);
@@ -722,11 +722,11 @@ fn shift_rows_with_edge(rows: [u16; 8], edge_fill: u16, shift_rows: i32) -> u16x
     let (edge_bytes, shifted_bytes): (i8x16, i8x16) = match shift_rows {
         1 => (
             edge_fill_bytes(edge_fill, 0),
-            row_bytes.swizzle(SHIFT_ROWS_DOWN_BYTES),
+            row_bytes.shuffle_zeroing(SHIFT_ROWS_DOWN_BYTES.cast_unsigned()),
         ),
         -1 => (
             edge_fill_bytes(edge_fill, 7),
-            row_bytes.swizzle(SHIFT_ROWS_UP_BYTES),
+            row_bytes.shuffle_zeroing(SHIFT_ROWS_UP_BYTES.cast_unsigned()),
         ),
         _ => crate::invariant_failure!("unsupported row shift: {shift_rows}"),
     };

@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
+use crate::test_support::c::CSource;
 use syn::visit::{self, Visit};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 use crate::RequiredExt;
 
@@ -85,15 +86,11 @@ pub(super) fn rust_inline_hash_mixers(path: &Path, source: &str) -> Vec<InlineHa
 }
 
 pub(super) fn c_inline_hash_mixers(path: &Path, source: &str) -> Vec<InlineHashMixer> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_c::LANGUAGE.into())
-        .or_invariant("tree-sitter-c language should load");
-    let tree = parser.parse(source, None).unwrap_or_else(|| {
-        crate::invariant_failure!("failed to parse C source {}", path.display())
+    let syntax = CSource::try_parse(source).unwrap_or_else(|error| {
+        crate::invariant_failure!("failed to parse C source {}: {error}", path.display())
     });
     let mut mixers = Vec::new();
-    let mut pending = vec![tree.root_node()];
+    let mut pending = vec![syntax.root()];
     while let Some(node) = pending.pop() {
         if node.kind() == "function_definition" {
             inspect_c_function(node, source.as_bytes(), path, &mut mixers);

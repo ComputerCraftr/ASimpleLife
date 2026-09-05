@@ -64,6 +64,7 @@ impl HashLifeSession {
         grid: &BitGrid,
         generation: u64,
     ) -> Result<(), HashLifeConversionError> {
+        self.collect_before_allocation();
         let published = self.published_state();
         let retained_before = wide_allocated_bytes(self.engine.allocated_bytes());
         self.memory_budget.sync_retained(retained_before);
@@ -120,6 +121,7 @@ impl HashLifeSession {
             });
         }
         self.current_root = Some(root);
+        self.engine.record_retained_root(root);
         self.current_origin_x = origin_x;
         self.current_origin_y = origin_y;
         self.current_generation = generation;
@@ -132,12 +134,43 @@ impl HashLifeSession {
     }
 
     pub fn load_snapshot_string(&mut self, snapshot: &str) -> Result<(), HashLifeConversionError> {
+        self.load_snapshot_reader(Cursor::new(snapshot.as_bytes()))
+    }
+
+    pub fn load_snapshot_owned(
+        &mut self,
+        snapshot: &super::super::OwnedHashLifeSnapshot,
+    ) -> Result<(), HashLifeConversionError> {
+        self.load_snapshot_reader(Cursor::new(snapshot.as_bytes()))
+    }
+
+    pub fn load_snapshot_reader(
+        &mut self,
+        reader: impl Read,
+    ) -> Result<(), HashLifeConversionError> {
+        self.collect_before_allocation();
+        let available = self
+            .limits
+            .hard_memory_bytes
+            .saturating_sub(self.allocated_bytes());
+        let snapshot = super::super::snapshot::read_snapshot_with_limit(reader, available)
+            .map_err(|error| match error.allocation_bytes() {
+                Some(requested_bytes) => {
+                    HashLifeConversionError::AllocationFailed { requested_bytes }
+                }
+                None => HashLifeConversionError::Snapshot(error),
+            })?;
+        self.load_parsed_snapshot(snapshot)
+    }
+
+    fn load_parsed_snapshot(
+        &mut self,
+        snapshot: super::super::snapshot::ParsedHashLifeSnapshot,
+    ) -> Result<(), HashLifeConversionError> {
         let published = self.published_state();
         let retained_before = wide_allocated_bytes(self.engine.allocated_bytes());
         self.memory_budget.sync_retained(retained_before);
-        let candidate_bytes = u128::try_from(snapshot.len())
-            .unwrap_or(u128::MAX)
-            .saturating_mul(4);
+        let candidate_bytes = snapshot.estimated_import_bytes();
         self.check_allocation_gate(HashLifeAllocationClass::SnapshotImport, candidate_bytes)?;
         checked_capacity::<u8>(candidate_bytes).map_err(|error| {
             HashLifeConversionError::AllocationFailed {
@@ -152,7 +185,7 @@ impl HashLifeSession {
         self.ensure_active_run();
         self.engine
             .begin_allocation_transaction(self.limits.hard_memory_bytes);
-        let imported = self.engine.import_snapshot_string(snapshot);
+        let imported = self.engine.import_snapshot(snapshot);
         let (root, origin_x, origin_y, generation) = match imported {
             Ok(imported) => imported,
             Err(error) => {
@@ -190,6 +223,7 @@ impl HashLifeSession {
             });
         }
         self.current_root = Some(root);
+        self.engine.record_retained_root(root);
         self.current_origin_x = origin_x;
         self.current_origin_y = origin_y;
         self.current_generation = generation;
@@ -285,6 +319,7 @@ fn conversion_budget_error(
 
 fn conversion_engine_failure(failure: EngineAllocationFailure) -> HashLifeConversionError {
     match failure {
+        EngineAllocationFailure::Cancelled => HashLifeConversionError::Cancelled,
         EngineAllocationFailure::Allocation { requested_bytes } => {
             HashLifeConversionError::AllocationFailed { requested_bytes }
         }

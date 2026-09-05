@@ -1,6 +1,7 @@
 use super::*;
 #[cfg(test)]
 use crate::RequiredExt;
+use crate::recurrence::{ExactRecurrenceTracker, Lineage, Observation, ObserveOutcome};
 use std::collections::{HashSet, VecDeque};
 
 const COMPONENT_PERIOD_LIMIT: u64 = 64;
@@ -37,25 +38,40 @@ pub(super) fn project_periodic_constellation(grid: &BitGrid, remaining: u64) -> 
 
 fn solve_periodic_component(cells: &[Cell]) -> Option<PeriodicComponent> {
     let initial = BitGrid::from_cells(cells);
-    let (initial_signature, initial_origin) = normalize(&initial);
     let mut phases = Vec::new();
     let mut current = initial;
     let mut memo = Memo::default();
+    let lineage = Lineage::fresh();
+    let mut recurrence = ExactRecurrenceTracker::new(lineage);
 
-    for period in 1..=COMPONENT_PERIOD_LIMIT {
-        phases.push(current.live_cells());
-        current = step_grid_with_changes_and_memo(&current, &mut memo).0;
+    for generation in 0..=COMPONENT_PERIOD_LIMIT {
         if current.is_empty() {
             return None;
         }
-        let (signature, origin) = normalize(&current);
-        if signature == initial_signature {
+        let outcome =
+            recurrence.observe_result(Observation::from_grid(lineage, generation, &current));
+        if let ObserveOutcome::Repeated(certificate) = outcome {
+            if certificate.first_seen() != 0 {
+                // Component phases are indexed from the supplied generation;
+                // a later recurrence would require a transient offset model.
+                return None;
+            }
+            let (dx, dy) = certificate.delta();
+            let delta = Coord::try_from(dx).ok().zip(Coord::try_from(dy).ok())?;
             return Some(PeriodicComponent {
                 phases,
-                period,
-                delta: (origin.0 - initial_origin.0, origin.1 - initial_origin.1),
+                period: certificate.period(),
+                delta,
             });
         }
+        if matches!(outcome, ObserveOutcome::Unavailable(_)) {
+            return None;
+        }
+        phases.push(current.live_cells());
+        if generation == COMPONENT_PERIOD_LIMIT {
+            break;
+        }
+        current = step_grid_with_changes_and_memo(&current, &mut memo).0;
     }
     None
 }
@@ -311,6 +327,16 @@ mod tests {
         assert!(
             project_periodic_constellation(&grid, 256).is_none(),
             "nearby components must fall back when their Life frontiers can interact"
+        );
+    }
+
+    #[test]
+    fn periodic_component_rejects_transient_before_stable_block() {
+        let l_shape = [(0, 0), (1, 0), (0, 1)];
+
+        assert!(
+            solve_periodic_component(&l_shape).is_none(),
+            "a transient L must not be projected with its generation-zero cells as phase zero"
         );
     }
 

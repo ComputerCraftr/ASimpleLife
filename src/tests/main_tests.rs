@@ -32,6 +32,7 @@ fn initial_grid_uses_named_pattern() {
         width: 80,
         height: 24,
         steps: 1,
+        steps_explicit: true,
         max_generations: None,
         target_generation: None,
         step_generations: 1,
@@ -39,6 +40,9 @@ fn initial_grid_uses_named_pattern() {
         seed: 123,
         pattern: "glider".to_string(),
         classify_only: false,
+        run_mode: crate::cli::RunMode::Headless,
+        load: None,
+        bf: None,
     };
 
     let grid = initial_grid(&config);
@@ -56,6 +60,7 @@ fn initial_grid_random_soup_respects_config_dimensions() {
         width: 90,
         height: 30,
         steps: 1,
+        steps_explicit: true,
         max_generations: None,
         target_generation: None,
         step_generations: 1,
@@ -63,6 +68,9 @@ fn initial_grid_random_soup_respects_config_dimensions() {
         seed: 7,
         pattern: "random".to_string(),
         classify_only: false,
+        run_mode: crate::cli::RunMode::Headless,
+        load: None,
+        bf: None,
     };
 
     let grid = initial_grid(&config);
@@ -289,10 +297,9 @@ fn exact_simd_repeat_skip_matches_manual_glider_translation() {
         expected = step_grid(&expected);
     }
 
-    assert_normalized_grids_eq(
-        "exact SIMD repeat skip should match manual glider stepping",
-        &advanced,
-        &expected,
+    assert_eq!(
+        advanced, expected,
+        "exact repeat skip must preserve glider phase AND world-space displacement"
     );
 }
 
@@ -313,10 +320,9 @@ fn exact_simd_repeat_skip_matches_million_generation_blinker() {
     assert_eq!(stats.simd_generations, target);
     assert!(stats.repeat_skip_events > 0);
     assert!(stats.repeat_skip_generations > 0);
-    assert_normalized_grids_eq(
-        "exact SIMD repeat skip should match million-generation blinker remainder",
-        &advanced,
-        &expected,
+    assert_eq!(
+        advanced, expected,
+        "stationary certificate must not translate the blinker"
     );
 }
 
@@ -331,11 +337,32 @@ fn exact_simd_repeat_skip_matches_million_generation_glider() {
 
     assert_eq!(stats.backend, SimulationBackend::SimdChunk);
     assert_eq!(stats.simd_generations, target);
-    assert_normalized_grids_eq(
-        "exact SIMD repeat skip should match HashLife glider target",
-        &advanced,
-        &expected,
+    assert_eq!(
+        advanced, expected,
+        "million-generation certificate must match HashLife at exact world coordinates"
     );
+}
+
+#[test]
+fn exact_repeat_skip_preserves_glider_displacement_across_every_chunk_alignment() {
+    let seed = crate::generators::pattern_by_name("glider").or_invariant("glider fixture");
+    let mut evolved = seed.clone();
+    for _ in 0..129 {
+        evolved = step_grid(&evolved);
+    }
+    let mut session = SimulationSession::new();
+    for x in -8..8 {
+        for y in -8..8 {
+            let input = seed.translated(x, y);
+            let expected = evolved.translated(x, y);
+            let (actual, stats) = session.advance_simd_chunk_exact(&input, 129);
+            assert_eq!(actual, expected, "glider anchor=({x},{y}), stats={stats:?}");
+            assert!(
+                stats.repeat_skip_generations > 0,
+                "no certificate used at anchor=({x},{y})"
+            );
+        }
+    }
 }
 
 #[test]
@@ -366,6 +393,47 @@ fn simulation_session_grid_hashlife_snapshot_roundtrip_preserves_loaded_grid() {
         .or_invariant("restored snapshot should materialize to a grid");
 
     assert_eq!(restored_grid, grid);
+}
+
+#[test]
+fn cell_authoritative_streaming_snapshot_preserves_authority_and_generation() {
+    let grid = crate::generators::pattern_by_name("glider").or_invariant("glider fixture");
+    let mut session = SimulationSession::new();
+    session.load_cell_state(grid.clone(), 37);
+
+    let mut encoded = Vec::new();
+    assert!(
+        session
+            .write_hashlife_snapshot(&mut encoded)
+            .or_invariant("cell-authoritative snapshot should write"),
+        "cell-authoritative session unexpectedly reported no snapshot"
+    );
+
+    let (retained_grid, retained_generation) = session
+        .cell_state()
+        .or_invariant("snapshot save changed cell authority");
+    assert_eq!(retained_grid, &grid, "snapshot save changed the cell grid");
+    assert_eq!(
+        retained_generation, 37,
+        "snapshot save changed the cell generation"
+    );
+    assert_eq!(
+        session.hashlife_sample_materializations(),
+        0,
+        "cell-authoritative snapshot save materialized the primary HashLife session"
+    );
+
+    let mut restored = SimulationSession::new();
+    restored
+        .load_hashlife_snapshot_reader(std::io::Cursor::new(encoded))
+        .or_invariant("cell-authoritative snapshot should load directly");
+    assert_eq!(restored.hashlife_generation(), 37);
+    assert!(restored.hashlife_loaded());
+    assert_eq!(
+        restored.hashlife_sample_materializations(),
+        0,
+        "direct engine snapshot load materialized a grid"
+    );
 }
 
 #[test]

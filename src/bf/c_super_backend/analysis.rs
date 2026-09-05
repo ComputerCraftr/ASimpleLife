@@ -68,15 +68,14 @@ impl EmitterEngine {
                         self.exact_specs.insert(current, None);
                         continue;
                     };
-                    let window_tail =
-                        crate::bf::BfOffset::from(child_spec.window.len.saturating_sub(1));
-                    if child_spec.window.len != 0 && window_start.checked_add(window_tail).is_none()
-                    {
-                        self.exact_specs.insert(current, None);
-                        continue;
-                    }
-                    for index in 0..child_spec.window.len {
-                        offsets.insert(window_start + crate::bf::BfOffset::from(index));
+                    if let Some(window_tail) = child_spec.window.len.checked_sub(1) {
+                        let Some(window_end) =
+                            window_start.checked_add(crate::bf::BfOffset::from(window_tail))
+                        else {
+                            self.exact_specs.insert(current, None);
+                            continue;
+                        };
+                        offsets.extend(window_start..=window_end);
                     }
                     let Some(next_ptr_delta) = ptr_delta.checked_add(child_spec.ptr_delta) else {
                         self.exact_specs.insert(current, None);
@@ -184,7 +183,14 @@ impl EmitterEngine {
                         stack.push(Frame::Visit(child));
                         continue;
                     }
-                    let transfer = self.transfer_from_cached_children(current);
+                    let mut transfer = if self.compile_work.budget.can_start_transfer() {
+                        self.transfer_from_cached_children(current)
+                    } else {
+                        SymbolicTransfer::unknown()
+                    };
+                    if !self.compile_work.budget.admit(&transfer) {
+                        transfer = SymbolicTransfer::unknown();
+                    }
                     self.transfers.insert(current, transfer);
                 }
                 Frame::Seq {
@@ -196,7 +202,12 @@ impl EmitterEngine {
                         NodeKind::Seq(children) => children[next_child],
                         _ => crate::invariant_failure!("sequence frame must reference a sequence"),
                     };
-                    let acc = compose_transfer(&acc, &self.transfers[&child]);
+                    let acc = compose_transfer_owned(
+                        acc,
+                        &self.transfers[&child],
+                        self.polynomial_semantics,
+                        &mut self.compile_work,
+                    );
                     if acc.unknown {
                         self.transfers.insert(current, acc);
                         continue;
@@ -224,7 +235,7 @@ impl EmitterEngine {
     }
 
     fn transfer_from_cached_children(&self, id: NodeId) -> SymbolicTransfer {
-        match self.interner.get(id) {
+        let mut transfer = match self.interner.get(id) {
             NodeKind::Add(delta) => {
                 let Some(value) = SymbolicPolynomial::input(0).add_constant(i64::from(*delta))
                 else {
@@ -263,6 +274,9 @@ impl EmitterEngine {
                 targets,
                 preserve_src,
             } => {
+                if targets.len() > 256 {
+                    return SymbolicTransfer::unknown();
+                }
                 let mut seen = BTreeSet::new();
                 if targets
                     .iter()
@@ -405,7 +419,22 @@ impl EmitterEngine {
                 crate::invariant_failure!("non-empty sequences are evaluated by traversal frames")
             }
             NodeKind::Loop(_) => SymbolicTransfer::unknown(),
+        };
+        if let Some(semantics) = self.polynomial_semantics {
+            for polynomial in transfer.effects.values_mut() {
+                let Some(normalized) = polynomial.normalized(&semantics) else {
+                    return SymbolicTransfer::unknown();
+                };
+                *polynomial = normalized;
+            }
+            transfer.ptr_delta = normalized_c_offset(transfer.ptr_delta);
+            transfer.reads = transfer
+                .effects
+                .values()
+                .flat_map(SymbolicPolynomial::sources)
+                .collect();
         }
+        transfer
     }
 
     pub(super) fn loop_analysis(&mut self, id: NodeId) -> Option<&LoopAnalysis> {
@@ -423,14 +452,10 @@ impl EmitterEngine {
             }
         };
         let exact = self.exact_memo_spec(id);
-        let transfer = self.transfer(body).clone();
+        let transfer = self.transfer(body);
         let analysis = if transfer.is_direct_kernel_loop_shape() {
             if let Some(exact) = exact {
-                if let Some(powered) = powered_loop_analysis(body, &transfer) {
-                    Some(LoopAnalysis::ExactMemoPlusSymbolicPower { exact, powered })
-                } else {
-                    Some(LoopAnalysis::ExactMemoPlusDirectKernel { body, exact })
-                }
+                Some(LoopAnalysis::ExactMemoPlusDirectKernel { body, exact })
             } else {
                 Some(LoopAnalysis::Residual { body })
             }
@@ -498,90 +523,155 @@ pub(super) fn shift_effect(
     effect.shifted(delta)
 }
 
+#[cfg(test)]
 pub(super) fn compose_transfer(
     left: &SymbolicTransfer,
     right: &SymbolicTransfer,
 ) -> SymbolicTransfer {
+    compose_transfer_owned(left.clone(), right, None, &mut CompileWork::default())
+}
+
+pub(super) fn compose_transfer_owned(
+    mut left: SymbolicTransfer,
+    right: &SymbolicTransfer,
+    semantics: Option<PolynomialSemantics>,
+    work: &mut CompileWork,
+) -> SymbolicTransfer {
+    if !work.budget.begin_composition() {
+        return SymbolicTransfer::unknown();
+    }
+    work.compositions += 1;
     if left.unknown || right.unknown {
         return SymbolicTransfer::unknown();
     }
-    let mut effects = left.effects.clone();
-    let left_values = left
-        .effects
-        .iter()
-        .map(|(&offset, polynomial)| (offset, polynomial.clone()))
-        .collect::<BTreeMap<_, _>>();
+    if right.effects.len() > 256 || left.effects.len() > 256 {
+        return SymbolicTransfer::unknown();
+    }
+    let mut updates = Vec::with_capacity(right.effects.len());
+    let mut budget = SubstitutionBudget::new();
     for (offset, effect) in &right.effects {
         let Some(rebased) = offset.checked_add(left.ptr_delta) else {
             return SymbolicTransfer::unknown();
         };
-        let Some(polynomial) = shift_effect(effect, left.ptr_delta) else {
+        let rebased = if semantics.is_some() {
+            normalized_c_offset(rebased)
+        } else {
+            rebased
+        };
+        let polynomial = match semantics {
+            Some(ref semantics) => effect.shifted_with(left.ptr_delta, semantics),
+            None => shift_effect(effect, left.ptr_delta),
+        };
+        let Some(polynomial) = polynomial else {
             return SymbolicTransfer::unknown();
         };
-        let Some(composed) = polynomial.substitute(&left_values) else {
+        let composed = match semantics {
+            Some(ref semantics) => {
+                polynomial.substitute_with(&left.effects, semantics, &mut budget)
+            }
+            None => polynomial.substitute(&left.effects),
+        };
+        let Some(composed) = composed else {
+            work.record_substitution(&budget);
             return SymbolicTransfer::unknown();
         };
-        effects.insert(rebased, composed);
+        updates.push((rebased, composed));
     }
-    let reads = effects
+    work.record_substitution(&budget);
+    left.effects.extend(updates);
+    if left.effects.len() > 256 || left.effects.values().map(|p| p.terms.len()).sum::<usize>() > 256
+    {
+        return SymbolicTransfer::unknown();
+    }
+    let reads = left
+        .effects
         .values()
         .flat_map(SymbolicPolynomial::sources)
         .collect();
-    SymbolicTransfer {
+    let result = SymbolicTransfer {
         ptr_delta: match left.ptr_delta.checked_add(right.ptr_delta) {
+            Some(delta) if semantics.is_some() => normalized_c_offset(delta),
             Some(delta) => delta,
             None => return SymbolicTransfer::unknown(),
         },
-        effects,
+        effects: left.effects,
         reads,
         may_input: left.may_input || right.may_input,
         may_output: left.may_output || right.may_output,
         may_diverge: left.may_diverge || right.may_diverge,
         unknown: false,
-    }
-}
-
-fn powered_loop_analysis(body: NodeId, transfer: &SymbolicTransfer) -> Option<PoweredLoopAnalysis> {
-    let _window = transfer.memo_window()?;
-    if !transfer.is_direct_kernel_loop_shape() {
-        return None;
-    }
-    let guard_delta = match transfer.effects.get(&0) {
-        Some(polynomial) => polynomial.additive_delta_for(0)?,
-        _ => return None,
     };
-    if guard_delta == 0 {
-        return None;
+    if work.budget.admit(&result) {
+        result
+    } else {
+        SymbolicTransfer::unknown()
     }
-    let mut powers = Vec::with_capacity(usize::from(SUPER_LOOP_POWER_MAX) + 1);
-    let mut power = transfer.clone();
-    powers.push(power.clone());
-    while powers.len() <= usize::from(SUPER_LOOP_POWER_MAX) {
-        power = compose_transfer(&power, &power);
-        let cost = power
-            .effects
-            .values()
-            .map(SymbolicPolynomial::cost)
-            .sum::<usize>();
-        if !power.is_pure_windowed() || cost > SYMBOLIC_TERM_MAX {
-            break;
-        }
-        powers.push(power.clone());
-    }
-    if powers.len() < 2 {
-        return None;
-    }
-    Some(PoweredLoopAnalysis {
-        body,
-        guard_offset: 0,
-        guard_delta,
-        powers,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memo_window_rebases_the_complete_checked_inclusive_range() {
+        let mut engine = EmitterEngine::new();
+        let first = engine.interner.intern(NodeKind::Clear);
+        let last = engine.interner.intern(NodeKind::ClearAt(7));
+        let body = engine.interner.intern(NodeKind::Seq(vec![first, last]));
+        let shift = engine.interner.intern(NodeKind::Move(-11));
+        let root = engine.interner.intern(NodeKind::Seq(vec![shift, body]));
+
+        assert_eq!(
+            engine.exact_memo_spec(root),
+            Some(ExactMemoSpec {
+                window: MemoWindow { start: -11, len: 8 },
+                ptr_delta: -11,
+            }),
+            "rebasing must include both endpoints of the eight-cell window"
+        );
+    }
+
+    #[test]
+    fn memo_window_overflow_rejects_before_visiting_the_next_child() {
+        let mut engine = EmitterEngine::new();
+        let first = engine.interner.intern(NodeKind::Clear);
+        let last = engine.interner.intern(NodeKind::ClearAt(1));
+        let body = engine.interner.intern(NodeKind::Seq(vec![first, last]));
+        let shift = engine
+            .interner
+            .intern(NodeKind::Move(crate::bf::BfOffset::MAX));
+        let unvisited = engine.interner.intern(NodeKind::Input);
+        let root = engine
+            .interner
+            .intern(NodeKind::Seq(vec![shift, body, unvisited]));
+
+        assert_eq!(engine.exact_memo_spec(root), None);
+        assert!(
+            !engine.exact_specs.contains_key(&unvisited),
+            "overflowing MAX + 1 must reject the range, not continue analysis"
+        );
+    }
+
+    #[test]
+    fn empty_memo_window_at_maximum_pointer_does_not_touch_a_cell() {
+        let mut engine = EmitterEngine::new();
+        let shift = engine
+            .interner
+            .intern(NodeKind::Move(crate::bf::BfOffset::MAX));
+        let stationary = engine.interner.intern(NodeKind::Move(0));
+        let root = engine
+            .interner
+            .intern(NodeKind::Seq(vec![shift, stationary]));
+
+        assert_eq!(
+            engine.exact_memo_spec(root),
+            Some(ExactMemoSpec {
+                window: MemoWindow { start: 0, len: 0 },
+                ptr_delta: crate::bf::BfOffset::MAX,
+            }),
+            "an empty window must not become an inclusive one-cell range"
+        );
+    }
 
     #[test]
     fn deep_dag_analysis_uses_iterative_postorder() {
@@ -664,11 +754,13 @@ mod tests {
     }
 
     #[test]
-    fn composition_rejects_degree_growth_beyond_quadratic() {
+    fn composition_preserves_exact_cubic_terms() {
         let left = polynomial_transfer(BTreeMap::from([(0, SymbolicPolynomial::product(1, 2))]));
         let right = polynomial_transfer(BTreeMap::from([(3, SymbolicPolynomial::product(0, 4))]));
 
-        assert!(compose_transfer(&left, &right).unknown);
+        let composed = compose_transfer(&left, &right);
+        assert!(!composed.unknown);
+        assert_eq!(composed.effects[&3].degree(), 3);
     }
 
     #[test]

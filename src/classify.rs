@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+pub(crate) mod analysis;
+mod evaluator;
 
-use crate::benchmark::effective_generation_limit;
 use crate::bitgrid::{BitGrid, Cell, Coord};
 use crate::life::step_grid_with_changes_and_memo;
 use crate::memo::Memo;
 use crate::normalize::{NormalizedGridSignature, normalize};
+use crate::recurrence::{ExactRecurrenceTracker, Lineage, Observation, ObserveOutcome};
 
 const SETTLING_MAX_POPULATION: usize = 256;
 const SETTLING_MAX_SPAN: Coord = 64;
@@ -70,6 +72,226 @@ pub enum Classification {
     },
 }
 
+/// Stable categorical result for classifier consumers that do not need the
+/// legacy result's presentation-oriented payload layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ClassificationOutcome {
+    Extinct,
+    StillLife,
+    Oscillator,
+    Spaceship,
+    Emitter,
+    Puffer,
+    Expanding,
+    Unresolved,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ClassificationCertainty {
+    Exact,
+    Heuristic,
+    Inconclusive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ClassificationGrowthKind {
+    Emitter,
+    Puffer,
+    PersistentExpansion,
+    Other(&'static str),
+}
+
+impl ClassificationGrowthKind {
+    fn from_legacy(reason: &'static str) -> Self {
+        match reason {
+            "emitter" => Self::Emitter,
+            "puffer" => Self::Puffer,
+            "persistent_expansion" => Self::PersistentExpansion,
+            other => Self::Other(other),
+        }
+    }
+
+    fn legacy_reason(self) -> &'static str {
+        match self {
+            Self::Emitter => "emitter",
+            Self::Puffer => "puffer",
+            Self::PersistentExpansion => "persistent_expansion",
+            Self::Other(reason) => reason,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClassificationEvidence {
+    Extinction {
+        at_generation: u64,
+    },
+    Recurrence {
+        period: u64,
+        first_seen: u64,
+        displacement: Cell,
+        detected_at: u64,
+    },
+    PersistentGrowth {
+        kind: ClassificationGrowthKind,
+        detected_at: u64,
+    },
+    Horizon {
+        simulated: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassificationReport {
+    pub outcome: ClassificationOutcome,
+    pub certainty: ClassificationCertainty,
+    pub observed_through: u64,
+    pub evidence: ClassificationEvidence,
+}
+
+impl ClassificationReport {
+    #[must_use]
+    pub fn from_legacy(classification: &Classification) -> Self {
+        match classification {
+            Classification::DiesOut { at_generation } => Self {
+                outcome: ClassificationOutcome::Extinct,
+                certainty: ClassificationCertainty::Exact,
+                observed_through: *at_generation,
+                evidence: ClassificationEvidence::Extinction {
+                    at_generation: *at_generation,
+                },
+            },
+            Classification::Repeats { period, first_seen } => {
+                let detected_at = first_seen.saturating_add(*period);
+                Self {
+                    outcome: if *period == 1 {
+                        ClassificationOutcome::StillLife
+                    } else {
+                        ClassificationOutcome::Oscillator
+                    },
+                    certainty: ClassificationCertainty::Exact,
+                    observed_through: detected_at,
+                    evidence: ClassificationEvidence::Recurrence {
+                        period: *period,
+                        first_seen: *first_seen,
+                        displacement: (0, 0),
+                        detected_at,
+                    },
+                }
+            }
+            Classification::Spaceship {
+                period,
+                first_seen,
+                delta,
+                detected_at,
+            } => Self {
+                outcome: ClassificationOutcome::Spaceship,
+                certainty: ClassificationCertainty::Exact,
+                observed_through: *detected_at,
+                evidence: ClassificationEvidence::Recurrence {
+                    period: *period,
+                    first_seen: *first_seen,
+                    displacement: *delta,
+                    detected_at: *detected_at,
+                },
+            },
+            Classification::LikelyInfinite {
+                reason,
+                detected_at,
+            } => {
+                let kind = ClassificationGrowthKind::from_legacy(reason);
+                Self {
+                    outcome: match kind {
+                        ClassificationGrowthKind::Emitter => ClassificationOutcome::Emitter,
+                        ClassificationGrowthKind::Puffer => ClassificationOutcome::Puffer,
+                        _ => ClassificationOutcome::Expanding,
+                    },
+                    certainty: ClassificationCertainty::Heuristic,
+                    observed_through: *detected_at,
+                    evidence: ClassificationEvidence::PersistentGrowth {
+                        kind,
+                        detected_at: *detected_at,
+                    },
+                }
+            }
+            Classification::Unknown { simulated } => Self {
+                outcome: ClassificationOutcome::Unresolved,
+                certainty: ClassificationCertainty::Inconclusive,
+                observed_through: *simulated,
+                evidence: ClassificationEvidence::Horizon {
+                    simulated: *simulated,
+                },
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn to_legacy(&self) -> Classification {
+        match &self.evidence {
+            ClassificationEvidence::Extinction { at_generation } => Classification::DiesOut {
+                at_generation: *at_generation,
+            },
+            ClassificationEvidence::Recurrence {
+                period,
+                first_seen,
+                displacement,
+                detected_at: _,
+            } if *displacement == (0, 0) => Classification::Repeats {
+                period: *period,
+                first_seen: *first_seen,
+            },
+            ClassificationEvidence::Recurrence {
+                period,
+                first_seen,
+                displacement,
+                detected_at,
+            } => Classification::Spaceship {
+                period: *period,
+                first_seen: *first_seen,
+                delta: *displacement,
+                detected_at: *detected_at,
+            },
+            ClassificationEvidence::PersistentGrowth { kind, detected_at } => {
+                Classification::LikelyInfinite {
+                    reason: kind.legacy_reason(),
+                    detected_at: *detected_at,
+                }
+            }
+            ClassificationEvidence::Horizon { simulated } => Classification::Unknown {
+                simulated: *simulated,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ClassificationCache {
+    exact: HashMap<NormalizedGridSignature, ClassificationReport>,
+}
+
+impl ClassificationCache {
+    #[must_use]
+    pub fn get(&self, signature: &NormalizedGridSignature) -> Option<ClassificationReport> {
+        self.exact.get(signature).cloned()
+    }
+
+    pub fn insert(&mut self, signature: NormalizedGridSignature, report: ClassificationReport) {
+        if report.certainty == ClassificationCertainty::Exact {
+            self.exact.insert(signature, report);
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.exact.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.exact.is_empty()
+    }
+}
+
 impl fmt::Display for Classification {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -101,6 +323,29 @@ pub struct ClassificationLimits {
     pub max_generations: u64,
 }
 
+#[must_use]
+pub fn effective_generation_limit(
+    limits: &ClassificationLimits,
+    population: usize,
+    bounds: Option<(Coord, Coord, Coord, Coord)>,
+) -> u64 {
+    const SMALL_PATTERN_POPULATION: usize = 64;
+    const SMALL_PATTERN_SPAN: Coord = 24;
+    const MIN_EXTENDED_LIMIT: u64 = 1_024;
+    let Some((min_x, min_y, max_x, max_y)) = bounds else {
+        return limits.max_generations;
+    };
+    let width = max_x - min_x + 1;
+    let height = max_y - min_y + 1;
+    if population <= SMALL_PATTERN_POPULATION
+        && width <= SMALL_PATTERN_SPAN
+        && height <= SMALL_PATTERN_SPAN
+    {
+        return limits.max_generations.max(MIN_EXTENDED_LIMIT);
+    }
+    limits.max_generations
+}
+
 impl Default for ClassificationLimits {
     fn default() -> Self {
         Self {
@@ -109,11 +354,11 @@ impl Default for ClassificationLimits {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct ClassificationCheckpoint {
     pub generation: u64,
     pub grid: BitGrid,
-    pub seen: HashMap<NormalizedGridSignature, (u64, Cell)>,
+    pub recurrence: ExactRecurrenceTracker,
 }
 
 pub fn classify_seed(
@@ -121,13 +366,31 @@ pub fn classify_seed(
     limits: &ClassificationLimits,
     memo: &mut Memo,
 ) -> Classification {
+    classify_seed_report(seed, limits, memo).to_legacy()
+}
+
+pub fn classify_seed_report(
+    seed: &BitGrid,
+    limits: &ClassificationLimits,
+    transition_memo: &mut Memo,
+) -> ClassificationReport {
+    let (result, _) = predict_seed_with_checkpoint(seed, limits, transition_memo);
+    ClassificationReport::from_legacy(&result)
+}
+
+pub fn classify_seed_report_cached(
+    seed: &BitGrid,
+    limits: &ClassificationLimits,
+    transition_memo: &mut Memo,
+    classification_cache: &mut ClassificationCache,
+) -> ClassificationReport {
     let (seed_signature, _) = normalize(seed);
-    if let Some(cached) = memo.get_classification(&seed_signature) {
+    if let Some(cached) = classification_cache.get(&seed_signature) {
         return cached;
     }
 
-    let (result, _) = predict_seed_with_checkpoint(seed, limits, memo);
-    memo.insert_classification(seed_signature, result.clone());
+    let result = classify_seed_report(seed, limits, transition_memo);
+    classification_cache.insert(seed_signature, result.clone());
     result
 }
 
@@ -138,7 +401,7 @@ pub(crate) fn predict_seed_with_checkpoint(
 ) -> (Classification, ClassificationCheckpoint) {
     run_classification_from_state(
         seed.clone(),
-        HashMap::new(),
+        ExactRecurrenceTracker::new(Lineage::fresh()),
         0,
         effective_generation_limit(limits, seed.population(), seed.bounds()),
         limits,
@@ -148,99 +411,31 @@ pub(crate) fn predict_seed_with_checkpoint(
 
 fn run_classification_from_state(
     mut grid: BitGrid,
-    mut seen: HashMap<NormalizedGridSignature, (u64, Cell)>,
+    recurrence: ExactRecurrenceTracker,
     mut generation: u64,
-    mut generation_limit: u64,
+    generation_limit: u64,
     limits: &ClassificationLimits,
     memo: &mut Memo,
 ) -> (Classification, ClassificationCheckpoint) {
-    let mut metrics_history: Vec<(usize, Coord, Coord, Coord, Coord, Coord)> = Vec::new();
-
-    while generation <= generation_limit {
-        let (signature, origin) = normalize(&grid);
-
-        if grid.is_empty() {
+    let mut evidence = evaluator::EvidenceEvaluator::new(recurrence, limits, generation_limit);
+    loop {
+        let observation = Observation::from_grid(evidence.recurrence.lineage(), generation, &grid);
+        if let Some(report) =
+            evidence.observe(generation, observation, grid.is_empty(), Some(&grid))
+        {
             return (
-                Classification::DiesOut {
-                    at_generation: generation,
-                },
+                report.to_legacy(),
                 ClassificationCheckpoint {
                     generation,
                     grid,
-                    seen,
+                    recurrence: evidence.recurrence,
                 },
             );
         }
-
-        if let Some(&(first_seen, first_origin)) = seen.get(&signature) {
-            let period = generation - first_seen;
-            let dx = origin.0 - first_origin.0;
-            let dy = origin.1 - first_origin.1;
-            let result = if dx == 0 && dy == 0 {
-                Classification::Repeats { period, first_seen }
-            } else {
-                Classification::Spaceship {
-                    period,
-                    first_seen,
-                    delta: (dx, dy),
-                    detected_at: generation,
-                }
-            };
-            return (
-                result,
-                ClassificationCheckpoint {
-                    generation,
-                    grid,
-                    seen,
-                },
-            );
-        }
-
-        if let Some(bounds) = grid.bounds() {
-            let (min_x, min_y, max_x, max_y) = bounds;
-            let (_, _, span) = bounds_dimensions(bounds);
-            metrics_history.push((grid.population(), min_x, max_x, min_y, max_y, span));
-            if let Some(result) =
-                detect_persistent_expansion(generation, &metrics_history, &grid, limits)
-            {
-                return (
-                    result,
-                    ClassificationCheckpoint {
-                        generation,
-                        grid,
-                        seen,
-                    },
-                );
-            }
-        }
-
-        seen.insert(signature.clone(), (generation, origin));
         grid = step_grid_with_changes_and_memo(&grid, memo).0;
+        // The evaluator returns a horizon result before the u64 boundary.
         generation += 1;
-
-        if generation > generation_limit {
-            let mut next_limit =
-                effective_generation_limit(limits, grid.population(), grid.bounds());
-            if next_limit <= generation_limit
-                && let Some(settling_limit) =
-                    settling_extension_limit(limits, generation_limit, &metrics_history)
-            {
-                next_limit = settling_limit;
-            }
-            generation_limit = next_limit;
-        }
     }
-
-    (
-        Classification::Unknown {
-            simulated: generation_limit,
-        },
-        ClassificationCheckpoint {
-            generation,
-            grid,
-            seen,
-        },
-    )
 }
 
 fn settling_extension_limit(

@@ -492,27 +492,6 @@ fn seeded_index(seed: u64, len: usize) -> usize {
     let reduced = seed % len_u64;
     usize::try_from(reduced).or_invariant("reduced seed index exceeded usize")
 }
-pub(crate) fn effective_generation_limit(
-    limits: &ClassificationLimits,
-    population: usize,
-    bounds: Option<(Coord, Coord, Coord, Coord)>,
-) -> u64 {
-    const SMALL_PATTERN_POPULATION: usize = 64;
-    const SMALL_PATTERN_SPAN: Coord = 24;
-    const MIN_EXTENDED_LIMIT: u64 = 1024;
-    let Some((min_x, min_y, max_x, max_y)) = bounds else {
-        return limits.max_generations;
-    };
-    let width = max_x - min_x + 1;
-    let height = max_y - min_y + 1;
-    if population <= SMALL_PATTERN_POPULATION
-        && width <= SMALL_PATTERN_SPAN
-        && height <= SMALL_PATTERN_SPAN
-    {
-        return limits.max_generations.max(MIN_EXTENDED_LIMIT);
-    }
-    limits.max_generations
-}
 pub(crate) fn canonical_small_box_mask(mask: u32, width: usize, height: usize) -> u32 {
     let mut best = transform_mask(mask, width, height, 0);
     for transform in 1..8 {

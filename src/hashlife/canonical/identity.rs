@@ -1,7 +1,7 @@
 use super::*;
 
 impl HashLifeEngine {
-    pub(super) fn canonicalize_packed_direct(
+    pub(in crate::hashlife) fn canonicalize_packed_direct(
         &mut self,
         packed: PackedNodeKey,
         base_symmetry: Symmetry,
@@ -27,37 +27,37 @@ impl HashLifeEngine {
             self.lookup_direct_parent_identity(packed.level, base_symmetry, input_children)
         {
             self.stats.canonical_cache.direct_parent_cached_result_hits += 1;
+            let used_cached_fingerprint =
+                base_symmetry == Symmetry::Identity && canonical.symmetry == Symmetry::Identity;
             return CanonicalNodeProbe {
                 node: canonical,
-                fingerprint: if canonical.symmetry == Symmetry::Identity {
+                fingerprint: if used_cached_fingerprint {
                     packed.fingerprint()
                 } else {
                     canonical.packed.fingerprint()
                 },
-                used_cached_fingerprint: canonical.symmetry == Symmetry::Identity,
+                used_cached_fingerprint,
             };
         }
 
         self.stats.canonical_fallback.symmetry_scan_fallbacks += 1;
-        let (canonical_id, canonical_symmetry, canonical_structural) =
+        let (canonical_packed, canonical_symmetry, canonical_structural) =
             self.canonical_transform_winner_fallback(packed, base_symmetry, count_fallback);
-        self.stats
-            .canonical_fallback
-            .canonical_transform_root_reconstructions += 1;
         let canonical = CanonicalNodeIdentity {
-            packed: self.packed_root_from_transform_id(canonical_id),
+            packed: canonical_packed,
             structural: canonical_structural,
             symmetry: canonical_symmetry,
         };
-        self.cache_direct_parent_identity(packed.level, base_symmetry, input_children, canonical);
+        let used_cached_fingerprint =
+            base_symmetry == Symmetry::Identity && canonical_symmetry == Symmetry::Identity;
         CanonicalNodeProbe {
             node: canonical,
-            fingerprint: if canonical_symmetry == Symmetry::Identity {
+            fingerprint: if used_cached_fingerprint {
                 packed.fingerprint()
             } else {
                 canonical.packed.fingerprint()
             },
-            used_cached_fingerprint: canonical_symmetry == Symmetry::Identity,
+            used_cached_fingerprint,
         }
     }
 
@@ -66,7 +66,7 @@ impl HashLifeEngine {
         packed: PackedNodeKey,
     ) -> CanonicalNodeProbe {
         if packed.level == 0 {
-            let structural = CanonicalStructKey::leaf(packed.children[0] != 0);
+            let structural = CanonicalStructKey::leaf(packed.children[0] != NodeId::ZERO);
             return CanonicalNodeProbe {
                 node: CanonicalNodeIdentity {
                     packed,
@@ -78,13 +78,6 @@ impl HashLifeEngine {
             };
         }
         if let Some(cached) = self.lookup_canonical_packed_identity(packed) {
-            let input_children = self.direct_parent_input_children(packed, Symmetry::Identity);
-            self.backfill_direct_parent_identity(
-                packed,
-                Symmetry::Identity,
-                input_children,
-                cached,
-            );
             return CanonicalNodeProbe {
                 node: cached,
                 fingerprint: if cached.symmetry == Symmetry::Identity {
@@ -109,7 +102,7 @@ impl HashLifeEngine {
             return self.canonicalize_packed_identity(packed);
         }
         if packed.level == 0 {
-            let structural = CanonicalStructKey::leaf(packed.children[0] != 0);
+            let structural = CanonicalStructKey::leaf(packed.children[0] != NodeId::ZERO);
             return CanonicalNodeProbe {
                 node: CanonicalNodeIdentity {
                     packed,
@@ -125,8 +118,6 @@ impl HashLifeEngine {
             symmetry: base_symmetry,
         };
         if let Some(cached) = self.lookup_canonical_oriented_identity(cache_key) {
-            let input_children = self.direct_parent_input_children(packed, base_symmetry);
-            self.backfill_direct_parent_identity(packed, base_symmetry, input_children, cached);
             return CanonicalNodeProbe {
                 node: cached,
                 fingerprint: cached.packed.fingerprint(),
@@ -152,8 +143,8 @@ impl HashLifeEngine {
     ) -> [CanonicalNodeProbe; N] {
         let mut canonical = [CanonicalNodeProbe {
             node: CanonicalNodeIdentity {
-                packed: PackedNodeKey::new(0, [0; 4]),
-                structural: CanonicalStructKey::new(0, [0; 4]),
+                packed: PackedNodeKey::new(0, [NodeId::ZERO; 4]),
+                structural: CanonicalStructKey::leaf(false),
                 symmetry: Symmetry::Identity,
             },
             fingerprint: 0,
@@ -173,7 +164,7 @@ impl HashLifeEngine {
                 canonical[lane] = CanonicalNodeProbe {
                     node: CanonicalNodeIdentity {
                         packed,
-                        structural: CanonicalStructKey::leaf(packed.children[0] != 0),
+                        structural: CanonicalStructKey::leaf(packed.children[0] != NodeId::ZERO),
                         symmetry: Symmetry::Identity,
                     },
                     fingerprint,
@@ -216,7 +207,7 @@ impl HashLifeEngine {
                     |engine| &engine.canonical_caches.node,
                     |engine| &mut engine.canonical_caches.node,
                     node,
-                    crate::flat_table::FlatKey::fingerprint(&node),
+                    ProbeKey::fingerprint(&node),
                     canonical[lane].node,
                 );
             }
@@ -233,7 +224,7 @@ impl HashLifeEngine {
 
     pub(super) fn materialize_packed_node_key_internal(&mut self, packed: PackedNodeKey) -> NodeId {
         if packed.level == 0 {
-            return if packed.children[0] == 0 {
+            return if packed.children[0] == NodeId::ZERO {
                 self.dead_leaf
             } else {
                 self.live_leaf

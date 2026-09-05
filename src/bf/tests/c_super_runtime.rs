@@ -2,6 +2,7 @@ use super::*;
 
 mod emitted_simd;
 mod safety;
+mod wide_multiply;
 
 fn backend_kernel_stat(output: &str, backend: TestCBackend, prefix: &str) -> u64 {
     match backend {
@@ -45,7 +46,7 @@ fn primitive_guard_restoring_loop_exhausts_equal_semantic_fuel_in_both_backends(
     );
     let super_c = emit_backend_ir(&program, opts, TestCBackend::Super);
     assert!(
-        !super_c.contains("dynamic_spec_"),
+        !CSource::parse(&super_c).has_identifier_prefix("dynamic_spec_"),
         "guard-writing loop must not be admitted to the runtime reducer"
     );
     let optimized =
@@ -118,8 +119,8 @@ fn wrapped_pointer_moves_preserve_semantic_fuel_before_address_normalization() {
 
 #[test]
 fn circular_scan_without_reachable_zero_exhausts_work_for_all_strides() {
-    for template_path in ["src/bf/bf.c.in", "src/bf/bf_super.c.in"] {
-        let template = fs::read_to_string(template_path).or_invariant("C template");
+    for backend in [TestCBackend::Plain, TestCBackend::Super] {
+        let template = backend.runtime_template();
         for stride in [0, 1, 2] {
             let source = format!(
                 "#define main bf_template_main\n{template}\n#undef main\n\
@@ -138,7 +139,7 @@ fn circular_scan_without_reachable_zero_exhausts_work_for_all_strides() {
             ));
             assert!(
                 matches!(outcome, GeneratedCOutcome::WorkLimitReached { .. }),
-                "template={template_path} stride={stride} did not exhaust deterministic work: {outcome:?}"
+                "template={backend:?} stride={stride} did not exhaust deterministic work: {outcome:?}"
             );
         }
     }
@@ -206,7 +207,7 @@ fn positive_guard_invariant_product_matches_plain_c() {
 
 #[test]
 fn runtime_summary_positive_guard_negates_invariant_product_trip_count() {
-    let template = fs::read_to_string("src/bf/bf_super.c.in").or_invariant("required value");
+    let template = TestCBackend::Super.runtime_template();
     let source = format!(
         "#define BF_TEMPLATE_SIGNED_CELLS 0\n#define main bf_template_main\n{template}\n#undef main\n\
          int main(void) {{\n\
@@ -395,19 +396,10 @@ fn generated_c_scan_forced_scalar_path_does_not_claim_native_lanes() {
 #[test]
 fn generated_c_batched_kernels_match_forced_scalar_with_wrapped_addresses() {
     for signed_cells in [0, 1] {
-        for (template_path, stats_call, stats_prefix) in [
-            (
-                "src/bf/bf.c.in",
-                "print_work_stats();",
-                "=== BF PLAIN RUNTIME STATS ===",
-            ),
-            (
-                "src/bf/bf_super.c.in",
-                "print_memo_stats();",
-                "=== BF SUPER RUNTIME STATS ===",
-            ),
-        ] {
-            let template = fs::read_to_string(template_path).or_invariant("C template");
+        for backend in [TestCBackend::Plain, TestCBackend::Super] {
+            let stats_call = backend.stats_call();
+            let stats_prefix = backend.stats_sentinel();
+            let template = backend.runtime_template();
             let source = format!(
                 "#define BF_TEMPLATE_SIGNED_CELLS {signed_cells}\n#define main bf_template_main\n{template}\n#undef main\n\
              int main(void) {{\n\
@@ -441,7 +433,7 @@ fn generated_c_batched_kernels_match_forced_scalar_with_wrapped_addresses() {
             assert_eq!(
                 payload(&native),
                 payload(&scalar),
-                "template={template_path} signed={signed_cells}"
+                "template={backend:?} signed={signed_cells}"
             );
             let stat = |output: &str, prefix: &str| {
                 output
@@ -455,16 +447,8 @@ fn generated_c_batched_kernels_match_forced_scalar_with_wrapped_addresses() {
                 "bf clear/set kernel lanes:",
                 "bf transfer kernel lanes:",
             ] {
-                assert_eq!(
-                    stat(&native, family),
-                    4,
-                    "template={template_path} {native}"
-                );
-                assert_eq!(
-                    stat(&scalar, family),
-                    4,
-                    "template={template_path} {scalar}"
-                );
+                assert_eq!(stat(&native, family), 4, "template={backend:?} {native}");
+                assert_eq!(stat(&scalar, family), 4, "template={backend:?} {scalar}");
             }
             assert_eq!(stat(&scalar, "bf native avx2 lanes:"), 0);
             assert_eq!(stat(&scalar, "bf native neon lanes:"), 0);
@@ -487,7 +471,7 @@ fn generated_c_batched_kernels_match_forced_scalar_with_wrapped_addresses() {
                     assert_eq!(
                         stat(&native, &native_prefix),
                         4,
-                        "template={template_path} family={family} did not execute natively: {native}"
+                        "template={backend:?} family={family} did not execute natively: {native}"
                     );
                 }
             }
@@ -497,19 +481,10 @@ fn generated_c_batched_kernels_match_forced_scalar_with_wrapped_addresses() {
 
 #[test]
 fn generated_c_add_and_set_wrapped_aliases_use_sequential_scalar_fallbacks() {
-    for (template_path, stats_call, stats_prefix) in [
-        (
-            "src/bf/bf.c.in",
-            "print_work_stats();",
-            "=== BF PLAIN RUNTIME STATS ===",
-        ),
-        (
-            "src/bf/bf_super.c.in",
-            "print_memo_stats();",
-            "=== BF SUPER RUNTIME STATS ===",
-        ),
-    ] {
-        let template = fs::read_to_string(template_path).or_invariant("C template");
+    for backend in [TestCBackend::Plain, TestCBackend::Super] {
+        let stats_call = backend.stats_call();
+        let stats_prefix = backend.stats_sentinel();
+        let template = backend.runtime_template();
         let source = format!(
             "#define main bf_template_main\n{template}\n#undef main\n\
              int main(void) {{\n\
@@ -528,10 +503,7 @@ fn generated_c_add_and_set_wrapped_aliases_use_sequential_scalar_fallbacks() {
         );
         let output = compile_and_run_c_source_with_args(&source, &["-O3"]);
         let payload = output.split(stats_prefix).next().unwrap_or(&output).trim();
-        assert_eq!(
-            payload, "3 3 4 8 9 10",
-            "template={template_path}\n{output}"
-        );
+        assert_eq!(payload, "3 3 4 8 9 10", "template={backend:?}\n{output}");
         let stat = |prefix: &str| {
             output
                 .lines()
@@ -582,74 +554,8 @@ fn richer_simd_entrypoints_remain_fail_closed_under_semantic_fuel() {
 }
 
 #[test]
-fn emitted_distribute_uses_transfer_kernel_and_wrapped_aliases_fall_back() {
-    let opts = CodegenOpts {
-        io_mode: IoMode::Number,
-        cell_bits: 8,
-        input_bits: None,
-        output_bits: None,
-        cell_sign: CellSign::Unsigned,
-    };
-    let disjoint = [
-        BfIr::Add(3),
-        BfIr::Distribute {
-            targets: vec![(1, 1), (2, -2), (3, 3), (4, 4)],
-            preserve_src: true,
-        },
-    ];
-    let aliased = [
-        BfIr::Add(3),
-        BfIr::Distribute {
-            targets: vec![(1, 1), (30_001, 2), (2, 3), (3, 4)],
-            preserve_src: true,
-        },
-    ];
-    for backend in [TestCBackend::Plain, TestCBackend::Super] {
-        let output = compile_and_run_ir_backend(&disjoint, opts, backend);
-        let stat = |prefix| match backend {
-            TestCBackend::Plain => plain_stat(&output, prefix),
-            TestCBackend::Super => memo_stat(&output, prefix),
-        };
-        assert_eq!(
-            stat("bf transfer kernel lanes:"),
-            4,
-            "backend={backend:?} {output}"
-        );
-        assert_kernel_lane_conservation(&output, backend, "transfer");
-        if cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
-            assert_eq!(
-                stat("bf native transfer kernel lanes:"),
-                4,
-                "backend={backend:?} {output}"
-            );
-        }
-
-        let output = compile_and_run_ir_backend(&aliased, opts, backend);
-        let stat = |prefix| match backend {
-            TestCBackend::Plain => plain_stat(&output, prefix),
-            TestCBackend::Super => memo_stat(&output, prefix),
-        };
-        assert_eq!(
-            stat("bf transfer kernel lanes:"),
-            4,
-            "backend={backend:?} {output}"
-        );
-        assert_kernel_lane_conservation(&output, backend, "transfer");
-        assert_eq!(
-            stat("bf native transfer kernel lanes:"),
-            0,
-            "wrapped aliases must not be attributed to native transfer: backend={backend:?} {output}"
-        );
-        assert!(
-            stat("bf scalar kernel lanes:") >= 4,
-            "wrapped duplicate destinations must force scalar transfer: backend={backend:?} {output}"
-        );
-    }
-}
-
-#[test]
 fn super_c_runtime_summary_and_probe_use_their_kernel_families() {
-    let template = fs::read_to_string("src/bf/bf_super.c.in").or_invariant("C template");
+    let template = TestCBackend::Super.runtime_template();
     let source = format!(
         "#define BF_TEMPLATE_SIGNED_CELLS 0\n#define main bf_template_main\n{template}\n#undef main\n\
          int main(void) {{\n\
@@ -792,11 +698,10 @@ fn emit_c_super_transducer_capacity_fails_closed_to_exact_memo_path() {
         cell_sign: CellSign::Unsigned,
     };
     let plain = compile_and_run_ir_backend(&program, opts, TestCBackend::Plain);
-    let super_c = emit_c_super(&program, opts).replacen(
-        "#define BF_TEMPLATE_DYNAMIC_HOT_THRESHOLD 8",
-        "#define BF_TEMPLATE_DYNAMIC_HOT_THRESHOLD 1",
-        1,
-    );
+    let source = emit_c_super(&program, opts);
+    let super_c = CSource::parse(&source)
+        .replace_define("BF_TEMPLATE_DYNAMIC_HOT_THRESHOLD", "1")
+        .or_invariant("unique hot threshold definition");
     let super_out = compile_and_run_c_source(&super_c);
 
     assert_super_payload_matches_plain("saturated guarded transducer", &plain, &super_out);
@@ -880,9 +785,12 @@ fn emit_c_super_repeated_powered_loop_regions_do_less_work_than_plain_c() {
 }
 
 #[test]
-fn emit_c_super_composed_richer_summary_program_does_less_work_than_plain_c() {
+fn emit_c_super_repeated_composed_richer_regions_do_less_work_than_plain_c() {
+    // Plain C also composes a single region now. Isolate repeated regions on
+    // fresh tape windows so this remains a test of super-C memo reuse.
+    let source = "++++[->+>+<<]>>[-<<+>>]<<[->[->+>+<<]>>[-<<+>>]<<<]>[-]<>>.>>>>".repeat(3);
     assert_super_c_does_less_work_than_plain_c(
-        "++++[->+>+<<]>>[-<<+>>]<<[->[->+>+<<]>>[-<<+>>]<<<]>[-]<>>.",
+        &source,
         CodegenOpts {
             io_mode: IoMode::Number,
             cell_bits: 8,

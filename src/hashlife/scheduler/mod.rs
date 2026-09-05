@@ -6,20 +6,20 @@ mod flush;
 
 pub(super) struct RecursiveSchedulerState<'a> {
     pub(super) discover: &'a mut Vec<DiscoveredJumpTask>,
-    pub(super) task_index: &'a mut FlatTable<CanonicalJumpKey, usize>,
+    pub(super) task_index: &'a mut ProbeTable<CanonicalJumpKey, usize>,
     pub(super) tasks: &'a mut Vec<Option<TaskRecord>>,
     pub(super) task_keys: &'a mut Vec<Option<CanonicalJumpKey>>,
-    pub(super) dependents: &'a mut FlatTable<CanonicalJumpKey, usize>,
+    pub(super) dependents: &'a mut ProbeTable<CanonicalJumpKey, usize>,
     pub(super) dependent_edges: &'a mut Vec<DependentEdge>,
     pub(super) ready: &'a mut Vec<usize>,
 }
 
 pub(super) struct Step0SchedulerState<'a> {
     pub(super) discover: &'a mut Vec<DiscoveredJumpTask>,
-    pub(super) task_index: &'a mut FlatTable<CanonicalJumpKey, usize>,
+    pub(super) task_index: &'a mut ProbeTable<CanonicalJumpKey, usize>,
     pub(super) tasks: &'a mut Vec<Option<Step0TaskRecord>>,
     pub(super) task_keys: &'a mut Vec<Option<CanonicalJumpKey>>,
-    pub(super) dependents: &'a mut FlatTable<CanonicalJumpKey, usize>,
+    pub(super) dependents: &'a mut ProbeTable<CanonicalJumpKey, usize>,
     pub(super) dependent_edges: &'a mut Vec<DependentEdge>,
     pub(super) ready: &'a mut Vec<usize>,
 }
@@ -72,11 +72,16 @@ mod tests {
         let mut engine = HashLifeEngine::default();
         engine.begin_allocation_transaction(u128::MAX);
         let mut table = engine
-            .try_transient_flat_table::<CanonicalJumpKey, usize>(8)
+            .try_transient_probe_table::<CanonicalJumpKey, usize>(8)
             .or_invariant("scheduler table should allocate");
-        for index in 0..11_u32 {
+        let table_capacity = table.capacity();
+        for index in 0..table_capacity {
+            let index = u32::try_from(index).or_invariant("test table capacity should fit u32");
             let key = CanonicalJumpKey {
-                structural: CanonicalStructKey::new(index + 2, [index; 4]),
+                structural: CanonicalStructKey::synthetic(
+                    index + 2,
+                    [CanonicalShapeId::from_raw(index); 4],
+                ),
                 step_exp: 0,
                 symmetry_admitted: false,
             };
@@ -90,8 +95,9 @@ mod tests {
         let retained = super::super::memory::wide_allocated_bytes(engine.allocated_bytes());
         engine.begin_allocation_transaction(retained);
         let before = table.len();
+        assert_eq!(before, table_capacity, "fixture must fill the table");
         let key = CanonicalJumpKey {
-            structural: CanonicalStructKey::new(99, [99; 4]),
+            structural: CanonicalStructKey::synthetic(99, [CanonicalShapeId::from_raw(99); 4]),
             step_exp: 0,
             symmetry_admitted: false,
         };

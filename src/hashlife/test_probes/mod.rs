@@ -1,6 +1,6 @@
 use crate::RequiredExt;
 use crate::bitgrid::{BitGrid, Coord};
-use crate::flat_table::FlatKey;
+use crate::probe_table::ProbeKey;
 use crate::symmetry::D4Symmetry as Symmetry;
 
 use super::{

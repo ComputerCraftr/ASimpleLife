@@ -1,7 +1,6 @@
 use crate::RequiredExt;
-use crate::classify::Classification;
 use crate::memo::Memo;
-use crate::normalize::{NormalizedGridSignature, normalize};
+use crate::normalize::normalize;
 
 use super::{
     ChunkNeighborhood, GameOfLife, build_neighborhood, evolve_center_chunk_bitwise,
@@ -56,32 +55,6 @@ fn neighborhood_from_cells(cells: &[(usize, usize)]) -> ChunkNeighborhood {
         chunks[chunk_y * 3 + chunk_x] |= 1_u64 << bit;
     }
     ChunkNeighborhood(chunks)
-}
-
-#[test]
-fn memo_transition_collection_preserves_classification_cache() {
-    let mut memo = Memo::default();
-    let signature = NormalizedGridSignature {
-        width: 1,
-        height: 1,
-        cells: vec![(0, 0)],
-    };
-    let classification = Classification::Repeats {
-        period: 1,
-        first_seen: 0,
-    };
-    memo.insert_classification(signature.clone(), classification.clone());
-
-    let neighborhood = neighborhood_from_cells(&[(0, 0), (9, 9), (17, 17)]);
-    let next = evolve_center_chunk_bitwise(&neighborhood);
-    memo.insert_chunk_transition(neighborhood, next);
-    assert_eq!(memo.chunk_transition_cache_len(), 1);
-
-    memo.force_collect_transition_caches();
-
-    assert_eq!(memo.chunk_transition_cache_len(), 0);
-    assert_eq!(memo.chunk_canonicalization_cache_len(), 0);
-    assert_eq!(memo.get_classification(&signature), Some(classification));
 }
 
 #[test]

@@ -1,0 +1,88 @@
+static void bf_polynomial_mul_scalar(const int64_t *lhs, const int64_t *rhs,
+                                     int64_t *out, size_t count, unsigned bits,
+                                     int signed_cells) {
+    bf_count_family(BF_KERNEL_FAMILY_POLYNOMIAL, (uint64_t)count,
+                    count == 0 ? 0 : 1);
+    bf_count_scalar_family(BF_KERNEL_FAMILY_POLYNOMIAL, (uint64_t)count);
+    bf_scalar_kernel_lanes += (uint64_t)count;
+    for (size_t i = 0; i < count; ++i)
+        out[i] = bf_polynomial_wrap_mul(lhs[i], rhs[i], bits, signed_cells);
+}
+
+#if BF_HAS_AVX2_KERNEL && !defined(BF_FORCE_SCALAR_KERNEL)
+/* Keep vector values inside the AVX2 caller even at -O0: MinGW's out-of-line
+ * by-value vector temporaries can violate their required stack alignment. */
+__attribute__((target("avx2"), always_inline))
+static inline __m256i bf_mullo_u64_avx2(__m256i lhs, __m256i rhs) {
+    __m256i lhs_hi = _mm256_srli_epi64(lhs, 32);
+    __m256i rhs_hi = _mm256_srli_epi64(rhs, 32);
+    __m256i low = _mm256_mul_epu32(lhs, rhs);
+    __m256i cross = _mm256_add_epi64(_mm256_mul_epu32(lhs, rhs_hi),
+                                     _mm256_mul_epu32(lhs_hi, rhs));
+    return _mm256_add_epi64(low, _mm256_slli_epi64(cross, 32));
+}
+
+__attribute__((target("avx2")))
+static void bf_polynomial_mul_avx2(const int64_t *lhs, const int64_t *rhs,
+                                   int64_t *out, size_t count, unsigned bits,
+                                   int signed_cells) {
+    size_t i = 0;
+    const __m256i mask = _mm256_set1_epi64x((int64_t)bf_bits_mask(bits));
+    const __m256i sign = _mm256_set1_epi64x(
+        bits == 0 ? 0 : (int64_t)(UINT64_C(1) << (bits - 1U)));
+    for (; i + 4 <= count; i += 4) {
+        __m256i raw = bf_mullo_u64_avx2(
+            _mm256_loadu_si256((const __m256i *)&lhs[i]),
+            _mm256_loadu_si256((const __m256i *)&rhs[i]));
+        raw = _mm256_and_si256(raw, mask);
+        if (signed_cells && bits != 0U)
+            raw = _mm256_sub_epi64(_mm256_xor_si256(raw, sign), sign);
+        _mm256_storeu_si256((__m256i *)&out[i], raw);
+        bf_native_avx2_lanes += 4;
+        bf_kernel_batches++;
+        bf_count_family(BF_KERNEL_FAMILY_POLYNOMIAL, 4, 1);
+        bf_count_native_family(BF_KERNEL_FAMILY_POLYNOMIAL, 4);
+    }
+    if (i != count)
+        bf_polynomial_mul_scalar(&lhs[i], &rhs[i], &out[i], count - i, bits,
+                                 signed_cells);
+}
+#endif
+
+#if BF_HAS_NEON_KERNEL && !defined(BF_FORCE_SCALAR_KERNEL)
+static uint64x2_t bf_mullo_u64_neon(uint64x2_t lhs, uint64x2_t rhs) {
+    uint32x2_t lhs_lo = vmovn_u64(lhs);
+    uint32x2_t rhs_lo = vmovn_u64(rhs);
+    uint32x2_t lhs_hi = vmovn_u64(vshrq_n_u64(lhs, 32));
+    uint32x2_t rhs_hi = vmovn_u64(vshrq_n_u64(rhs, 32));
+    uint64x2_t low = vmull_u32(lhs_lo, rhs_lo);
+    uint64x2_t cross = vaddq_u64(vmull_u32(lhs_lo, rhs_hi),
+                                 vmull_u32(lhs_hi, rhs_lo));
+    return vaddq_u64(low, vshlq_n_u64(cross, 32));
+}
+
+static void bf_polynomial_mul_neon(const int64_t *lhs, const int64_t *rhs,
+                                   int64_t *out, size_t count, unsigned bits,
+                                   int signed_cells) {
+    size_t i = 0;
+    const uint64x2_t mask = vdupq_n_u64(bf_bits_mask(bits));
+    const uint64x2_t sign =
+        vdupq_n_u64(bits == 0 ? 0 : UINT64_C(1) << (bits - 1U));
+    for (; i + 2 <= count; i += 2) {
+        uint64x2_t raw = bf_mullo_u64_neon(
+            vreinterpretq_u64_s64(vld1q_s64(&lhs[i])),
+            vreinterpretq_u64_s64(vld1q_s64(&rhs[i])));
+        raw = vandq_u64(raw, mask);
+        if (signed_cells && bits != 0U)
+            raw = vsubq_u64(veorq_u64(raw, sign), sign);
+        vst1q_s64(&out[i], vreinterpretq_s64_u64(raw));
+        bf_native_neon_lanes += 2;
+        bf_kernel_batches++;
+        bf_count_family(BF_KERNEL_FAMILY_POLYNOMIAL, 2, 1);
+        bf_count_native_family(BF_KERNEL_FAMILY_POLYNOMIAL, 2);
+    }
+    if (i != count)
+        bf_polynomial_mul_scalar(&lhs[i], &rhs[i], &out[i], count - i, bits,
+                                 signed_cells);
+}
+#endif

@@ -1,7 +1,7 @@
 use super::*;
 use crate::bf::{AssetRegistry, LifeAssetError};
 use crate::bitgrid::BitGrid;
-use crate::test_support::{RustRepository, RustSource};
+use crate::test_support::RustRepository;
 use std::path::Path;
 
 fn source_repository() -> RustRepository {
@@ -9,14 +9,19 @@ fn source_repository() -> RustRepository {
         .or_invariant("parsed repository Rust sources")
 }
 
-fn assert_release_compiler_is_independent_from_scaffold(syntax: &RustSource) {
+fn assert_release_compiler_is_independent_from_scaffold(repository: &RustRepository) {
+    let scaffold = repository
+        .source_containing_callable("compile_life_scaffold")
+        .or_invariant("unique scaffold declaration");
     assert!(
-        syntax
-            .function_has_cfg_flag("compile_life_scaffold", "test")
+        scaffold
+            .function_is_test_only("compile_life_scaffold")
             .or_invariant("test Life scaffold declaration"),
         "the reference scaffold must remain explicitly test-only"
     );
-    let references = syntax
+    let references = repository
+        .source_containing_callable("compile_to_life_circuit")
+        .or_invariant("unique release compiler declaration")
         .function_path_references("compile_to_life_circuit")
         .or_invariant("release Life compiler declaration");
     assert!(
@@ -189,18 +194,15 @@ fn immutable_compiled_life_program_serialization_uses_only_life_cells() {
 #[test]
 fn life_release_readiness_cannot_be_inferred_from_test_scaffold() {
     let repository = source_repository();
-    let backend = repository
-        .source_containing_callable("compile_to_life_circuit")
-        .or_invariant("unique release Life compiler source");
-    assert_release_compiler_is_independent_from_scaffold(backend);
+    assert_release_compiler_is_independent_from_scaffold(&repository);
 }
 
 #[test]
 fn life_cli_routes_emission_through_the_public_compiler() {
     let repository = source_repository();
     let cli = repository
-        .source_containing_callable("run")
-        .or_invariant("unique BF CLI source");
+        .source_containing_function_reference("run", "compile_to_life_circuit")
+        .or_invariant("unique CLI run function calling the public Life compiler");
     let run_references = cli
         .function_path_references("run")
         .or_invariant("BF CLI run function");
@@ -222,8 +224,8 @@ fn life_cli_routes_emission_through_the_public_compiler() {
 fn compiled_life_artifact_contains_no_host_runtime_state() {
     let repository = source_repository();
     let backend = repository
-        .source_containing_callable("compile_to_life_circuit")
-        .or_invariant("unique release Life compiler source");
+        .source_containing_struct("CompiledLifeProgram")
+        .or_invariant("unique compiled Life artifact declaration");
     let artifact_fields = backend
         .struct_field_names("CompiledLifeProgram")
         .or_invariant("CompiledLifeProgram field declaration");

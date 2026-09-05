@@ -1,12 +1,11 @@
 use super::arena::NodeColumns;
-use super::{HashLifeEngine, NodeId};
+use super::cache_lifecycle::CacheStorageLifecycle;
+use super::{CanonicalNodeRef, HashLifeEngine, NodeId};
 use crate::RequiredExt;
 use crate::cache_policy::{
     HASHLIFE_GC_MIN_NODES, HASHLIFE_GC_MIN_RECLAIM, HASHLIFE_TRANSIENT_CACHE_GROWTH_TRIGGER,
     hashlife_gc_reason,
 };
-
-const HASHLIFE_MAX_RETAINED_ROOTS: usize = 1;
 
 impl HashLifeEngine {
     fn dynamic_total_hot_budget(&self) -> usize {
@@ -98,10 +97,10 @@ impl HashLifeEngine {
             + self.result_caches.structural_fast_path.len()
             + self.result_caches.packed_structural_fast_path.len()
             + self.transform_state.canonical_cache.len()
-            + self.transform_state.compare_cache.len()
             + self.transform_state.intern.len()
             + self.result_caches.materialized_packed.len()
             + self.embed_layout_cache.len()
+            + self.future_state.result_len()
     }
 
     pub(super) fn transient_cache_pressure_entries(&self) -> usize {
@@ -117,16 +116,19 @@ impl HashLifeEngine {
             + self.result_caches.structural_fast_path.len()
             + self.result_caches.packed_structural_fast_path.len()
             + self.transform_state.canonical_cache.len()
-            + self.transform_state.compare_cache.len()
             + self.transform_state.intern.len()
             + self.result_caches.materialized_packed.len()
             + self.embed_layout_cache.len()
+            + self.future_state.result_len()
     }
 
     pub(super) fn initialize_runtime_state(&mut self) {
         let dead_shape = self.intern_canonical_shape(super::CanonicalStructKey::leaf(false));
         let live_shape = self.intern_canonical_shape(super::CanonicalStructKey::leaf(true));
-        debug_assert_eq!((dead_shape, live_shape), (0, 1));
+        debug_assert_eq!(
+            (dead_shape, live_shape),
+            (CanonicalNodeRef::DEAD, CanonicalNodeRef::LIVE)
+        );
         self.dead_leaf = self.intern_leaf(false);
         self.live_leaf = self.intern_leaf(true);
         self.empty_by_level.push(self.dead_leaf);
@@ -135,54 +137,25 @@ impl HashLifeEngine {
 
     pub(super) fn clear_transient_state(&mut self, preserve_hot_canonical: bool) {
         self.rebalance_hot_canonical_budgets();
-        self.result_caches.jump.reset();
-        self.result_caches.root.reset();
-        self.result_caches.overlap.reset();
-        #[cfg(test)]
-        {
-            self.transform_state.cache = crate::flat_table::FlatTable::with_capacity(64);
-        }
-        self.result_caches.oriented.reset();
-        self.result_caches.materialized_packed.reset();
-        self.result_caches.shells.reset();
+        self.result_caches
+            .apply_lifecycle(CacheStorageLifecycle::RetainCapacity);
         self.embed_layout_cache.clear();
-        self.reset_packed_transform_state();
-        self.canonical_caches.node.reset();
-        self.canonical_caches.packed.reset();
-        self.canonical_caches.oriented.reset();
-        self.canonical_caches.direct_parent.reset();
-        self.canonical_caches.symmetry_refs.reset();
-        if !preserve_hot_canonical {
-            self.canonical_caches.hot_packed.reset();
-            self.canonical_caches.hot_oriented.reset();
-            self.canonical_caches.hot_direct_parent.reset();
-        }
-        self.result_caches.structural_fast_path.reset();
-        self.result_caches.packed_structural_fast_path.reset();
+        self.clear_packed_transform_state();
+        self.canonical_caches.apply_lifecycle(
+            CacheStorageLifecycle::RetainCapacity,
+            preserve_hot_canonical,
+        );
+        self.clear_future_results();
     }
 
-    fn release_optional_cache_storage(&mut self) {
-        self.result_caches.jump.release_storage();
-        self.result_caches.root.release_storage();
-        self.result_caches.overlap.release_storage();
-        self.result_caches.oriented.release_storage();
-        self.result_caches.materialized_packed.release_storage();
-        self.result_caches.structural_fast_path.release_storage();
+    pub(super) fn release_optional_cache_storage(&mut self) {
         self.result_caches
-            .packed_structural_fast_path
-            .release_storage();
-        self.result_caches.shells.release_storage();
-        self.result_caches.bounds.release_storage();
-        self.canonical_caches.node.release_storage();
-        self.canonical_caches.packed.release_storage();
-        self.canonical_caches.hot_packed.release_storage();
-        self.canonical_caches.oriented.release_storage();
-        self.canonical_caches.hot_oriented.release_storage();
-        self.canonical_caches.direct_parent.release_storage();
-        self.canonical_caches.hot_direct_parent.release_storage();
-        self.canonical_caches.symmetry_refs.release_storage();
+            .apply_lifecycle(CacheStorageLifecycle::ReleaseStorage);
+        self.canonical_caches
+            .apply_lifecycle(CacheStorageLifecycle::ReleaseStorage, false);
         self.embed_layout_cache = std::collections::HashMap::new();
         self.release_packed_transform_state();
+        self.release_future_state();
     }
 
     pub(super) fn gc_reason(
@@ -228,9 +201,12 @@ impl HashLifeEngine {
         self.stats.gc.nodes_before_mark = self.node_count();
         self.stats.gc.nodes_after_mark = live_nodes;
         let reclaimable = self.node_count().saturating_sub(live_nodes);
-        let should_compact = self.node_count() >= HASHLIFE_GC_MIN_NODES
+        let ordinary_compaction = self.node_count() >= HASHLIFE_GC_MIN_NODES
             && reclaimable >= HASHLIFE_GC_MIN_RECLAIM
             && reclaimable * 4 >= self.node_count();
+        let pressure_compaction = reason == "budget_pressure"
+            && (reclaimable != 0 || self.canonical_caches.shapes.len() > live_nodes);
+        let should_compact = ordinary_compaction || pressure_compaction;
 
         if should_compact && self.can_repack_mandatory_indexes(live_nodes) {
             self.stats.gc.gc_reason = "compacted";
@@ -238,7 +214,6 @@ impl HashLifeEngine {
             self.compact_marked_nodes();
             self.stats.gc.nodes_after_compact = self.node_count();
             self.last_gc_nodes = self.node_count();
-            self.clear_transient_state(true);
         } else {
             self.stats.gc.gc_reason = if reason == "root_changed" {
                 "root_changed_mark_only"
@@ -249,7 +224,7 @@ impl HashLifeEngine {
             self.stats.gc.nodes_after_compact = self.node_count();
             self.last_gc_nodes = self.node_count();
             self.filter_caches_to_live_nodes();
-            self.reset_packed_transform_state();
+            self.clear_packed_transform_state();
         }
         let release_threshold = hard_memory_bytes.saturating_sub(hard_memory_bytes / 5);
         if super::memory::wide_allocated_bytes(self.allocated_bytes()) >= release_threshold {
@@ -259,14 +234,16 @@ impl HashLifeEngine {
 
     fn can_repack_mandatory_indexes(&self, live_nodes: usize) -> bool {
         self.at_gc_safepoint()
+            && !self.allocation_failed()
             && self.intern.can_rebuild_without_allocation(live_nodes)
             && self
                 .canonical_caches
                 .shape_intern
                 .can_rebuild_without_allocation(live_nodes)
+            && self.canonical_caches.shapes.capacity() >= live_nodes
     }
 
-    fn filter_caches_to_live_nodes(&mut self) {
+    pub(in crate::hashlife) fn filter_caches_to_live_nodes(&mut self) {
         let columns = &self.node_columns;
         self.intern.retain_for_gc(|key, node| {
             node_is_live(node, columns) && packed_node_is_live(key, columns)
@@ -326,9 +303,10 @@ impl HashLifeEngine {
         self.canonical_caches
             .hot_direct_parent
             .retain(|_, identity| packed_node_is_live(identity.packed, columns));
-        self.canonical_caches
-            .symmetry_refs
-            .retain(|key, _| node_is_live(key.node, columns));
+        // Orientation records never root shapes. Active filtering retains owned
+        // capacity; the separate hard-pressure path releases their backing store.
+        self.canonical_caches.symmetry_refs.reset();
+        self.filter_future_results_to_live_nodes();
     }
 
     pub(super) fn mark_live_nodes(&mut self) -> usize {
@@ -355,7 +333,10 @@ impl HashLifeEngine {
                 continue;
             }
             for child in self.node_columns.quadrants(node) {
-                debug_assert!(child < node, "HashLife child must precede parent during GC");
+                debug_assert!(
+                    child.precedes(node),
+                    "HashLife child must precede parent during GC"
+                );
                 self.node_columns.mark(child);
             }
         }
@@ -364,13 +345,11 @@ impl HashLifeEngine {
     }
 
     pub(super) fn record_retained_root(&mut self, root: NodeId) {
-        if self.retained_roots.last().copied() == Some(root) {
-            return;
-        }
-        self.retained_roots.push(root);
-        if self.retained_roots.len() > HASHLIFE_MAX_RETAINED_ROOTS {
-            let excess = self.retained_roots.len() - HASHLIFE_MAX_RETAINED_ROOTS;
-            self.retained_roots.drain(0..excess);
+        if let Some(retained) = self.retained_roots.first_mut() {
+            *retained = root;
+        } else {
+            // One slot is reserved with the engine; root publication cannot grow it.
+            self.retained_roots.push(root);
         }
     }
 
@@ -385,6 +364,9 @@ impl HashLifeEngine {
             self.can_repack_mandatory_indexes(live_nodes),
             "mandatory HashLife indexes must be prevalidated before arena repacking"
         );
+        // Future results contain weak arena IDs. Discard the registry and all
+        // dependent caches before any ID is rewritten.
+        self.prepare_future_for_shape_rebuild();
         self.node_columns.clear_remap();
         let mut live = 0_usize;
         let mut old_idx = 0_usize;
@@ -418,7 +400,7 @@ impl HashLifeEngine {
                         self.node_columns
                             .quadrants(remapped_node)
                             .into_iter()
-                            .all(|child| child < remapped_node),
+                            .all(|child| child.precedes(remapped_node)),
                         "stable arena packing must preserve child-before-parent topology"
                     );
                     self.node_columns.set_fingerprint(
@@ -493,34 +475,23 @@ impl HashLifeEngine {
     /// Mandatory structural indexes are rebuilt above from compacted node semantics;
     /// all acceleration state is complete-or-discarded.
     fn discard_epoch_bound_state(&mut self) {
-        self.result_caches.jump.reset();
-        self.result_caches.root.reset();
-        self.result_caches.overlap.reset();
-        self.result_caches.oriented.reset();
-        self.result_caches.materialized_packed.reset();
-        self.result_caches.structural_fast_path.reset();
-        self.result_caches.packed_structural_fast_path.reset();
-        self.result_caches.shells.reset();
-        self.result_caches.bounds.reset();
-
-        self.canonical_caches.node.reset();
-        self.canonical_caches.packed.reset();
-        self.canonical_caches.hot_packed.reset();
-        self.canonical_caches.oriented.reset();
-        self.canonical_caches.hot_oriented.reset();
-        self.canonical_caches.direct_parent.reset();
-        self.canonical_caches.hot_direct_parent.reset();
-        self.canonical_caches.symmetry_refs.reset();
+        self.result_caches
+            .apply_lifecycle(CacheStorageLifecycle::RetainCapacity);
+        self.canonical_caches
+            .apply_lifecycle(CacheStorageLifecycle::RetainCapacity, false);
         self.embed_layout_cache.clear();
-        self.reset_packed_transform_state();
+        self.clear_packed_transform_state();
     }
 }
 
 fn node_is_live(node: NodeId, columns: &NodeColumns) -> bool {
-    columns.is_marked(node as usize)
+    columns.is_marked(node.index())
 }
 
-fn packed_node_is_live(node: super::PackedNodeKey, columns: &NodeColumns) -> bool {
+pub(super) fn packed_node_is_live_for_cache(
+    node: super::PackedNodeKey,
+    columns: &NodeColumns,
+) -> bool {
     node.level == 0
         || node
             .children
@@ -528,10 +499,109 @@ fn packed_node_is_live(node: super::PackedNodeKey, columns: &NodeColumns) -> boo
             .all(|child| node_is_live(child, columns))
 }
 
+fn packed_node_is_live(node: super::PackedNodeKey, columns: &NodeColumns) -> bool {
+    packed_node_is_live_for_cache(node, columns)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hashlife::PopulationStat;
+
+    #[test]
+    fn pressure_repack_is_allocation_free_and_preserves_structural_uniqueness() {
+        let mut engine = HashLifeEngine::default();
+        let d = engine.dead_leaf;
+        let l = engine.live_leaf;
+        engine.join(d, l, d, l); // Unreachable structure below normal GC thresholds.
+        let retained = engine.join(l, l, d, l);
+        engine.record_retained_root(retained);
+        let children = [CanonicalNodeRef::LIVE; 4];
+        let shape = engine.canonical_parent_key(1, children);
+        engine.intern_canonical_shape(shape); // Shape-only historical identity.
+        engine.release_packed_transform_state();
+        let bytes = engine.allocated_bytes();
+        let epoch = engine.arena_epoch;
+        engine.allocation_hard_limit = bytes as u128;
+
+        engine.maybe_garbage_collect_with_budget("budget_pressure", bytes as u128);
+
+        assert_eq!(
+            engine.arena_epoch,
+            epoch + 1,
+            "small dead DAG was stranded by size thresholds"
+        );
+        assert!(
+            engine.allocated_bytes() <= bytes,
+            "repacking allocated new storage"
+        );
+        assert!(
+            engine.transform_state.nodes.is_empty(),
+            "GC eagerly recreated transform leaves"
+        );
+        assert_eq!(engine.take_allocation_failure(), None);
+        assert_eq!(engine.node_count(), 3);
+        assert_eq!(
+            engine.canonical_caches.shapes.len(),
+            3,
+            "historical shapes survived epoch rebuild"
+        );
+        let root = engine.retained_roots[0];
+        let children = engine.node_columns.quadrants(root);
+        let identity = engine.node_columns.identity_ref(root);
+        for _ in 0..8 {
+            assert_eq!(
+                engine.join(children[0], children[1], children[2], children[3]),
+                root,
+                "exact structure received a duplicate node after index rebuild"
+            );
+            let key = engine.canonical_parent_key(
+                1,
+                children.map(|child| engine.node_columns.identity_ref(child)),
+            );
+            assert_eq!(
+                engine.intern_canonical_shape(key),
+                identity,
+                "exact structure received a duplicate canonical identity after rebuild"
+            );
+        }
+        assert_eq!(engine.node_count(), 3);
+        assert_eq!(engine.canonical_caches.shapes.len(), 3);
+    }
+
+    #[test]
+    fn root_publication_and_transient_cleanup_do_not_allocate() {
+        let mut engine = HashLifeEngine::default();
+        let capacity = engine.retained_roots.capacity();
+        for root in [engine.live_leaf, engine.dead_leaf, engine.live_leaf] {
+            engine.record_retained_root(root);
+            assert_eq!(engine.retained_roots.as_slice(), &[root]);
+            assert_eq!(
+                engine.retained_roots.capacity(),
+                capacity,
+                "root replacement grew storage"
+            );
+        }
+        engine.result_caches.bounds.insert(
+            engine.live_leaf,
+            super::super::RelativeBounds {
+                min_x: 0,
+                min_y: 0,
+                max_x: 0,
+                max_y: 0,
+            },
+        );
+        engine.release_packed_transform_state();
+        let bytes = engine.allocated_bytes();
+        engine.clear_transient_state(false);
+        assert_eq!(engine.result_caches.bounds.len(), 0);
+        assert_eq!(
+            engine.allocated_bytes(),
+            bytes,
+            "cleanup seeded transform storage"
+        );
+        assert!(engine.transform_state.nodes.is_empty());
+    }
 
     #[test]
     fn shell_and_bounds_entries_contribute_to_gc_pressure() {
@@ -597,9 +667,16 @@ mod tests {
         for _ in 0..super::super::arena::NODE_SEGMENT_LEN {
             engine
                 .node_columns
-                .try_reserve_node()
+                .try_reserve_nodes(1)
                 .or_invariant("test arena segment allocation failed");
-            engine.push_node(0, PopulationStat::exact(0), 0, 0, 0, 0);
+            engine.push_node(
+                0,
+                PopulationStat::exact(0),
+                NodeId::ZERO,
+                NodeId::ZERO,
+                NodeId::ZERO,
+                NodeId::ZERO,
+            );
         }
         engine.record_retained_root(engine.dead_leaf);
         engine.canonical_caches.shape_intern.release_storage();
@@ -619,9 +696,16 @@ mod tests {
         for _ in 0..super::super::arena::NODE_SEGMENT_LEN * 4 {
             engine
                 .node_columns
-                .try_reserve_node()
+                .try_reserve_nodes(1)
                 .or_invariant("test arena segment allocation failed");
-            engine.push_node(0, PopulationStat::exact(0), 0, 0, 0, 0);
+            engine.push_node(
+                0,
+                PopulationStat::exact(0),
+                NodeId::ZERO,
+                NodeId::ZERO,
+                NodeId::ZERO,
+                NodeId::ZERO,
+            );
         }
         let capacity_before = engine.node_columns.capacity();
         let segments_before = engine.node_columns.segment_count();
@@ -659,7 +743,7 @@ mod tests {
             engine.dead_leaf,
         );
         assert!(
-            resumed > engine.live_leaf,
+            engine.live_leaf.precedes(resumed),
             "mandatory interning did not resume from reclaimed segment capacity"
         );
         for parent in 0..engine.node_count() {
@@ -670,8 +754,8 @@ mod tests {
                         .node_columns
                         .quadrants(parent)
                         .into_iter()
-                        .all(|child| child < parent),
-                    "repacked parent {parent} violates child-before-parent topology"
+                        .all(|child| child.precedes(parent)),
+                    "repacked parent {parent:?} violates child-before-parent topology"
                 );
             }
         }
@@ -767,10 +851,10 @@ mod tests {
             bytes_after < bytes_before,
             "hard-pressure release retained transform capacity: before={bytes_before} after={bytes_after}"
         );
-        let leaf = super::super::PackedNodeKey::new(0, [0; 4]);
+        let leaf = super::super::PackedNodeKey::new(0, [super::super::NodeId::ZERO; 4]);
         assert_eq!(
             engine.transform_packed_node_key(leaf, crate::symmetry::D4Symmetry::Identity),
-            0,
+            super::super::PackedTransformId::ZERO,
             "released transform state did not reinitialize its canonical leaves"
         );
     }

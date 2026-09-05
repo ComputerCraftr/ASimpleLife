@@ -4,7 +4,7 @@ pub(super) fn notify_dependents(
     engine: &mut HashLifeEngine,
     key: &CanonicalJumpKey,
     tasks: &mut [Option<TaskRecord>],
-    dependents: &mut FlatTable<CanonicalJumpKey, usize>,
+    dependents: &mut ProbeTable<CanonicalJumpKey, usize>,
     dependent_edges: &[DependentEdge],
     ready: &mut Vec<usize>,
 ) {
@@ -29,7 +29,7 @@ pub(super) fn notify_step0_dependents(
     engine: &mut HashLifeEngine,
     key: CanonicalJumpKey,
     tasks: &mut [Option<Step0TaskRecord>],
-    dependents: &mut FlatTable<CanonicalJumpKey, usize>,
+    dependents: &mut ProbeTable<CanonicalJumpKey, usize>,
     dependent_edges: &[DependentEdge],
     ready: &mut Vec<usize>,
 ) {
@@ -52,7 +52,7 @@ pub(super) fn notify_step0_dependents(
 
 pub(super) fn push_dependent(
     engine: &mut HashLifeEngine,
-    dependents: &mut FlatTable<CanonicalJumpKey, usize>,
+    dependents: &mut ProbeTable<CanonicalJumpKey, usize>,
     dependent_edges: &mut Vec<DependentEdge>,
     key: CanonicalJumpKey,
     task_id: usize,

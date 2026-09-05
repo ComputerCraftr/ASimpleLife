@@ -29,6 +29,9 @@ pub struct HashLifeExecutionStats {
     pub native_d4_candidate_lanes: usize,
     pub native_d4_prefix_compare_lanes: usize,
     pub native_d4_exact_winner_lanes: usize,
+    pub swar_control_groups: usize,
+    pub native_avx2_control_groups: usize,
+    pub native_neon_control_groups: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +51,12 @@ impl Default for HashLifeLimits {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HashLifeAdvanceError {
+    Cancelled {
+        starting_generation: u64,
+        requested_delta: u64,
+        completed_generations: u64,
+        reached_generation: u64,
+    },
     NotLoaded {
         starting_generation: u64,
         requested_delta: u64,
@@ -100,6 +109,10 @@ pub enum HashLifeAdvanceError {
 impl HashLifeAdvanceError {
     pub const fn completed_generations(self) -> u64 {
         match self {
+            Self::Cancelled {
+                completed_generations,
+                ..
+            } => completed_generations,
             Self::NotLoaded {
                 completed_generations,
                 ..
@@ -133,6 +146,9 @@ impl HashLifeAdvanceError {
 
     pub const fn reached_generation(self) -> u64 {
         match self {
+            Self::Cancelled {
+                reached_generation, ..
+            } => reached_generation,
             Self::NotLoaded {
                 reached_generation, ..
             }
@@ -160,6 +176,7 @@ impl HashLifeAdvanceError {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HashLifeConversionError {
+    Cancelled,
     MemoryBudgetExceeded {
         retained_bytes: u128,
         candidate_bytes: u128,

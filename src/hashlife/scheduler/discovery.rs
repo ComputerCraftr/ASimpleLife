@@ -85,13 +85,33 @@ impl HashLifeEngine {
         root_node: NodeId,
         root_step_exp: u32,
     ) -> NodeId {
+        self.with_transient_allocation_scope(|engine| {
+            engine.advance_power_of_two_recursive_in_scope(root_node, root_step_exp)
+        })
+    }
+
+    fn advance_power_of_two_recursive_in_scope(
+        &mut self,
+        root_node: NodeId,
+        root_step_exp: u32,
+    ) -> NodeId {
+        let root_key = (root_node, root_step_exp);
+        if let Some(result) = self.cached_jump_result(root_key) {
+            if self.poll_advance_cancellation() {
+                return self.dead_leaf;
+            }
+            return result;
+        }
+        if self.poll_advance_cancellation() {
+            return self.dead_leaf;
+        }
         let level = self.node_columns.level(root_node) as usize;
         let task_capacity = 1usize << level.saturating_sub(root_step_exp as usize + 1).min(10);
         let Some(mut discover) = self.try_transient_vec(task_capacity.max(8)) else {
             return self.dead_leaf;
         };
         let root_jump_probe = self.canonical_jump_probe((root_node, root_step_exp));
-        if self.allocation_failure.is_some() {
+        if self.poll_advance_cancellation() {
             return self.dead_leaf;
         }
         discover.push(DiscoveredJumpTask {
@@ -99,7 +119,7 @@ impl HashLifeEngine {
             source_node: root_node,
             canonical_packed: root_jump_probe.node.packed,
         });
-        let Some(mut task_index) = self.try_transient_flat_table(task_capacity) else {
+        let Some(mut task_index) = self.try_transient_probe_table(task_capacity) else {
             return self.dead_leaf;
         };
         let Some(mut tasks) = self.try_transient_vec::<Option<TaskRecord>>(task_capacity) else {
@@ -109,7 +129,7 @@ impl HashLifeEngine {
         else {
             return self.dead_leaf;
         };
-        let Some(mut dependents) = self.try_transient_flat_table(task_capacity) else {
+        let Some(mut dependents) = self.try_transient_probe_table(task_capacity) else {
             return self.dead_leaf;
         };
         let Some(mut dependent_edges) =
@@ -122,8 +142,8 @@ impl HashLifeEngine {
         };
         let mut batch = [DiscoveredJumpTask {
             key: CanonicalJumpKey::empty(),
-            source_node: 0,
-            canonical_packed: PackedNodeKey::new(0, [0; 4]),
+            source_node: NodeId::ZERO,
+            canonical_packed: PackedNodeKey::new(0, [NodeId::ZERO; 4]),
         }; DISCOVER_BATCH];
         let mut batch_keys = [CanonicalJumpKey::empty(); DISCOVER_BATCH];
         let Some(mut phase_one_candidates) =
@@ -140,13 +160,13 @@ impl HashLifeEngine {
             task_id: 0,
             key: CanonicalJumpKey::empty(),
             next_exp: 0,
-            inputs: [0; 9],
+            inputs: [NodeId::ZERO; 9],
         }; SIMD_BATCH_LANES];
         let mut phase1_pending = 0usize;
         let mut phase2_ready = [Phase2ReadyLane {
             key: CanonicalJumpKey::empty(),
             next_exp: 0,
-            inputs: [0; 4],
+            inputs: [NodeId::ZERO; 4],
         }; SIMD_BATCH_LANES];
         let mut phase2_pending = 0usize;
         let Some(mut parent_child_arena) =
@@ -155,24 +175,22 @@ impl HashLifeEngine {
             return self.dead_leaf;
         };
 
-        while self
-            .cached_jump_result((root_node, root_step_exp))
-            .is_none()
-        {
-            if self.allocation_failure.is_some() {
+        let Some(mut parent_records) =
+            self.try_transient_vec::<RecursiveParentBatchRecord>(DISCOVER_BATCH)
+        else {
+            return self.dead_leaf;
+        };
+        loop {
+            if self.poll_advance_cancellation() {
                 return self.dead_leaf;
             }
             while !discover.is_empty() {
-                if self.allocation_failure.is_some() {
+                if self.poll_advance_cancellation() {
                     return self.dead_leaf;
                 }
                 let batch_len =
                     Self::drain_discover_batch(&mut discover, &mut batch, &mut batch_keys);
-                let Some(mut parent_records) =
-                    self.try_transient_vec::<RecursiveParentBatchRecord>(batch_len)
-                else {
-                    return self.dead_leaf;
-                };
+                parent_records.clear();
                 let mut base_tasks = [batch[0]; SIMD_BATCH_LANES];
                 let mut base_nodes = [self.dead_leaf; SIMD_BATCH_LANES];
                 let mut base_count = 0;
@@ -238,7 +256,7 @@ impl HashLifeEngine {
                             next_exp: discovered_step_exp - 1,
                             canonical_structural: canonical_task.structural,
                             canonical_fingerprint: canonical_task.structural.fingerprint(),
-                            overlaps: [0; 9],
+                            overlaps: [NodeId::ZERO; 9],
                             child_arena_start: 0,
                             child_arena_len: 0,
                         },
@@ -352,17 +370,20 @@ impl HashLifeEngine {
                 }
             }
 
-            if self
-                .cached_jump_result((root_node, root_step_exp))
-                .is_some()
-            {
-                break;
+            if let Some(result) = self.cached_jump_result(root_key) {
+                if self.poll_advance_cancellation() {
+                    return self.dead_leaf;
+                }
+                return result;
+            }
+            if self.poll_advance_cancellation() {
+                return self.dead_leaf;
             }
 
             if ready.is_empty() {
                 self.stats.scheduler.dependency_stalls += 1;
                 crate::invariant_failure!(
-                    "hashlife recursive dependency resolution stalled root={root_node} step_exp={root_step_exp} pending={} ready={} cache={}",
+                    "hashlife recursive dependency resolution stalled root={root_node:?} step_exp={root_step_exp} pending={} ready={} cache={}",
                     task_index.len(),
                     ready.len(),
                     self.result_caches.jump.len(),
@@ -512,17 +533,27 @@ impl HashLifeEngine {
                 },
             );
         }
-
-        self.jump_result((root_node, root_step_exp))
     }
 
     pub(in crate::hashlife::scheduler) fn advance_one_generation_centered_impl(
         &mut self,
         root_node: NodeId,
     ) -> NodeId {
+        self.with_transient_allocation_scope(|engine| {
+            engine.advance_one_generation_centered_in_scope(root_node)
+        })
+    }
+
+    fn advance_one_generation_centered_in_scope(&mut self, root_node: NodeId) -> NodeId {
         let root_key = (root_node, 0);
-        if self.cached_jump_result(root_key).is_some() {
-            return self.jump_result(root_key);
+        if let Some(result) = self.cached_jump_result(root_key) {
+            if self.poll_advance_cancellation() {
+                return self.dead_leaf;
+            }
+            return result;
+        }
+        if self.poll_advance_cancellation() {
+            return self.dead_leaf;
         }
 
         let level = self.node_columns.level(root_node) as usize;
@@ -531,7 +562,7 @@ impl HashLifeEngine {
             return self.dead_leaf;
         };
         let root_jump_probe = self.canonical_jump_probe((root_node, 0));
-        if self.allocation_failure.is_some() {
+        if self.poll_advance_cancellation() {
             return self.dead_leaf;
         }
         discover.push(DiscoveredJumpTask {
@@ -539,7 +570,7 @@ impl HashLifeEngine {
             source_node: root_node,
             canonical_packed: root_jump_probe.node.packed,
         });
-        let Some(mut task_index) = self.try_transient_flat_table(task_capacity) else {
+        let Some(mut task_index) = self.try_transient_probe_table(task_capacity) else {
             return self.dead_leaf;
         };
         let Some(mut tasks) = self.try_transient_vec::<Option<Step0TaskRecord>>(task_capacity)
@@ -550,7 +581,7 @@ impl HashLifeEngine {
         else {
             return self.dead_leaf;
         };
-        let Some(mut dependents) = self.try_transient_flat_table(task_capacity) else {
+        let Some(mut dependents) = self.try_transient_probe_table(task_capacity) else {
             return self.dead_leaf;
         };
         let Some(mut dependent_edges) =
@@ -563,8 +594,8 @@ impl HashLifeEngine {
         };
         let mut batch = [DiscoveredJumpTask {
             key: CanonicalJumpKey::empty(),
-            source_node: 0,
-            canonical_packed: PackedNodeKey::new(0, [0; 4]),
+            source_node: NodeId::ZERO,
+            canonical_packed: PackedNodeKey::new(0, [NodeId::ZERO; 4]),
         }; DISCOVER_BATCH];
         let mut batch_keys = [CanonicalJumpKey::empty(); DISCOVER_BATCH];
         let Some(mut provisional_candidates) =
@@ -572,12 +603,12 @@ impl HashLifeEngine {
         else {
             return self.dead_leaf;
         };
-        while self.cached_jump_result(root_key).is_none() {
-            if self.allocation_failure.is_some() {
+        loop {
+            if self.poll_advance_cancellation() {
                 return self.dead_leaf;
             }
             while !discover.is_empty() {
-                if self.allocation_failure.is_some() {
+                if self.poll_advance_cancellation() {
                     return self.dead_leaf;
                 }
                 let batch_len =
@@ -678,23 +709,34 @@ impl HashLifeEngine {
                 );
             }
 
-            if self.cached_jump_result(root_key).is_some() {
-                break;
+            if let Some(result) = self.cached_jump_result(root_key) {
+                if self.poll_advance_cancellation() {
+                    return self.dead_leaf;
+                }
+                return result;
+            }
+            if self.poll_advance_cancellation() {
+                return self.dead_leaf;
             }
 
             let Some(task_id) = ready.pop() else {
-                let sample = task_index.iter().next().map(|(pending_key, task_id)| {
-                    let task = tasks[task_id].or_invariant("required value");
-                    (
-                        pending_key.structural,
-                        pending_key.step_exp,
-                        task.remaining,
-                        task.children,
-                    )
-                });
+                let sample = task_keys
+                    .iter()
+                    .enumerate()
+                    .find_map(|(task_id, pending_key)| {
+                        pending_key.map(|pending_key| {
+                            let task = tasks[task_id].or_invariant("required value");
+                            (
+                                pending_key.structural,
+                                pending_key.step_exp,
+                                task.remaining,
+                                task.children,
+                            )
+                        })
+                    });
                 self.stats.scheduler.dependency_stalls += 1;
                 crate::invariant_failure!(
-                    "hashlife step-0 dependency resolution stalled root_node={root_node} pending={} ready={} cache={} sample={sample:?}",
+                    "hashlife step-0 dependency resolution stalled root_node={root_node:?} pending={} ready={} cache={} sample={sample:?}",
                     task_index.len(),
                     ready.len(),
                     self.result_caches.jump.len(),
@@ -725,7 +767,5 @@ impl HashLifeEngine {
                 self.stats.scheduler.scheduler_ready_max = ready.len();
             }
         }
-
-        self.jump_result(root_key)
     }
 }

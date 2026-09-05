@@ -2,9 +2,8 @@ use crate::RequiredExt;
 use bytemuck::{must_cast, must_cast_ref};
 use wide::{u16x8, u64x8};
 
-use crate::flat_table::FlatKey;
 use crate::hashing::hash_chunk_coord_key;
-use crate::probe_table::{ProbeMode, ProbeReserveError, ProbeTable};
+use crate::probe_table::{ProbeKey, ProbeMode, ProbeReserveError, ProbeTable};
 use crate::simd_layout::{
     AlignedU64Value, SIMD_BATCH_LANES, compact_nonzero_u8_lanes, widen_u64_pair_to_aligned_u16_rows,
 };
@@ -12,6 +11,12 @@ use crate::simd_layout::{
 pub type Coord = i64;
 pub type Cell = (Coord, Coord);
 pub type Bounds = (Coord, Coord, Coord, Coord);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GridTranslationError {
+    CoordinateOverflow,
+    Allocation,
+}
 
 pub const CHUNK_SIZE: Coord = 8;
 const DEFAULT_CHUNK_CAPACITY: usize = 64;
@@ -34,7 +39,7 @@ impl ChunkCoordKey {
     }
 }
 
-impl FlatKey for ChunkCoordKey {
+impl ProbeKey for ChunkCoordKey {
     fn fingerprint(&self) -> u64 {
         hash_chunk_coord_key(self.cx, self.cy)
     }
@@ -224,6 +229,77 @@ impl BitGrid {
         translated
     }
 
+    pub fn try_translated(&self, dx: i128, dy: i128) -> Result<Self, GridTranslationError> {
+        if let Some((min_x, min_y, max_x, max_y)) = self.bounds() {
+            for coordinate in [min_x, max_x] {
+                let translated = i128::from(coordinate)
+                    .checked_add(dx)
+                    .ok_or(GridTranslationError::CoordinateOverflow)?;
+                Coord::try_from(translated)
+                    .map_err(|_| GridTranslationError::CoordinateOverflow)?;
+            }
+            for coordinate in [min_y, max_y] {
+                let translated = i128::from(coordinate)
+                    .checked_add(dy)
+                    .ok_or(GridTranslationError::CoordinateOverflow)?;
+                Coord::try_from(translated)
+                    .map_err(|_| GridTranslationError::CoordinateOverflow)?;
+            }
+        }
+        let chunk_size = i128::from(CHUNK_SIZE);
+        let chunk_dx = dx.div_euclid(chunk_size);
+        let chunk_dy = dy.div_euclid(chunk_size);
+        let local_dx = u32::try_from(dx.rem_euclid(chunk_size))
+            .map_err(|_| GridTranslationError::CoordinateOverflow)?;
+        let local_dy = usize::try_from(dy.rem_euclid(chunk_size))
+            .map_err(|_| GridTranslationError::CoordinateOverflow)?;
+        let capacity = self
+            .chunks
+            .len()
+            .checked_mul(4)
+            .ok_or(GridTranslationError::Allocation)?
+            .max(1);
+        let mut translated = Self::try_with_chunk_capacity(capacity)
+            .map_err(|_| GridTranslationError::Allocation)?;
+
+        for (coord, chunk) in self.chunks.iter() {
+            let base_x = i128::from(coord.cx)
+                .checked_add(chunk_dx)
+                .ok_or(GridTranslationError::CoordinateOverflow)?;
+            let base_y = i128::from(coord.cy)
+                .checked_add(chunk_dy)
+                .ok_or(GridTranslationError::CoordinateOverflow)?;
+            let [left_top, right_top, left_bottom, right_bottom] =
+                translated_chunk_parts(chunk.bits.0, local_dx, local_dy);
+            translated.try_accumulate_wide_chunk(base_x, base_y, left_top)?;
+            translated.try_accumulate_wide_chunk(
+                base_x
+                    .checked_add(1)
+                    .ok_or(GridTranslationError::CoordinateOverflow)?,
+                base_y,
+                right_top,
+            )?;
+            translated.try_accumulate_wide_chunk(
+                base_x,
+                base_y
+                    .checked_add(1)
+                    .ok_or(GridTranslationError::CoordinateOverflow)?,
+                left_bottom,
+            )?;
+            translated.try_accumulate_wide_chunk(
+                base_x
+                    .checked_add(1)
+                    .ok_or(GridTranslationError::CoordinateOverflow)?,
+                base_y
+                    .checked_add(1)
+                    .ok_or(GridTranslationError::CoordinateOverflow)?,
+                right_bottom,
+            )?;
+        }
+
+        Ok(translated)
+    }
+
     pub fn bounds(&self) -> Option<Bounds> {
         let mut bounds = None;
 
@@ -311,6 +387,22 @@ impl BitGrid {
         let merged = self.chunk_bits(cx, cy) | bits;
         self.set_chunk_bits(cx, cy, merged);
     }
+
+    fn try_accumulate_wide_chunk(
+        &mut self,
+        cx: i128,
+        cy: i128,
+        bits: u64,
+    ) -> Result<(), GridTranslationError> {
+        if bits == 0 {
+            return Ok(());
+        }
+        let cx = Coord::try_from(cx).map_err(|_| GridTranslationError::CoordinateOverflow)?;
+        let cy = Coord::try_from(cy).map_err(|_| GridTranslationError::CoordinateOverflow)?;
+        let merged = self.chunk_bits(cx, cy) | bits;
+        self.try_set_chunk_bits(cx, cy, merged)
+            .map_err(|_| GridTranslationError::Allocation)
+    }
 }
 
 impl Default for BitGrid {
@@ -344,12 +436,17 @@ fn chunk_and_bit(x: Coord, y: Coord) -> (Cell, u32) {
 }
 
 pub(crate) fn append_live_bits_as_cells(cells: &mut Vec<Cell>, cx: Coord, cy: Coord, bits: u64) {
+    if bits == 0 {
+        return;
+    }
+    let base_x = cx * CHUNK_SIZE;
+    let base_y = cy * CHUNK_SIZE;
     let mut remaining = bits;
     while remaining != 0 {
         let bit = remaining.trailing_zeros() as Coord;
         let local_x = bit % CHUNK_SIZE;
         let local_y = bit / CHUNK_SIZE;
-        cells.push((cx * CHUNK_SIZE + local_x, cy * CHUNK_SIZE + local_y));
+        cells.push((base_x + local_x, base_y + local_y));
         remaining &= remaining - 1;
     }
 }
@@ -414,10 +511,15 @@ fn append_live_row_bits_as_cells(
     row: Coord,
     row_bits: u8,
 ) {
+    if row_bits == 0 {
+        return;
+    }
+    let base_x = cx * CHUNK_SIZE;
+    let y = cy * CHUNK_SIZE + row;
     let mut remaining = row_bits;
     while remaining != 0 {
         let bit = remaining.trailing_zeros() as Coord;
-        cells.push((cx * CHUNK_SIZE + bit, cy * CHUNK_SIZE + row));
+        cells.push((base_x + bit, y));
         remaining &= remaining - 1;
     }
 }
@@ -429,9 +531,10 @@ fn update_bounds_from_live_row_bits(
     row: Coord,
     row_bits: u8,
 ) {
+    let base_x = cx * CHUNK_SIZE;
     let y = cy * CHUNK_SIZE + row;
-    let x0 = cx * CHUNK_SIZE + row_bits.trailing_zeros() as Coord;
-    let x1 = cx * CHUNK_SIZE + (7 - row_bits.leading_zeros() as Coord);
+    let x0 = base_x + row_bits.trailing_zeros() as Coord;
+    let x1 = base_x + (7 - row_bits.leading_zeros() as Coord);
     if let Some((min_x, min_y, max_x, max_y)) = bounds {
         *min_x = (*min_x).min(x0);
         *min_y = (*min_y).min(y);
@@ -485,7 +588,7 @@ fn translated_chunk_parts(bits: u64, local_dx: u32, local_dy: usize) -> [u64; 4]
 
 #[cfg(test)]
 mod tests {
-    use super::{BitGrid, Cell};
+    use super::{BitGrid, Cell, Coord, append_live_bits_as_cells, append_live_row_bits_as_cells};
     use crate::RequiredExt;
     use std::collections::HashMap;
 
@@ -534,6 +637,20 @@ mod tests {
         assert_eq!(grid.chunk_count(), 1);
         assert_eq!(grid.population(), 1);
         assert!(grid.get(8, 8));
+    }
+
+    #[test]
+    fn empty_bit_expansion_does_not_evaluate_unused_extreme_chunk_origins() {
+        let mut cells = vec![(2, 3)];
+        for coordinate in [Coord::MIN, Coord::MAX] {
+            append_live_bits_as_cells(&mut cells, coordinate, coordinate, 0);
+            append_live_row_bits_as_cells(&mut cells, coordinate, coordinate, coordinate, 0);
+        }
+        assert_eq!(
+            cells,
+            [(2, 3)],
+            "empty chunks and rows must leave output unchanged without origin arithmetic"
+        );
     }
 
     #[test]

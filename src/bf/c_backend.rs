@@ -1,12 +1,17 @@
 use super::BF_C_TAPE_LEN as C_TAPE_LEN;
+use super::c_super_backend::{CompileWork, summarize_c_region_with_work};
 use super::c_support::{
-    mask_literal, normalized_c_offset, push_c_line, signed_cells_flag, split_char_input_stmt,
-    split_number_input_stmt, split_output_stmt, wrap_ptr_expr,
+    expand_runtime_fragments, mask_literal, normalized_c_offset, push_c_line, signed_cells_flag,
+    split_char_input_stmt, split_number_input_stmt, split_output_stmt, wrap_ptr_expr,
 };
 use super::ir::{BfIr, ShiftDir, validate_canonical_ir};
 #[cfg(test)]
 use super::optimizer::CellSign;
 use super::optimizer::{CodegenOpts, IoMode};
+use super::polynomial_emit::{
+    PolynomialCBackend, PolynomialEmissionBudget, can_emit_transfer, emit_symbolic_transfer,
+    evaluation_cost_breakdown,
+};
 use crate::RequiredExt;
 
 mod batches;
@@ -15,125 +20,58 @@ use batches::{emit_add_batch, emit_clear_batch};
 #[cfg(test)]
 const BF_TEST_STEP_BUDGET: u64 = 10_000_000;
 
-fn indent(n: usize) -> String {
-    " ".repeat(n)
+struct PlainPolynomialBackend;
+
+impl PolynomialCBackend for PlainPolynomialBackend {
+    fn source(&self, offset: crate::bf::BfOffset) -> String {
+        format!("tape[{}]", wrap_ptr_expr(offset))
+    }
+
+    fn target(&self, offset: crate::bf::BfOffset) -> String {
+        format!("tape[{}]", wrap_ptr_expr(offset))
+    }
+
+    fn wrap_add(&self, lhs: &str, rhs: &str) -> String {
+        format!(
+            "BF_SIGNED_CELLS ? bf_wrap_add_i64_signed({lhs}, {rhs}, BF_CELL_BITS) : bf_wrap_add_i64_unsigned({lhs}, {rhs}, BF_CELL_BITS)"
+        )
+    }
+
+    fn wrap_mul(&self, lhs: &str, rhs: &str) -> String {
+        format!(
+            "BF_SIGNED_CELLS ? bf_wrap_mul_i64_signed({lhs}, {rhs}, BF_CELL_BITS) : bf_wrap_mul_i64_unsigned({lhs}, {rhs}, BF_CELL_BITS)"
+        )
+    }
+
+    fn zero_region(&self, start: crate::bf::BfOffset, len: crate::bf::BfOffset) -> String {
+        let len = usize::try_from(len).or_invariant("positive symbolic zero region fits usize");
+        let assignments = (0..len)
+            .map(|index| {
+                let offset = start
+                    .checked_add(
+                        crate::bf::BfOffset::try_from(index)
+                            .or_invariant("symbolic zero region index fits offset"),
+                    )
+                    .or_invariant("symbolic zero region offset remains in range");
+                format!("tape[{}] = 0;", wrap_ptr_expr(offset))
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{{ {assignments} }}")
+    }
 }
 
-pub fn format_ir(program: &[BfIr]) -> String {
-    enum Frame<'a> {
-        Seq {
-            nodes: &'a [BfIr],
-            index: usize,
-            indent: usize,
-        },
-        Close {
-            indent: usize,
-        },
-    }
-
-    let mut out = String::new();
-    let mut stack = vec![Frame::Seq {
-        nodes: program,
-        index: 0,
-        indent: 0,
-    }];
-
-    while let Some(frame) = stack.pop() {
-        match frame {
-            Frame::Seq {
-                nodes,
-                mut index,
-                indent: ind,
-            } => {
-                if index >= nodes.len() {
-                    continue;
-                }
-                let pad = indent(ind);
-                let node = &nodes[index];
-                index += 1;
-                stack.push(Frame::Seq {
-                    nodes,
-                    index,
-                    indent: ind,
-                });
-                match node {
-                    BfIr::MovePtr(n) => out.push_str(&format!("{pad}MovePtr({n})\n")),
-                    BfIr::Add(n) => out.push_str(&format!("{pad}Add({n})\n")),
-                    BfIr::Input => out.push_str(&format!("{pad}Input\n")),
-                    BfIr::Output => out.push_str(&format!("{pad}Output\n")),
-                    BfIr::Clear => out.push_str(&format!("{pad}Clear\n")),
-                    BfIr::ClearAt { offset } => {
-                        out.push_str(&format!("{pad}ClearAt({offset})\n"));
-                    }
-                    BfIr::Scan { stride } => {
-                        out.push_str(&format!("{pad}Scan {{ stride: {stride} }}\n"))
-                    }
-                    BfIr::Shift {
-                        src,
-                        dst,
-                        amount,
-                        dir,
-                        preserve_src,
-                        set_dst,
-                    } => out.push_str(&format!(
-                        "{pad}Shift {{ src: {src}, dst: {dst}, amount: {amount}, dir: {dir:?}, preserve_src: {preserve_src}, set_dst: {set_dst} }}\n"
-                    )),
-                    BfIr::Affine {
-                        src,
-                        dst,
-                        coeff,
-                        preserve_src,
-                        set_dst,
-                    } => out.push_str(&format!(
-                        "{pad}Affine {{ src: {src}, dst: {dst}, coeff: {coeff}, preserve_src: {preserve_src}, set_dst: {set_dst} }}\n"
-                    )),
-                    BfIr::Square {
-                        src,
-                        dst,
-                        preserve_src,
-                        set_dst,
-                    } => out.push_str(&format!(
-                        "{pad}Square {{ src: {src}, dst: {dst}, preserve_src: {preserve_src}, set_dst: {set_dst} }}\n"
-                    )),
-                    BfIr::MulAdd {
-                        lhs,
-                        rhs,
-                        dst,
-                        preserve_lhs,
-                        preserve_rhs,
-                        set_dst,
-                    } => out.push_str(&format!(
-                        "{pad}MulAdd {{ lhs: {lhs}, rhs: {rhs}, dst: {dst}, preserve_lhs: {preserve_lhs}, preserve_rhs: {preserve_rhs}, set_dst: {set_dst} }}\n"
-                    )),
-                    BfIr::Diverge => out.push_str(&format!("{pad}Diverge\n")),
-                    BfIr::Distribute {
-                        targets,
-                        preserve_src,
-                    } => out.push_str(&format!(
-                        "{pad}Distribute {{ targets: {targets:?}, preserve_src: {preserve_src} }}\n"
-                    )),
-                    BfIr::Loop(body) => {
-                        out.push_str(&format!("{pad}Loop {{\n"));
-                        stack.push(Frame::Close { indent: ind });
-                        stack.push(Frame::Seq {
-                            nodes: body,
-                            index: 0,
-                            indent: ind + 2,
-                        });
-                    }
-                }
-            }
-            Frame::Close { indent: ind } => out.push_str(&format!(
-                "{}}}
-",
-                indent(ind)
-            )),
-        }
-    }
-    out
+fn is_polynomial_rich_op(node: &BfIr) -> bool {
+    matches!(
+        node,
+        BfIr::Affine { .. } | BfIr::Square { .. } | BfIr::MulAdd { .. }
+    )
 }
 
 pub fn emit_c(program: &[BfIr], opts: CodegenOpts) -> String {
+    if let Err(error) = opts.validate() {
+        return format!("#error {error}\n");
+    }
     validate_canonical_ir(program).or_invariant("plain C backend requires canonical richer IR");
 
     fn add_expr(d: u64) -> String {
@@ -171,6 +109,7 @@ pub fn emit_c(program: &[BfIr], opts: CodegenOpts) -> String {
             nodes: &'a [BfIr],
             index: usize,
             level: usize,
+            allow_symbolic: bool,
         },
         Close {
             level: usize,
@@ -178,10 +117,13 @@ pub fn emit_c(program: &[BfIr], opts: CodegenOpts) -> String {
     }
 
     fn emit_body(out: &mut String, program: &[BfIr], opts: CodegenOpts) {
+        let mut compile_work = CompileWork::default();
+        let mut emission_budget = PolynomialEmissionBudget::default();
         let mut stack = vec![EmitFrame::Seq {
             nodes: program,
             index: 0,
             level: 1,
+            allow_symbolic: true,
         }];
         while let Some(frame) = stack.pop() {
             match frame {
@@ -189,6 +131,7 @@ pub fn emit_c(program: &[BfIr], opts: CodegenOpts) -> String {
                     nodes,
                     mut index,
                     level,
+                    allow_symbolic,
                 } => {
                     if index >= nodes.len() {
                         continue;
@@ -198,6 +141,7 @@ pub fn emit_c(program: &[BfIr], opts: CodegenOpts) -> String {
                             nodes,
                             index: next_index,
                             level,
+                            allow_symbolic,
                         });
                         continue;
                     }
@@ -206,8 +150,59 @@ pub fn emit_c(program: &[BfIr], opts: CodegenOpts) -> String {
                             nodes,
                             index: next_index,
                             level,
+                            allow_symbolic,
                         });
                         continue;
+                    }
+                    if allow_symbolic && is_polynomial_rich_op(&nodes[index]) {
+                        const POLYNOMIAL_REGION_MAX: usize = 16;
+                        let limit = nodes.len().min(index + POLYNOMIAL_REGION_MAX);
+                        let mut end = index + 1;
+                        while end < limit && is_polynomial_rich_op(&nodes[end]) {
+                            end += 1;
+                        }
+                        if end - index > 1
+                            && let Some(transfer) = summarize_c_region_with_work(
+                                &nodes[index..end],
+                                opts,
+                                &mut compile_work,
+                            )
+                            && can_emit_transfer(&transfer)
+                            && compile_work.admit_evaluation(&transfer)
+                        {
+                            let cost = evaluation_cost_breakdown(&transfer);
+                            if cost.multiplications > 0
+                                && cost.total <= (end - index) * 6
+                                && let Some(lines) = emit_symbolic_transfer(
+                                    &transfer,
+                                    &PlainPolynomialBackend,
+                                    &mut emission_budget,
+                                    (level + 1) * 4,
+                                )
+                            {
+                                stack.push(EmitFrame::Seq {
+                                    nodes,
+                                    index: end,
+                                    level,
+                                    allow_symbolic,
+                                });
+                                stack.push(EmitFrame::Close { level });
+                                stack.push(EmitFrame::Seq {
+                                    nodes: &nodes[index..end],
+                                    index: 0,
+                                    level: level + 1,
+                                    allow_symbolic: false,
+                                });
+                                push_c_line(out, level, "if (!bf_semantic_fuel_enabled()) {");
+                                push_c_line(out, level + 1, "bf_work_dispatch();");
+                                push_c_line(out, level + 1, "bf_work_op();");
+                                for line in lines {
+                                    push_c_line(out, level + 1, &line);
+                                }
+                                push_c_line(out, level, "} else {");
+                                continue;
+                            }
+                        }
                     }
                     let node = &nodes[index];
                     index += 1;
@@ -215,6 +210,7 @@ pub fn emit_c(program: &[BfIr], opts: CodegenOpts) -> String {
                         nodes,
                         index,
                         level,
+                        allow_symbolic,
                     });
                     match node {
                         BfIr::MovePtr(n) if *n != 0 => {
@@ -293,6 +289,7 @@ pub fn emit_c(program: &[BfIr], opts: CodegenOpts) -> String {
                                 nodes: body,
                                 index: 0,
                                 level: level + 1,
+                                allow_symbolic,
                             });
                         }
                         BfIr::Clear => {
@@ -614,7 +611,7 @@ pub fn emit_c(program: &[BfIr], opts: CodegenOpts) -> String {
     let mut ir_body = String::new();
     emit_body(&mut ir_body, program, opts);
 
-    let mut out = include_str!("bf.c.in").to_owned();
+    let mut out = expand_runtime_fragments(super::c_support::PLAIN_RUNTIME_TEMPLATE);
 
     if needs_ptr_wrap {
         keep_block(
@@ -664,6 +661,7 @@ pub fn emit_c(program: &[BfIr], opts: CodegenOpts) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BfEvalError {
     DivergenceDetected,
+    InvalidOptions,
     StepBudgetExceeded,
 }
 
@@ -685,191 +683,7 @@ pub(crate) fn interpret_unsigned_for_tests(
 }
 
 #[cfg(test)]
-pub(crate) fn interpret_for_tests(
-    program: &[BfIr],
-    opts: CodegenOpts,
-) -> Result<(Vec<i64>, usize), BfEvalError> {
-    fn wrap_unsigned(v: i64, bits: u32) -> i64 {
-        if bits == 0 {
-            return 0;
-        }
-        let mask = (1_u64 << bits) - 1;
-        (v.cast_unsigned() & mask).cast_signed()
-    }
+pub(crate) use interpreter::interpret_for_tests;
 
-    fn wrap_signed(v: i64, bits: u32) -> i64 {
-        if bits == 0 {
-            return 0;
-        }
-        let mask = (1_u64 << bits) - 1;
-        let raw = v.cast_unsigned() & mask;
-        let sign_bit = 1_u64 << (bits - 1);
-        if raw & sign_bit == 0 {
-            raw.cast_signed()
-        } else {
-            i64::try_from(i128::from(raw) - (1_i128 << bits))
-                .or_invariant("wrapped signed cell fits i64")
-        }
-    }
-
-    fn wrap(v: i64, bits: u32, sign: CellSign) -> i64 {
-        match sign {
-            CellSign::Signed => wrap_signed(v, bits),
-            CellSign::Unsigned => wrap_unsigned(v, bits),
-        }
-    }
-
-    let cell_bits = opts.cell_bits.min(63);
-    let mut tape = vec![0_i64; C_TAPE_LEN];
-    let mut ptr = 0_usize;
-    let mut stack: Vec<(&[BfIr], usize)> = vec![(program, 0)];
-    let mut steps = 0_u64;
-
-    while let Some((nodes, index)) = stack.last_mut() {
-        if *index >= nodes.len() {
-            stack.pop();
-            continue;
-        }
-        if steps >= BF_TEST_STEP_BUDGET {
-            return Err(BfEvalError::StepBudgetExceeded);
-        }
-        steps += 1;
-
-        let node = &nodes[*index];
-        *index += 1;
-
-        match node {
-            BfIr::MovePtr(n) => {
-                ptr = super::tape::wrapped_index(ptr, *n, tape.len());
-            }
-            BfIr::Add(n) => {
-                tape[ptr] = wrap(tape[ptr] + i64::from(*n), cell_bits, opts.cell_sign);
-            }
-            BfIr::Input | BfIr::Output => {}
-            BfIr::Clear => tape[ptr] = 0,
-            BfIr::ClearAt { offset } => {
-                let target = super::tape::wrapped_index(ptr, *offset, tape.len());
-                tape[target] = 0;
-            }
-            BfIr::Scan { stride } => {
-                while tape[ptr] != 0 {
-                    if steps >= BF_TEST_STEP_BUDGET {
-                        return Err(BfEvalError::StepBudgetExceeded);
-                    }
-                    steps += 1;
-                    ptr = super::tape::wrapped_index(ptr, *stride, tape.len());
-                }
-            }
-            BfIr::Distribute {
-                targets,
-                preserve_src,
-            } => {
-                let v = tape[ptr];
-                for &(offset, coeff) in targets {
-                    let t = super::tape::wrapped_index(ptr, offset, tape.len());
-                    tape[t] = wrap(tape[t] + v * i64::from(coeff), cell_bits, opts.cell_sign);
-                }
-                if !preserve_src {
-                    tape[ptr] = 0;
-                }
-            }
-            BfIr::Affine {
-                src,
-                dst,
-                coeff,
-                preserve_src,
-                set_dst,
-            } => {
-                let s = super::tape::wrapped_index(ptr, *src, tape.len());
-                let d = super::tape::wrapped_index(ptr, *dst, tape.len());
-                let src_v = tape[s];
-                let base = if *set_dst { 0 } else { tape[d] };
-                let dst_next = wrap(base + src_v * i64::from(*coeff), cell_bits, opts.cell_sign);
-                if !preserve_src && s != d {
-                    tape[s] = 0;
-                }
-                tape[d] = dst_next;
-            }
-            BfIr::Shift {
-                src,
-                dst,
-                amount,
-                dir,
-                preserve_src,
-                set_dst,
-            } => {
-                let s = super::tape::wrapped_index(ptr, *src, tape.len());
-                let d = super::tape::wrapped_index(ptr, *dst, tape.len());
-                let src_raw = tape[s].cast_unsigned() & ((1_u64 << cell_bits) - 1);
-                let shifted_raw = match dir {
-                    ShiftDir::Left => src_raw.checked_shl(*amount).unwrap_or(0),
-                    ShiftDir::Right => src_raw.checked_shr(*amount).unwrap_or(0),
-                };
-                let shifted = match dir {
-                    ShiftDir::Left => wrap(
-                        wrap_signed(shifted_raw.cast_signed(), cell_bits),
-                        cell_bits,
-                        opts.cell_sign,
-                    ),
-                    ShiftDir::Right => match opts.cell_sign {
-                        CellSign::Signed => wrap_signed(shifted_raw.cast_signed(), cell_bits),
-                        CellSign::Unsigned => wrap_unsigned(shifted_raw.cast_signed(), cell_bits),
-                    },
-                };
-                let base = if *set_dst { 0 } else { tape[d] };
-                let dst_next = wrap(base + shifted, cell_bits, opts.cell_sign);
-                if !preserve_src && s != d {
-                    tape[s] = 0;
-                }
-                tape[d] = dst_next;
-            }
-            BfIr::Square {
-                src,
-                dst,
-                preserve_src,
-                set_dst,
-            } => {
-                let s = super::tape::wrapped_index(ptr, *src, tape.len());
-                let d = super::tape::wrapped_index(ptr, *dst, tape.len());
-                let src_v = tape[s];
-                let base = if *set_dst { 0 } else { tape[d] };
-                let dst_next = wrap(base + src_v * src_v, cell_bits, opts.cell_sign);
-                if !preserve_src && s != d {
-                    tape[s] = 0;
-                }
-                tape[d] = dst_next;
-            }
-            BfIr::MulAdd {
-                lhs,
-                rhs,
-                dst,
-                preserve_lhs,
-                preserve_rhs,
-                set_dst,
-            } => {
-                let l = super::tape::wrapped_index(ptr, *lhs, tape.len());
-                let r = super::tape::wrapped_index(ptr, *rhs, tape.len());
-                let d = super::tape::wrapped_index(ptr, *dst, tape.len());
-                let lhs_v = tape[l];
-                let rhs_v = tape[r];
-                let base = if *set_dst { 0 } else { tape[d] };
-                let dst_next = wrap(base + lhs_v * rhs_v, cell_bits, opts.cell_sign);
-                if !preserve_lhs && l != d {
-                    tape[l] = 0;
-                }
-                if !preserve_rhs && r != d && (r != l || *preserve_lhs) {
-                    tape[r] = 0;
-                }
-                tape[d] = dst_next;
-            }
-            BfIr::Diverge => return Err(BfEvalError::DivergenceDetected),
-            BfIr::Loop(body) => {
-                if tape[ptr] != 0 {
-                    stack.last_mut().or_invariant("required value").1 -= 1;
-                    stack.push((body, 0));
-                }
-            }
-        }
-    }
-    Ok((tape, ptr))
-}
+#[cfg(test)]
+mod interpreter;

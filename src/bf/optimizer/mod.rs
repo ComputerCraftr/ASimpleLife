@@ -10,9 +10,14 @@ use super::ir::BfIr;
 use normalize::normalize_sequence;
 use rewrite::{canonicalize_loop_body, rewrite_ir_bottom_up};
 use semantics::OptimizerSemantics;
-pub use semantics::{CellSign, CodegenOpts, IoMode};
+pub use semantics::{CellSign, CodegenOpts, CodegenOptsError, IoMode, MAX_CELL_BITS};
 
 pub fn optimize_with_opts(program: Vec<BfIr>, opts: CodegenOpts) -> Vec<BfIr> {
+    // Invalid configurations cannot authorize algebraic rewrites. The codegen
+    // boundary reports the typed validation error instead of clamping widths.
+    if opts.validate().is_err() {
+        return program;
+    }
     let semantics = OptimizerSemantics::from_opts(opts);
     let mut program = rewrite_ir_bottom_up(program, semantics, &|body| {
         canonicalize_loop_body(body, semantics)
