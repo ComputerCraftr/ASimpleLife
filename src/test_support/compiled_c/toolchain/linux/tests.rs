@@ -2,6 +2,23 @@ use super::*;
 use crate::RequiredExt;
 
 #[test]
+fn loader_identity_accepts_upstream_and_distribution_glibc_banners() {
+    for banner in [
+        "ld.so (GNU libc) stable release version 2.41.\n",
+        "ld.so (Debian GLIBC 2.41-12) stable release version 2.41.\n",
+        "ld.so (Ubuntu GLIBC 2.39-0ubuntu8) stable release version 2.39.\n",
+    ] {
+        assert!(is_glibc_loader(banner), "glibc banner rejected: {banner}");
+    }
+    for banner in ["", "musl libc (x86_64)\nVersion 1.2.5\n", "unknown loader"] {
+        assert!(
+            !is_glibc_loader(banner),
+            "unknown loader accepted: {banner}"
+        );
+    }
+}
+
+#[test]
 fn metadata_rejects_unresolved_inputs_and_search_mutating_scripts() {
     assert!(linker_search_dirs("SEARCH_DIR(\"relative\")").is_err());
     assert!(linker_search_dirs("SEARCH_DIR(/lib)").is_err());
@@ -61,14 +78,32 @@ fn catalog_tracks_content_aliases_and_new_search_inputs() {
 fn debug_and_sanitizer_modes_reuse_only_their_own_compilation() {
     let root = crate::test_support::compiled_c::tests::TestRoot::new();
     for flags in [&["-g3"][..], &["-O3"], &["-fsanitize=undefined"]] {
+        let mut cold_notes = Vec::new();
         for warm in [false, true] {
             let mut counts = accounting::Request::new();
             let output = run_in(&root.0, "int main(void) { return 0; }", flags, &mut counts)
                 .or_invariant("Linux mode execution");
             assert!(output.status.success(), "flags={flags:?}, warm={warm}");
+            if !warm {
+                // Some distributions give libubsan a RUNPATH. The provider
+                // deliberately rejects private ELF search paths, so that mode
+                // must compile afresh rather than publish an unverified input.
+                assert!(
+                    counts.notes.is_empty()
+                        || (flags == ["-fsanitize=undefined"]
+                            && counts.notes
+                                == [
+                                    "Linux dependency audit bypass: private ELF dependency resolution is unsupported"
+                                ]),
+                    "unexpected cache bypass: {:?}",
+                    counts.notes
+                );
+                cold_notes = counts.notes.clone();
+            }
+            assert_eq!(counts.notes, cold_notes, "mode changed publication safety");
             assert_eq!(
                 counts.compiler_invocations,
-                u64::from(!warm),
+                u64::from(!warm || !cold_notes.is_empty()),
                 "flags={flags:?}, warm={warm}"
             );
             assert_eq!(counts.execution_attempts, 1, "warm reuse skipped execution");

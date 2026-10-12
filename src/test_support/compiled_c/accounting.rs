@@ -8,7 +8,7 @@ pub struct Request {
     compiler_outcome: Option<&'static str>,
     pub(super) execution_attempts: u64,
     milliseconds: BTreeMap<&'static str, u128>,
-    notes: Vec<String>,
+    pub(super) notes: Vec<String>,
 }
 impl Request {
     pub fn new() -> Self {

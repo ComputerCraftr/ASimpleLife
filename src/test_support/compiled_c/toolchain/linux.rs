@@ -91,7 +91,7 @@ pub(super) fn discover(
     let loader = PathBuf::from(loader);
     let help = output(tool, root, work, &loader, &["--help"])?;
     let version = output(tool, root, work, &loader, &["--version"])?;
-    if !version.contains("GLIBC") {
+    if !is_glibc_loader(&version) {
         return Err("non-glibc interpreter is unsupported".into());
     }
     pieces.push(version);
@@ -169,6 +169,12 @@ pub(super) fn discover(
     roots.extend([loader.clone(), readelf, ldconfig]);
     pieces.extend([search, specs, script, cache, catalog::seal(roots)?]);
     Ok(loader)
+}
+
+fn is_glibc_loader(version: &str) -> bool {
+    // Distributions can customize glibc's version banner; upstream uses
+    // "GNU libc", while Debian/Ubuntu include "GLIBC" in their release string.
+    version.contains("GNU libc") || version.contains("GLIBC")
 }
 
 fn linker_search_dirs(script: &str) -> Result<Vec<PathBuf>> {
